@@ -11,7 +11,6 @@ extern crate alloc;
 use brotli::Decompressor as BrotliDecompressor;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 use heic_decoder::DecodedFrame as HeicFrame;
-use rav1d::Dav1dResult;
 use rav1d::include::dav1d::data::Dav1dData;
 use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
 use rav1d::include::dav1d::headers::{
@@ -19,9 +18,9 @@ use rav1d::include::dav1d::headers::{
     DAV1D_PIXEL_LAYOUT_I444,
 };
 use rav1d::include::dav1d::picture::Dav1dPicture;
-use rav1d::src::lib::{
-    dav1d_close, dav1d_data_create, dav1d_data_unref, dav1d_default_settings, dav1d_get_picture,
-    dav1d_open, dav1d_picture_unref, dav1d_send_data,
+use rav1d::{
+    Dav1dResult, Rav1dError, dav1d_close, dav1d_data_create, dav1d_data_unref,
+    dav1d_default_settings, dav1d_get_picture, dav1d_open, dav1d_picture_unref, dav1d_send_data,
 };
 use scuffle_h265::{NALUnitType, SpsNALUnit};
 use source::{
@@ -8683,7 +8682,7 @@ fn decode_av1_bitstream_to_image(bitstream: &[u8]) -> Result<DecodedAvifImage, D
         if result.0 == 0 {
             return picture_to_internal_image(&picture.0);
         }
-        if result.0 != -libc::EAGAIN {
+        if result != Dav1dResult::from(Err::<(), Rav1dError>(Rav1dError::TryAgain)) {
             return Err(DecodeAvifError::DecoderApi {
                 stage: "dav1d_get_picture",
                 code: result.0,
