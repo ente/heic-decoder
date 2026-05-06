@@ -1,0 +1,17 @@
+# Local test artifacts
+.heic-test-assets/
+.heic-test-runs/
+
+# Rust build artifacts
+/target/
+
+# Rustfmt backups
+**/*.rs.bk
+
+# Coverage and profiling artifacts
+/coverage/
+/tarpaulin-report.html
+*.profraw
+
+# Library crates normally do not commit Cargo.lock.
+/Cargo.lock
