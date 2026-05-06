@@ -255,7 +255,7 @@ impl FileSource {
     }
 }
 
-const TEMP_SPOOL_PREFIX: &str = "ente_heic-spool";
+const TEMP_SPOOL_PREFIX: &str = "heic_decoder-spool";
 static TEMP_SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn next_temp_spool_path(directory: &Path) -> PathBuf {

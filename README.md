@@ -1,4 +1,4 @@
-# ente_heic
+# heic_decoder
 
 Pure Rust HEIF/HEIC/AVIF decoder with first-class `image` crate integration.
 
@@ -30,21 +30,21 @@ Pure Rust HEIF/HEIC/AVIF decoder with first-class `image` crate integration.
 
 ```toml
 [dependencies]
-ente_heic = { path = "../heic" }
+heic_decoder = { path = "../heic" }
 ```
 
 With `image` integration:
 
 ```toml
 [dependencies]
-ente_heic = { path = "../heic", features = ["image-integration"] }
+heic_decoder = { path = "../heic", features = ["image-integration"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ```
 
 ## Decode Example
 
 ```rust
-use ente_heic::{decode_path_to_rgba_with_guardrails, DecodeGuardrails};
+use heic_decoder::{decode_path_to_rgba_with_guardrails, DecodeGuardrails};
 use std::path::Path;
 
 fn decode_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -69,12 +69,12 @@ fn decode_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 ## EXIF Orientation Policy
 
-- `ente_heic` does **not** implicitly apply EXIF orientation to decoded output.
+- `heic_decoder` does **not** implicitly apply EXIF orientation to decoded output.
 - This keeps default output behavior stable and suitable for reference-output comparisons.
 - If your app wants display-oriented output, apply EXIF orientation explicitly:
 
 ```rust
-use ente_heic::{decode_path_to_rgba, exif_orientation_hint};
+use heic_decoder::{decode_path_to_rgba, exif_orientation_hint};
 use std::path::Path;
 
 fn decode_with_explicit_orientation(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -96,10 +96,10 @@ fn decode_with_explicit_orientation(path: &Path) -> Result<(), Box<dyn std::erro
 Path-based (no full file read, no pixel decode) orientation hint:
 
 ```rust
-use ente_heic::{exif_orientation_hint_from_path, path_extension_is_heif};
+use heic_decoder::{exif_orientation_hint_from_path, path_extension_is_heif};
 use std::path::Path;
 
-fn orientation_from_path(path: &Path) -> Result<Option<u8>, ente_heic::DecodeError> {
+fn orientation_from_path(path: &Path) -> Result<Option<u8>, heic_decoder::DecodeError> {
     if !path_extension_is_heif(path) {
         return Ok(None);
     }
@@ -112,11 +112,11 @@ fn orientation_from_path(path: &Path) -> Result<Option<u8>, ente_heic::DecodeErr
 
 ```rust
 use image::ImageReader;
-use ente_heic::image_integration::{
+use heic_decoder::image_integration::{
     apply_exif_orientation_dynamic,
     register_image_decoder_hooks_with_guardrails,
 };
-use ente_heic::{exif_orientation_hint, DecodeGuardrails};
+use heic_decoder::{exif_orientation_hint, DecodeGuardrails};
 
 fn init_image_hooks() {
     let guardrails = DecodeGuardrails {
@@ -153,13 +153,13 @@ fn decode_with_image(path: &str) -> image::ImageResult<image::DynamicImage> {
 Build:
 
 ```bash
-cargo build --manifest-path ente_heic/Cargo.toml --release --bin heif-decode
+cargo build --manifest-path heic_decoder/Cargo.toml --release --bin heif-decode
 ```
 
 Usage:
 
 ```bash
-ente_heic/target/release/heif-decode \
+heic_decoder/target/release/heif-decode \
   --max-input-bytes 134217728 \
   --max-pixels 64000000 \
   --max-temp-spool-bytes 134217728 \

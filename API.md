@@ -1,6 +1,6 @@
-# ente_heic API Guide
+# heic_decoder API Guide
 
-This document is the practical API reference for integrating `ente_heic` in apps and automation.
+This document is the practical API reference for integrating `heic_decoder` in apps and automation.
 
 ## Scope
 
@@ -12,20 +12,20 @@ This document is the practical API reference for integrating `ente_heic` in apps
 ## Feature Flags
 
 - `default`: no optional features.
-- `image-integration`: enables `ente_heic::image_integration` module and hook APIs.
+- `image-integration`: enables `heic_decoder::image_integration` module and hook APIs.
 
 `Cargo.toml`:
 
 ```toml
 [dependencies]
-ente_heic = { path = "../heic" }
+heic_decoder = { path = "../heic" }
 ```
 
 With `image` integration:
 
 ```toml
 [dependencies]
-ente_heic = { path = "../heic", features = ["image-integration"] }
+heic_decoder = { path = "../heic", features = ["image-integration"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ```
 
@@ -114,7 +114,7 @@ Use explicit guardrails in production.
 Example preset:
 
 ```rust
-use ente_heic::DecodeGuardrails;
+use heic_decoder::DecodeGuardrails;
 
 let guardrails = DecodeGuardrails {
     max_input_bytes: Some(128 * 1024 * 1024),
@@ -135,7 +135,7 @@ Notes:
 Top-level errors are `DecodeError`. Use `category()` for stable handling:
 
 ```rust
-use ente_heic::{DecodeError, DecodeErrorCategory};
+use heic_decoder::{DecodeError, DecodeErrorCategory};
 
 fn classify(err: &DecodeError) -> DecodeErrorCategory {
     err.category()
@@ -164,7 +164,7 @@ Typical policy mapping:
 Inspect storage and branch explicitly:
 
 ```rust
-use ente_heic::DecodedRgbaPixels;
+use heic_decoder::DecodedRgbaPixels;
 
 match &decoded.pixels {
     DecodedRgbaPixels::U8(p) => {
@@ -205,11 +205,11 @@ Orientation APIs:
 Recommended pattern:
 
 ```rust
-use ente_heic::{decode_path_to_rgba, exif_orientation_hint};
+use heic_decoder::{decode_path_to_rgba, exif_orientation_hint};
 use std::path::Path;
 
-fn decode_with_explicit_orientation(path: &Path) -> Result<(), ente_heic::DecodeError> {
-    let input = std::fs::read(path).map_err(ente_heic::DecodeError::Io)?;
+fn decode_with_explicit_orientation(path: &Path) -> Result<(), heic_decoder::DecodeError> {
+    let input = std::fs::read(path).map_err(heic_decoder::DecodeError::Io)?;
     let hint = exif_orientation_hint(&input);
 
     let decoded = decode_path_to_rgba(path)?;
@@ -227,10 +227,10 @@ fn decode_with_explicit_orientation(path: &Path) -> Result<(), ente_heic::Decode
 Path-only variant (no full input read, no image decode):
 
 ```rust
-use ente_heic::{exif_orientation_hint_from_path, path_extension_is_heif};
+use heic_decoder::{exif_orientation_hint_from_path, path_extension_is_heif};
 use std::path::Path;
 
-fn orientation_to_apply(path: &Path) -> Result<Option<u8>, ente_heic::DecodeError> {
+fn orientation_to_apply(path: &Path) -> Result<Option<u8>, heic_decoder::DecodeError> {
     if !path_extension_is_heif(path) {
         return Ok(None);
     }
@@ -245,8 +245,8 @@ Requires `image-integration` feature.
 ### 1) Register hooks once at startup
 
 ```rust
-use ente_heic::DecodeGuardrails;
-use ente_heic::image_integration::register_image_decoder_hooks_with_guardrails;
+use heic_decoder::DecodeGuardrails;
+use heic_decoder::image_integration::register_image_decoder_hooks_with_guardrails;
 
 let registration = register_image_decoder_hooks_with_guardrails(DecodeGuardrails {
     max_input_bytes: Some(128 * 1024 * 1024),
@@ -262,8 +262,8 @@ assert!(registration.any_decoder_hook_registered());
 
 ```rust
 use image::ImageReader;
-use ente_heic::exif_orientation_hint;
-use ente_heic::image_integration::apply_exif_orientation_dynamic;
+use heic_decoder::exif_orientation_hint;
+use heic_decoder::image_integration::apply_exif_orientation_dynamic;
 
 let bytes = std::fs::read("input.heic").map_err(image::ImageError::IoError)?;
 let hint = exif_orientation_hint(&bytes);
@@ -326,10 +326,10 @@ For reliable agent behavior:
 ## Minimal End-to-End Example
 
 ```rust
-use ente_heic::{decode_path_to_rgba_with_guardrails, DecodeGuardrails};
+use heic_decoder::{decode_path_to_rgba_with_guardrails, DecodeGuardrails};
 use std::path::Path;
 
-fn decode(path: &Path) -> Result<(), ente_heic::DecodeError> {
+fn decode(path: &Path) -> Result<(), heic_decoder::DecodeError> {
     let guardrails = DecodeGuardrails {
         max_input_bytes: Some(128 * 1024 * 1024),
         max_pixels: Some(64_000_000),

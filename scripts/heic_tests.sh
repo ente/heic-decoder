@@ -21,8 +21,8 @@ usage() {
 Usage: scripts/heic_tests.sh <command> [options]
 
 Commands:
-  verify           Compare ente_heic PNG output against an external validator
-  bench-decode     Benchmark ente_heic decode CLI against the validator
+  verify           Compare heic_decoder PNG output against an external validator
+  bench-decode     Benchmark heic_decoder decode CLI against the validator
   bench-ingestion  Benchmark bytes vs path ingestion
   bench-image      Benchmark image adapter vs direct decode
   bench-stream     Benchmark path/read decode under concurrency
@@ -133,18 +133,18 @@ ensure_helper_sources() {
 [workspace]
 
 [package]
-name = "ente_heic_test_helper"
+name = "heic_decoder_test_helper"
 version = "0.0.0"
 edition = "2024"
 publish = false
 
 [dependencies]
-ente_heic = { path = "$root_toml", features = ["image-integration"] }
+heic_decoder = { path = "$root_toml", features = ["image-integration"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 EOF
 
   cat > "$HELPER_DIR/src/bin/heif-decode.rs" <<'RS'
-use ente_heic::DecodeGuardrails;
+use heic_decoder::DecodeGuardrails;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -263,7 +263,7 @@ fn main() -> ExitCode {
 
     let input = Path::new(&positional[0]);
     let output = Path::new(&positional[1]);
-    let mut decoded = match ente_heic::decode_path_to_rgba_with_guardrails(input, guardrails) {
+    let mut decoded = match heic_decoder::decode_path_to_rgba_with_guardrails(input, guardrails) {
         Ok(decoded) => decoded,
         Err(error) => {
             eprintln!(
@@ -274,8 +274,8 @@ fn main() -> ExitCode {
         }
     };
 
-    if orientation == OrientationMode::Auto && ente_heic::path_extension_is_heif(input) {
-        if let Ok(hint) = ente_heic::exif_orientation_hint_from_path(input)
+    if orientation == OrientationMode::Auto && heic_decoder::path_extension_is_heif(input) {
+        if let Ok(hint) = heic_decoder::exif_orientation_hint_from_path(input)
             && let Some(orientation) = hint.orientation_to_apply()
         {
             match decoded.apply_exif_orientation(orientation) {
@@ -291,7 +291,7 @@ fn main() -> ExitCode {
         }
     }
 
-    match ente_heic::write_decoded_rgba_to_png(&decoded, output) {
+    match heic_decoder::write_decoded_rgba_to_png(&decoded, output) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!(
@@ -305,7 +305,7 @@ fn main() -> ExitCode {
 RS
 
   cat > "$HELPER_DIR/src/bin/heif-ingestion-bench.rs" <<'RS'
-use ente_heic::{DecodedRgbaImage, DecodedRgbaPixels, decode_bytes_to_rgba, decode_path_to_rgba};
+use heic_decoder::{DecodedRgbaImage, DecodedRgbaPixels, decode_bytes_to_rgba, decode_path_to_rgba};
 use std::error::Error;
 use std::fs;
 use std::path::Path;
@@ -358,8 +358,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 RS
 
   cat > "$HELPER_DIR/src/bin/heif-image-adapter-bench.rs" <<'RS'
-use ente_heic::image_integration::register_image_decoder_hooks;
-use ente_heic::{DecodedRgbaImage, DecodedRgbaPixels, decode_path_to_rgba};
+use heic_decoder::image_integration::register_image_decoder_hooks;
+use heic_decoder::{DecodedRgbaImage, DecodedRgbaPixels, decode_path_to_rgba};
 use image::{DynamicImage, ImageReader};
 use std::error::Error;
 use std::path::Path;
@@ -419,7 +419,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 RS
 
   cat > "$HELPER_DIR/src/bin/heif-stream-concurrency-bench.rs" <<'RS'
-use ente_heic::{DecodedRgbaImage, DecodedRgbaPixels, decode_path_to_rgba, decode_read_to_rgba};
+use heic_decoder::{DecodedRgbaImage, DecodedRgbaPixels, decode_path_to_rgba, decode_read_to_rgba};
 use std::error::Error;
 use std::fs::File;
 use std::path::{Path, PathBuf};

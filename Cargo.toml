@@ -1,5 +1,5 @@
 [package]
-name = "ente_heic"
+name = "heic_decoder"
 version = "0.1.0"
 edition = "2024"
 description = "Pure Rust HEIF/HEIC/AVIF decoder with image crate integration hooks"
