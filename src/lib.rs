@@ -1376,7 +1376,14 @@ fn decode_primary_heic_to_image_internal(
     };
     match primary_with_grid {
         isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
-            decode_primary_heic_grid_to_image(&grid_data)
+            let mut decoded = decode_primary_heic_grid_to_image(&grid_data)?;
+            if let Some(ycbcr_range) = ycbcr_range_override_from_primary_colr(&grid_data.colr) {
+                decoded.ycbcr_range = ycbcr_range;
+            }
+            if let Some(ycbcr_matrix) = ycbcr_matrix_override_from_primary_colr(&grid_data.colr) {
+                decoded.ycbcr_matrix = ycbcr_matrix;
+            }
+            Ok(decoded)
         }
         isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
             let (stream, metadata, ycbcr_range_override, ycbcr_matrix_override) =
@@ -3955,6 +3962,12 @@ fn decode_primary_heic_grid_to_image(
         let stream = assemble_heic_hevc_stream_from_components(&tile.hvcc, &tile.payload)?;
         let metadata = decode_hevc_stream_metadata_from_sps(&stream)?;
         let mut decoded = decode_hevc_stream_to_image(&stream)?;
+        if let Some(ycbcr_range) = ycbcr_range_override_from_primary_colr(&tile.colr) {
+            decoded.ycbcr_range = ycbcr_range;
+        }
+        if let Some(ycbcr_matrix) = ycbcr_matrix_override_from_primary_colr(&tile.colr) {
+            decoded.ycbcr_matrix = ycbcr_matrix;
+        }
         validate_decoded_heic_image_against_metadata(&decoded, &metadata)?;
         decoded = apply_heic_grid_tile_transforms(decoded, &tile.transforms)?;
         decoded_tiles.push(decoded);
@@ -5778,13 +5791,16 @@ fn extension_family_hint(path: &Path) -> Option<HeifInputFamily> {
     if extension.eq_ignore_ascii_case("avif") {
         return Some(HeifInputFamily::Avif);
     }
-    if extension.eq_ignore_ascii_case("heic") || extension.eq_ignore_ascii_case("heif") {
+    if extension.eq_ignore_ascii_case("heic")
+        || extension.eq_ignore_ascii_case("heif")
+        || extension.eq_ignore_ascii_case("hif")
+    {
         return Some(HeifInputFamily::Heif);
     }
     None
 }
 
-/// Return `true` when the path extension is `.heif` or `.heic`.
+/// Return `true` when the path extension is `.heif`, `.heic`, or `.hif`.
 ///
 /// This helper is intended as a cheap caller-side gate before HEIF-specific
 /// metadata handling such as EXIF orientation inspection.
@@ -5792,7 +5808,7 @@ pub fn path_extension_is_heif(path: &Path) -> bool {
     matches!(extension_family_hint(path), Some(HeifInputFamily::Heif))
 }
 
-/// Return `true` when the path extension is one of `.heif`, `.heic`, or `.avif`.
+/// Return `true` when the path extension is one of `.heif`, `.heic`, `.hif`, or `.avif`.
 pub fn path_extension_is_heif_family(path: &Path) -> bool {
     extension_family_hint(path).is_some()
 }
