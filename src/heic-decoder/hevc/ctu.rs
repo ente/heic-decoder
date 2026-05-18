@@ -290,7 +290,8 @@ impl<'a> SliceContext<'a> {
 
         // Start from slice segment address
         let start_addr = self.header.slice_segment_address;
-        self.ctb_y = start_addr / pic_width_in_ctbs;
+        let start_ctb_y = start_addr / pic_width_in_ctbs;
+        self.ctb_y = start_ctb_y;
         self.ctb_x = start_addr % pic_width_in_ctbs;
 
         let mut ctu_count = 0u32;
@@ -368,7 +369,12 @@ impl<'a> SliceContext<'a> {
             // WPP: at row boundaries, decode end_of_sub_stream and reinit CABAC
             if wpp && self.ctb_y != prev_ctb_y {
                 let _eoss = self.cabac.decode_terminate()?;
-                self.cabac.reinit();
+                let entry_point_index = self.ctb_y.saturating_sub(start_ctb_y + 1) as usize;
+                if let Some(&offset) = self.header.entry_point_offsets.get(entry_point_index) {
+                    self.cabac.seek_to(offset as usize)?;
+                } else {
+                    self.cabac.reinit();
+                }
             }
 
             // Check for end of picture
@@ -939,14 +945,15 @@ impl<'a> SliceContext<'a> {
             intra_luma_mode,
             intra_chroma_mode,
             intra_split_flag,
-            true,
-            true,
+            1,
+            1,
             frame,
         )
     }
 
     /// Inner transform tree decoding
-    /// cbf_cb_parent/cbf_cr_parent: whether parent says chroma has residuals (or true at root)
+    /// cbf_cb_parent/cbf_cr_parent: parent chroma CBF bitmask (bit 0 for
+    /// 4:2:0/4:4:4, bits 0+1 for top/bottom 4:2:2 chroma blocks).
     #[allow(clippy::too_many_arguments)]
     fn decode_transform_tree_inner(
         &mut self,
@@ -957,8 +964,8 @@ impl<'a> SliceContext<'a> {
         intra_luma_mode: IntraPredMode,
         intra_chroma_mode: IntraPredMode,
         intra_split_flag: bool,
-        cbf_cb_parent: bool,
-        cbf_cr_parent: bool,
+        cbf_cb_parent: u8,
+        cbf_cr_parent: u8,
         frame: &mut DecodedFrame,
     ) -> Result<()> {
         // Per H.265: MaxTrafoDepth = max_transform_hierarchy_depth_intra + IntraSplitFlag
@@ -1004,32 +1011,48 @@ impl<'a> SliceContext<'a> {
             false
         };
 
-        // Step 2: Decode cbf_cb and cbf_cr
-        // For 4:2:0, decode chroma cbf at this level if log2_size > 2
-        // cbf_cb/cbf_cr decoded if log2_size > 2 AND (trafoDepth == 0 OR parent cbf is set)
-        let (cbf_cb, cbf_cr) = if log2_size > 2 {
-            // Decode cbf_cb if trafo_depth == 0 (always) or parent had cbf_cb
-            let cb = if trafo_depth == 0 || cbf_cb_parent {
+        // Step 2: Decode cbf_cb and cbf_cr.
+        // 4:2:2 carries two chroma CBF bits when this node maps to two
+        // vertical chroma transform blocks.
+        let chroma_format = frame.chroma_format;
+        let has_chroma = chroma_format != 0;
+        let decode_chroma_cbf = (log2_size > 2 && has_chroma) || chroma_format == 3;
+        let (cbf_cb, cbf_cr) = if decode_chroma_cbf {
+            let decode_extra_422_cbf = chroma_format == 2 && (!split_transform || log2_size == 3);
+
+            let cb = if cbf_cb_parent != 0 {
                 let ctx_idx = context::CBF_CBCR + trafo_depth as usize;
-                let val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
+                let mut val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? as u8;
                 se_trace("cbf_cb", val as i64, &self.cabac);
+                if decode_extra_422_cbf {
+                    let extra = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? as u8;
+                    se_trace("cbf_cb", extra as i64, &self.cabac);
+                    val |= extra << 1;
+                }
                 val
             } else {
-                false
+                0
             };
-            // Decode cbf_cr if trafo_depth == 0 (always) or parent had cbf_cr
-            let cr = if trafo_depth == 0 || cbf_cr_parent {
+            let cr = if cbf_cr_parent != 0 {
                 let ctx_idx = context::CBF_CBCR + trafo_depth as usize;
-                let val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
+                let mut val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? as u8;
                 se_trace("cbf_cr", val as i64, &self.cabac);
+                if decode_extra_422_cbf {
+                    let extra = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? as u8;
+                    se_trace("cbf_cr", extra as i64, &self.cabac);
+                    val |= extra << 1;
+                }
                 val
             } else {
-                false
+                0
             };
             (cb, cr)
-        } else {
-            // log2_size == 2: inherit from parent (chroma decoded at parent level)
+        } else if trafo_depth > 0 && log2_size == 2 {
+            // 4:2:0/4:2:2 chroma at 4x4 luma children is decoded by the
+            // parent 8x8 transform node after all luma children are decoded.
             (cbf_cb_parent, cbf_cr_parent)
+        } else {
+            (0, 0)
         };
 
         if split_transform {
@@ -1086,24 +1109,17 @@ impl<'a> SliceContext<'a> {
                 frame,
             )?;
 
-            // For 4:2:0, if we split from 8x8 to 4x4, predict + decode chroma now
-            // (because 4x4 children can't have chroma TUs in 4:2:0).
-            // For 4:4:4, each child handles its own chroma — skip this.
-            if log2_size == 3 && frame.chroma_format != 3 {
-                let sis = self.sps.strong_intra_smoothing_enabled_flag;
-                let scan_order = residual::get_scan_order(2, intra_chroma_mode.as_u8(), 1);
-
-                // Predict and apply Cb
-                intra::predict_intra(frame, x0 / 2, y0 / 2, 2, intra_chroma_mode, 1, sis);
-                if cbf_cb {
-                    self.decode_and_apply_residual(x0 / 2, y0 / 2, 2, 1, scan_order, frame)?;
-                }
-
-                // Predict and apply Cr
-                intra::predict_intra(frame, x0 / 2, y0 / 2, 2, intra_chroma_mode, 2, sis);
-                if cbf_cr {
-                    self.decode_and_apply_residual(x0 / 2, y0 / 2, 2, 2, scan_order, frame)?;
-                }
+            // When an 8x8 luma transform splits to 4x4 children, subsampled
+            // chroma is decoded once here after the four luma children.
+            if log2_size == 3 && matches!(frame.chroma_format, 1 | 2) {
+                self.decode_split_subsampled_chroma(
+                    x0,
+                    y0,
+                    intra_chroma_mode,
+                    cbf_cb,
+                    cbf_cr,
+                    frame,
+                )?;
             }
         } else {
             // Decode transform unit (leaf node)
@@ -1138,8 +1154,8 @@ impl<'a> SliceContext<'a> {
         trafo_depth: u8,
         _intra_luma_mode: IntraPredMode,
         intra_chroma_mode: IntraPredMode,
-        cbf_cb: bool,
-        cbf_cr: bool,
+        cbf_cb: u8,
+        cbf_cr: u8,
         frame: &mut DecodedFrame,
     ) -> Result<()> {
         let debug_tt = self.debug_ctu;
@@ -1155,7 +1171,7 @@ impl<'a> SliceContext<'a> {
 
         // Per H.265 7.3.8.11: decode cu_qp_delta before residuals
         // Condition: (cbf_luma || cbf_cb || cbf_cr) && cu_qp_delta_enabled_flag && !IsCuQpDeltaCoded
-        if (cbf_luma || cbf_cb || cbf_cr)
+        if (cbf_luma || cbf_cb != 0 || cbf_cr != 0)
             && self.pps.cu_qp_delta_enabled_flag
             && !self.is_cu_qp_delta_coded
         {
@@ -1213,55 +1229,173 @@ impl<'a> SliceContext<'a> {
             self.decode_and_apply_residual(x0, y0, log2_size, 0, scan_order, frame)?;
         }
 
-        // Decode chroma: predict + residual per component if not handled by parent.
-        // For 4:2:0: chroma TU is half the luma TU size, minimum 4x4 (log2=2),
-        //   so chroma is only decoded here when log2_size >= 3 (8x8+ luma → 4x4+ chroma).
-        //   When log2_size < 3, the parent 8x8 node handles chroma.
-        // For 4:4:4: chroma TU is the same size as luma, always decoded here.
-        let is_444 = frame.chroma_format == 3;
-        let chroma_here = if is_444 {
-            true // 4:4:4: chroma always at TU level
-        } else {
-            log2_size >= 3 // 4:2:0: only when luma TU >= 8x8
-        };
+        self.decode_leaf_chroma(x0, y0, log2_size, intra_chroma_mode, cbf_cb, cbf_cr, frame)?;
 
-        if chroma_here {
-            let (chroma_log2_size, cx, cy) = if is_444 {
-                (log2_size, x0, y0)
-            } else {
-                (log2_size - 1, x0 / 2, y0 / 2)
-            };
-            let chroma_scan_order =
-                residual::get_scan_order(chroma_log2_size, intra_chroma_mode.as_u8(), 1);
+        Ok(())
+    }
 
-            // Predict and apply Cb
-            intra::predict_intra(frame, cx, cy, chroma_log2_size, intra_chroma_mode, 1, sis);
-            if cbf_cb {
-                self.decode_and_apply_residual(
+    fn decode_split_subsampled_chroma(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        intra_chroma_mode: IntraPredMode,
+        cbf_cb: u8,
+        cbf_cr: u8,
+        frame: &mut DecodedFrame,
+    ) -> Result<()> {
+        match frame.chroma_format {
+            1 => {
+                let cx = x0 / 2;
+                let cy = y0 / 2;
+                self.decode_chroma_block(cx, cy, 2, 1, cbf_cb & 1 != 0, intra_chroma_mode, frame)?;
+                self.decode_chroma_block(cx, cy, 2, 2, cbf_cr & 1 != 0, intra_chroma_mode, frame)?;
+            }
+            2 => {
+                let cx = x0 / 2;
+                let cy = y0;
+                self.decode_chroma_block(cx, cy, 2, 1, cbf_cb & 1 != 0, intra_chroma_mode, frame)?;
+                self.decode_chroma_block(
+                    cx,
+                    cy + 4,
+                    2,
+                    1,
+                    cbf_cb & 2 != 0,
+                    intra_chroma_mode,
+                    frame,
+                )?;
+                self.decode_chroma_block(cx, cy, 2, 2, cbf_cr & 1 != 0, intra_chroma_mode, frame)?;
+                self.decode_chroma_block(
+                    cx,
+                    cy + 4,
+                    2,
+                    2,
+                    cbf_cr & 2 != 0,
+                    intra_chroma_mode,
+                    frame,
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn decode_leaf_chroma(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        intra_chroma_mode: IntraPredMode,
+        cbf_cb: u8,
+        cbf_cr: u8,
+        frame: &mut DecodedFrame,
+    ) -> Result<()> {
+        match frame.chroma_format {
+            1 if log2_size >= 3 => {
+                let chroma_log2_size = log2_size - 1;
+                let cx = x0 / 2;
+                let cy = y0 / 2;
+                self.decode_chroma_block(
                     cx,
                     cy,
                     chroma_log2_size,
                     1,
-                    chroma_scan_order,
+                    cbf_cb & 1 != 0,
+                    intra_chroma_mode,
                     frame,
                 )?;
-            }
-
-            // Predict and apply Cr
-            intra::predict_intra(frame, cx, cy, chroma_log2_size, intra_chroma_mode, 2, sis);
-            if cbf_cr {
-                self.decode_and_apply_residual(
+                self.decode_chroma_block(
                     cx,
                     cy,
                     chroma_log2_size,
                     2,
-                    chroma_scan_order,
+                    cbf_cr & 1 != 0,
+                    intra_chroma_mode,
                     frame,
                 )?;
             }
+            2 if log2_size >= 3 => {
+                let chroma_log2_size = (log2_size - 1).max(2);
+                let chroma_size = 1u32 << chroma_log2_size;
+                let cx = x0 / 2;
+                let cy = y0;
+                self.decode_chroma_block(
+                    cx,
+                    cy,
+                    chroma_log2_size,
+                    1,
+                    cbf_cb & 1 != 0,
+                    intra_chroma_mode,
+                    frame,
+                )?;
+                self.decode_chroma_block(
+                    cx,
+                    cy + chroma_size,
+                    chroma_log2_size,
+                    1,
+                    cbf_cb & 2 != 0,
+                    intra_chroma_mode,
+                    frame,
+                )?;
+                self.decode_chroma_block(
+                    cx,
+                    cy,
+                    chroma_log2_size,
+                    2,
+                    cbf_cr & 1 != 0,
+                    intra_chroma_mode,
+                    frame,
+                )?;
+                self.decode_chroma_block(
+                    cx,
+                    cy + chroma_size,
+                    chroma_log2_size,
+                    2,
+                    cbf_cr & 2 != 0,
+                    intra_chroma_mode,
+                    frame,
+                )?;
+            }
+            3 => {
+                self.decode_chroma_block(
+                    x0,
+                    y0,
+                    log2_size,
+                    1,
+                    cbf_cb & 1 != 0,
+                    intra_chroma_mode,
+                    frame,
+                )?;
+                self.decode_chroma_block(
+                    x0,
+                    y0,
+                    log2_size,
+                    2,
+                    cbf_cr & 1 != 0,
+                    intra_chroma_mode,
+                    frame,
+                )?;
+            }
+            _ => {}
         }
-        // Note: for 4:2:0, if log2_size < 3, chroma was predicted+decoded by parent when splitting from 8x8
+        Ok(())
+    }
 
+    fn decode_chroma_block(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        c_idx: u8,
+        cbf: bool,
+        intra_chroma_mode: IntraPredMode,
+        frame: &mut DecodedFrame,
+    ) -> Result<()> {
+        let sis = self.sps.strong_intra_smoothing_enabled_flag;
+        let scan_order = residual::get_scan_order(log2_size, intra_chroma_mode.as_u8(), c_idx);
+        intra::predict_intra(frame, x0, y0, log2_size, intra_chroma_mode, c_idx, sis);
+        if cbf {
+            self.decode_and_apply_residual(x0, y0, log2_size, c_idx, scan_order, frame)?;
+        }
         Ok(())
     }
 
@@ -1521,31 +1655,46 @@ impl<'a> SliceContext<'a> {
     fn decode_intra_chroma_mode(&mut self, luma_mode: IntraPredMode) -> Result<IntraPredMode> {
         let ctx_idx = context::INTRA_CHROMA_PRED_MODE;
         let first_bin = self.cabac.decode_bin(&mut self.ctx[ctx_idx])?;
-        if first_bin == 0 {
+        let intra_chroma_mode = if first_bin == 0 {
             // Mode 4: derived from luma
             se_trace("intra_chroma_mode", 4, &self.cabac);
-            return Ok(luma_mode);
+            luma_mode
+        } else {
+            // Read 2 fixed-length bypass bits for modes 0-3
+            let mode_idx = self.cabac.decode_bypass_bits(2)? as u8;
+            se_trace("intra_chroma_mode", mode_idx as i64, &self.cabac);
+
+            let candidate = match mode_idx {
+                0 => IntraPredMode::Planar,
+                1 => IntraPredMode::Angular26, // Vertical
+                2 => IntraPredMode::Angular10, // Horizontal
+                _ => IntraPredMode::Dc,        // mode_idx == 3
+            };
+
+            // Per Table 8-2: if candidate collides with luma mode, use Angular34
+            if candidate == luma_mode {
+                IntraPredMode::Angular34
+            } else {
+                candidate
+            }
+        };
+
+        Ok(self.map_chroma_mode_for_format(intra_chroma_mode))
+    }
+
+    fn map_chroma_mode_for_format(&self, mode: IntraPredMode) -> IntraPredMode {
+        if self.sps.chroma_format_idc != 2 {
+            return mode;
         }
 
-        // Read 2 fixed-length bypass bits for modes 0-3
-        let mode_idx = self.cabac.decode_bypass_bits(2)? as u8;
-        se_trace("intra_chroma_mode", mode_idx as i64, &self.cabac);
-
-        let candidate = match mode_idx {
-            0 => IntraPredMode::Planar,
-            1 => IntraPredMode::Angular26, // Vertical
-            2 => IntraPredMode::Angular10, // Horizontal
-            _ => IntraPredMode::Dc,        // mode_idx == 3
-        };
-
-        // Per Table 8-2: if candidate collides with luma mode, use Angular34
-        let intra_chroma_mode = if candidate == luma_mode {
-            IntraPredMode::Angular34
-        } else {
-            candidate
-        };
-
-        Ok(intra_chroma_mode)
+        // H.265 Table 8-3 remaps 4:2:2 chroma intra modes so angular
+        // prediction and chroma coefficient scan selection use the 4:2:2 geometry.
+        const MAP_CHROMA_422: [u8; 35] = [
+            0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24,
+            25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31,
+        ];
+        let mapped = MAP_CHROMA_422[mode.as_u8() as usize];
+        IntraPredMode::from_u8(mapped).unwrap_or(mode)
     }
 
     /// Decode intra prediction modes (luma + chroma) for Part2Nx2N

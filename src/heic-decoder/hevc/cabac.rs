@@ -239,6 +239,18 @@ impl<'a> CabacDecoder<'a> {
         }
     }
 
+    /// Reinitialize CABAC at an absolute byte offset within this slice data.
+    pub fn seek_to(&mut self, byte_pos: usize) -> Result<()> {
+        if byte_pos > self.data.len() {
+            return Err(HevcError::CabacError(
+                "entry point offset beyond slice data",
+            ));
+        }
+        self.byte_pos = byte_pos;
+        self.reinit();
+        Ok(())
+    }
+
     /// Read a single bit from the bitstream (for regular context decoding)
     fn read_bit(&mut self) -> Result<u32> {
         self.value <<= 1;

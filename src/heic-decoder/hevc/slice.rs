@@ -6,6 +6,7 @@
 use super::bitstream::{BitstreamReader, NalUnit};
 use super::params::{Pps, Sps};
 use crate::heic_decoder::error::HevcError;
+use alloc::vec::Vec;
 
 type Result<T> = core::result::Result<T, HevcError>;
 
@@ -220,6 +221,8 @@ pub struct SliceHeader {
 
     /// Number of entry point offsets (for tiles/WPP)
     pub num_entry_point_offsets: u32,
+    /// Cumulative entry point offsets from the start of slice data.
+    pub entry_point_offsets: Vec<u32>,
 
     /// Derived: SliceQPY = 26 + pps.init_qp_minus26 + slice_qp_delta
     pub slice_qp_y: i32,
@@ -387,19 +390,29 @@ impl SliceHeader {
         };
 
         // Entry point offsets (tiles/WPP)
-        let num_entry_point_offsets =
+        let (num_entry_point_offsets, entry_point_offsets) =
             if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag {
                 let n = reader.read_ue()?;
+                let mut offsets = Vec::with_capacity(n as usize);
                 if n > 0 {
-                    // Skip the actual offset values for now
                     let offset_len = reader.read_ue()? as u8 + 1;
+                    let mut cumulative = 0u32;
                     for _ in 0..n {
-                        reader.read_bits(offset_len)?;
+                        let offset = reader
+                            .read_bits(offset_len)?
+                            .checked_add(1)
+                            .ok_or(HevcError::InvalidBitstream("entry point offset overflow"))?;
+                        cumulative = cumulative
+                            .checked_add(offset)
+                            .ok_or(HevcError::InvalidBitstream("entry point offset overflow"))?;
+                        offsets.push(cumulative);
                     }
+                } else {
+                    offsets.clear();
                 }
-                n
+                (n, offsets)
             } else {
-                0
+                (0, Vec::new())
             };
 
         // Skip slice segment header extension
@@ -443,6 +456,7 @@ impl SliceHeader {
                 slice_tc_offset_div2,
                 slice_loop_filter_across_slices_enabled_flag,
                 num_entry_point_offsets,
+                entry_point_offsets,
                 slice_qp_y,
             },
             data_offset,

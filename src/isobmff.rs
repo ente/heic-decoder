@@ -735,6 +735,7 @@ pub struct HeicGridTileItemData {
     pub item_id: u32,
     pub construction_method: u8,
     pub hvcc: HevcDecoderConfigurationBox,
+    pub colr: PrimaryItemColorProperties,
     pub transforms: Vec<PrimaryItemTransformProperty>,
     pub payload: Vec<u8>,
 }
@@ -745,6 +746,7 @@ pub struct HeicGridPrimaryItemData {
     pub item_id: u32,
     pub construction_method: u8,
     pub descriptor: HeicGridDescriptor,
+    pub colr: PrimaryItemColorProperties,
     pub tile_item_ids: Vec<u32>,
     pub tiles: Vec<HeicGridTileItemData>,
 }
@@ -2853,6 +2855,15 @@ pub enum ExtractHeicItemDataError {
         item_id: u32,
         version: u8,
     },
+    GridColorInformation {
+        item_id: u32,
+        source: ParseColorInformationPropertyError,
+    },
+    GridTileColorInformation {
+        item_id: u32,
+        tile_item_id: u32,
+        source: ParseColorInformationPropertyError,
+    },
     MissingGridTileReferences {
         item_id: u32,
     },
@@ -2976,6 +2987,18 @@ impl Display for ExtractHeicItemDataError {
                     "primary grid item_ID {item_id} has unsupported descriptor version {version}"
                 )
             }
+            ExtractHeicItemDataError::GridColorInformation { item_id, source } => write!(
+                f,
+                "primary grid item_ID {item_id} has invalid colr property: {source}"
+            ),
+            ExtractHeicItemDataError::GridTileColorInformation {
+                item_id,
+                tile_item_id,
+                source,
+            } => write!(
+                f,
+                "primary grid item_ID {item_id} tile item_ID {tile_item_id} has invalid colr property: {source}"
+            ),
             ExtractHeicItemDataError::MissingGridTileReferences { item_id } => write!(
                 f,
                 "primary grid item_ID {item_id} has no dimg tile references"
@@ -3127,6 +3150,8 @@ impl Error for ExtractHeicItemDataError {
             ExtractHeicItemDataError::Meta(err) => Some(err),
             ExtractHeicItemDataError::ResolvePrimaryItem(err) => Some(err),
             ExtractHeicItemDataError::MetaChildBoxes(err) => Some(err),
+            ExtractHeicItemDataError::GridColorInformation { source, .. } => Some(source),
+            ExtractHeicItemDataError::GridTileColorInformation { source, .. } => Some(source),
             ExtractHeicItemDataError::GridTileCodecConfiguration { source, .. } => Some(source),
             ExtractHeicItemDataError::GridTileCleanAperture { source, .. } => Some(source),
             ExtractHeicItemDataError::GridTileRotation { source, .. } => Some(source),
@@ -4320,6 +4345,25 @@ fn extract_primary_heic_item_data_with_grid_internal(
         item_id,
     )?;
     let descriptor = parse_heic_grid_descriptor(item_id, &grid_payload)?;
+    let mut colr = PrimaryItemColorProperties::default();
+    for property in &resolved.primary_item.properties {
+        if property.property.header.box_type.as_bytes() != COLR_BOX_TYPE {
+            continue;
+        }
+
+        let parsed_colr = property
+            .property
+            .parse_colr()
+            .map_err(|source| ExtractHeicItemDataError::GridColorInformation { item_id, source })?;
+        match parsed_colr.information {
+            ColorInformation::Nclx(profile) => {
+                colr.nclx = Some(profile);
+            }
+            ColorInformation::Icc(profile) => {
+                colr.icc = Some(profile);
+            }
+        }
+    }
 
     let tile_item_ids: Vec<u32> = resolved
         .primary_item
@@ -4382,7 +4426,7 @@ fn extract_primary_heic_item_data_with_grid_internal(
             });
         }
 
-        let (tile_hvcc, tile_transforms) = resolve_grid_tile_hvcc_and_transforms(
+        let (tile_hvcc, tile_colr, tile_transforms) = resolve_grid_tile_hvcc_colr_and_transforms(
             item_id,
             tile_item_id,
             &resolved.iprp.associations,
@@ -4409,6 +4453,7 @@ fn extract_primary_heic_item_data_with_grid_internal(
             item_id: tile_item_id,
             construction_method: tile_construction_method,
             hvcc: tile_hvcc,
+            colr: tile_colr,
             transforms: tile_transforms,
             payload,
         });
@@ -4418,12 +4463,13 @@ fn extract_primary_heic_item_data_with_grid_internal(
         item_id,
         construction_method,
         descriptor,
+        colr,
         tile_item_ids,
         tiles,
     }))
 }
 
-fn resolve_grid_tile_hvcc_and_transforms(
+fn resolve_grid_tile_hvcc_colr_and_transforms(
     item_id: u32,
     tile_item_id: u32,
     associations: &[ItemPropertyAssociationBox],
@@ -4431,11 +4477,13 @@ fn resolve_grid_tile_hvcc_and_transforms(
 ) -> Result<
     (
         HevcDecoderConfigurationBox,
+        PrimaryItemColorProperties,
         Vec<PrimaryItemTransformProperty>,
     ),
     ExtractHeicItemDataError,
 > {
     let mut hvcc = None;
+    let mut colr = PrimaryItemColorProperties::default();
     let mut transforms = Vec::new();
 
     for association_box in associations {
@@ -4460,7 +4508,23 @@ fn resolve_grid_tile_hvcc_and_transforms(
                 }
                 let property = &flattened_properties[property_index];
                 if property.header.box_type.as_bytes() != HVCC_BOX_TYPE {
-                    if property.header.box_type.as_bytes() == CLAP_BOX_TYPE {
+                    if property.header.box_type.as_bytes() == COLR_BOX_TYPE {
+                        let parsed_colr = property.parse_colr().map_err(|source| {
+                            ExtractHeicItemDataError::GridTileColorInformation {
+                                item_id,
+                                tile_item_id,
+                                source,
+                            }
+                        })?;
+                        match parsed_colr.information {
+                            ColorInformation::Nclx(profile) => {
+                                colr.nclx = Some(profile);
+                            }
+                            ColorInformation::Icc(profile) => {
+                                colr.icc = Some(profile);
+                            }
+                        }
+                    } else if property.header.box_type.as_bytes() == CLAP_BOX_TYPE {
                         transforms.push(PrimaryItemTransformProperty::CleanAperture(
                             property.parse_clap().map_err(|source| {
                                 ExtractHeicItemDataError::GridTileCleanAperture {
@@ -4520,7 +4584,7 @@ fn resolve_grid_tile_hvcc_and_transforms(
             tile_item_id,
         },
     )?;
-    Ok((hvcc, transforms))
+    Ok((hvcc, colr, transforms))
 }
 
 fn resolve_primary_heic_item_graph<'a>(
