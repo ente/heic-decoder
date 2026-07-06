@@ -104,6 +104,10 @@ pub struct Sps {
     pub matrix_coeffs: u8,
     /// Colour primaries (from VUI). 2=unspecified
     pub colour_primaries: u8,
+    /// First enabled SPS range-extension coding tool that the decoder does
+    /// not implement (None when the stream uses none). Checked at decode
+    /// time so metadata-only parsing stays capability-agnostic.
+    pub unsupported_rext_tool: Option<&'static str>,
 }
 
 impl Sps {
@@ -508,14 +512,6 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
 
     let bit_depth_luma_minus8 = reader.read_ue()? as u8;
     let bit_depth_chroma_minus8 = reader.read_ue()? as u8;
-    // The decoder pipeline (intra clamps, deblock/SAO scaling, output
-    // conversion) assumes one bit depth for all planes; differing depths are
-    // RExt-only and would silently decode wrong. Reject loudly.
-    if chroma_format_idc != 0 && bit_depth_chroma_minus8 != bit_depth_luma_minus8 {
-        return Err(HevcError::Unsupported(
-            "different luma and chroma bit depths",
-        ));
-    }
     let log2_max_pic_order_cnt_lsb_minus4 = reader.read_ue()? as u8;
 
     let sub_layer_ordering_info_present_flag = reader.read_bit()? != 0;
@@ -556,13 +552,22 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
     let sample_adaptive_offset_enabled_flag = reader.read_bit()? != 0;
 
     let pcm_enabled_flag = reader.read_bit()? != 0;
-    if pcm_enabled_flag {
-        // pcm_flag is not decoded in the CU layer; with PCM enabled every
-        // eligible CU codes that bin, so continuing would desync CABAC and
-        // produce silent garbage. Reject loudly instead.
-        return Err(HevcError::Unsupported("IPCM (pcm_enabled_flag)"));
-    }
-    let pcm_params: Option<PcmParams> = None;
+    let pcm_params = if pcm_enabled_flag {
+        let pcm_sample_bit_depth_luma_minus1 = reader.read_bits(4)? as u8;
+        let pcm_sample_bit_depth_chroma_minus1 = reader.read_bits(4)? as u8;
+        let log2_min_pcm_luma_coding_block_size_minus3 = reader.read_ue()? as u8;
+        let log2_diff_max_min_pcm_luma_coding_block_size = reader.read_ue()? as u8;
+        let pcm_loop_filter_disabled_flag = reader.read_bit()? != 0;
+        Some(PcmParams {
+            pcm_sample_bit_depth_luma_minus1,
+            pcm_sample_bit_depth_chroma_minus1,
+            log2_min_pcm_luma_coding_block_size_minus3,
+            log2_diff_max_min_pcm_luma_coding_block_size,
+            pcm_loop_filter_disabled_flag,
+        })
+    } else {
+        None
+    };
 
     let num_short_term_ref_pic_sets = reader.read_ue()? as u8;
     // Skip short term ref pic sets (not needed for still images), tracking
@@ -629,6 +634,7 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
     }
 
     // SPS extensions (H.265 7.3.2.2.1)
+    let mut unsupported_rext_tool: Option<&'static str> = None;
     let sps_extension_present_flag = reader.read_bit()? != 0;
     if sps_extension_present_flag {
         let sps_range_extension_flag = reader.read_bit()? != 0;
@@ -639,8 +645,9 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
 
         if sps_range_extension_flag {
             // Range-extension coding tools change bitstream syntax and/or
-            // reconstruction; none are implemented, so reject any that are
-            // enabled instead of silently misdecoding.
+            // reconstruction; none are implemented. Record the first enabled
+            // one so the decoder can reject it loudly (parsing stays
+            // capability-agnostic for metadata-only callers).
             let names: [&'static str; 9] = [
                 "transform_skip_rotation_enabled_flag",
                 "transform_skip_context_enabled_flag",
@@ -656,8 +663,11 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
                 let flag = reader.read_bit()? != 0;
                 // high_precision_offsets only affects inter weighted
                 // prediction, which still images never use.
-                if flag && name != "high_precision_offsets_enabled_flag" {
-                    return Err(HevcError::Unsupported(name));
+                if flag
+                    && name != "high_precision_offsets_enabled_flag"
+                    && unsupported_rext_tool.is_none()
+                {
+                    unsupported_rext_tool = Some(name);
                 }
             }
         }
@@ -700,6 +710,7 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
         video_full_range_flag,
         matrix_coeffs,
         colour_primaries,
+        unsupported_rext_tool,
     })
 }
 

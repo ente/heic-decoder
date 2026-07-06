@@ -57,6 +57,26 @@ fn decode_nal_units(nal_units: &[bitstream::NalUnit<'_>]) -> Result<DecodedFrame
     let sps = sps.ok_or(HevcError::MissingParameterSet("SPS"))?;
     let pps = pps.ok_or(HevcError::MissingParameterSet("PPS"))?;
 
+    // Capability checks live here rather than in the SPS parser so that
+    // metadata-only callers can still read dimensions/bit depths of valid
+    // streams this decoder cannot decode.
+    if sps.pcm_enabled_flag {
+        // pcm_flag is not decoded in the CU layer; with PCM enabled every
+        // eligible CU codes that bin, so continuing would desync CABAC and
+        // produce silent garbage.
+        return Err(HevcError::Unsupported("IPCM (pcm_enabled_flag)"));
+    }
+    if sps.chroma_format_idc != 0 && sps.bit_depth_chroma_minus8 != sps.bit_depth_luma_minus8 {
+        // The pipeline (intra clamps, deblock/SAO scaling, output conversion)
+        // assumes one bit depth for all planes.
+        return Err(HevcError::Unsupported(
+            "different luma and chroma bit depths",
+        ));
+    }
+    if let Some(tool) = sps.unsupported_rext_tool {
+        return Err(HevcError::Unsupported(tool));
+    }
+
     // Sanity-check dimensions before allocating (prevent OOM from malicious SPS)
     let w = sps.pic_width_in_luma_samples;
     let h = sps.pic_height_in_luma_samples;

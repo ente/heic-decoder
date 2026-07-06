@@ -8717,7 +8717,9 @@ fn scale_sample_to_u16(sample: u16, bit_depth: u8) -> u16 {
     // Left shift into the top bits, byte-identical to libheif's PNG writer
     // expansion (its `| (v >> (16 - shift))` replication term is always zero
     // for in-range samples, so this is a plain shift there too). Peak white at
-    // bit depth b maps to ((1<<b)-1) << (16-b), not 65535.
+    // bit depth b maps to ((1<<b)-1) << (16-b), not 65535. Do not "fix" this
+    // to true bit replication: heif-dec, the pixel-parity oracle for the test
+    // harness, emits exactly these shifted values.
     let shift = 16 - u32::from(bit_depth);
     (u32::from(sample) << shift).min(u32::from(u16::MAX)) as u16
 }
