@@ -4587,6 +4587,54 @@ fn resolve_grid_tile_hvcc_colr_and_transforms(
     Ok((hvcc, colr, transforms))
 }
 
+/// ICC colour profile for the primary HEIC item, mirroring libheif: the
+/// primary item's own `colr` ICC wins; a `grid` primary without one inherits
+/// the first tile's ICC (libheif/libheif/context.cc).
+pub fn primary_heic_icc_profile(input: &[u8]) -> Option<Vec<u8>> {
+    let (_meta, resolved) = resolve_primary_heic_item_graph(input).ok()?;
+
+    let mut icc = None;
+    for property in &resolved.primary_item.properties {
+        if property.property.header.box_type.as_bytes() != COLR_BOX_TYPE {
+            continue;
+        }
+        if let Ok(parsed_colr) = property.property.parse_colr()
+            && let ColorInformation::Icc(profile) = parsed_colr.information
+        {
+            icc = Some(profile.profile);
+        }
+    }
+    if icc.is_some() {
+        return icc;
+    }
+
+    // Grid primary without its own ICC: inherit the first tile's.
+    let item_type = resolved.primary_item.item_info.item_type?;
+    if item_type.as_bytes() != GRID_ITEM_TYPE {
+        return None;
+    }
+    let tile_item_id = resolved
+        .primary_item
+        .references
+        .iter()
+        .filter(|reference| reference.reference_type.as_bytes() == DIMG_REFERENCE_TYPE)
+        .flat_map(|reference| reference.to_item_ids.iter().copied())
+        .next()?;
+
+    let mut flattened_properties = Vec::new();
+    for property_container in &resolved.iprp.property_containers {
+        flattened_properties.extend(property_container.properties.iter().cloned());
+    }
+    let (_, tile_colr, _) = resolve_grid_tile_hvcc_colr_and_transforms(
+        resolved.primary_item.item_id,
+        tile_item_id,
+        &resolved.iprp.associations,
+        &flattened_properties,
+    )
+    .ok()?;
+    tile_colr.icc.map(|profile| profile.profile)
+}
+
 fn resolve_primary_heic_item_graph<'a>(
     input: &'a [u8],
 ) -> Result<(MetaBox<'a>, ResolvedPrimaryItemGraph<'a>), ExtractHeicItemDataError> {

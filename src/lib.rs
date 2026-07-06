@@ -4226,8 +4226,19 @@ fn apply_heic_grid_tile_transforms(
     // ImageItem_Grid::decode_and_paste_tile_image, which calls tile image-item
     // decode flow applying clap/irot/imir transforms).
     for transform in transforms {
-        if let isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture) = transform {
-            decoded = crop_heic_by_clean_aperture(decoded, *clean_aperture)?;
+        match transform {
+            isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture) => {
+                decoded = crop_heic_by_clean_aperture(decoded, *clean_aperture)?;
+            }
+            // Per-tile rotation/mirror would require plane-level transforms
+            // before pasting (libheif applies them); silently skipping them
+            // scrambles tile content, so reject loudly until implemented.
+            isobmff::PrimaryItemTransformProperty::Rotation(_)
+            | isobmff::PrimaryItemTransformProperty::Mirror(_) => {
+                return Err(DecodeHeicError::InvalidDecodedFrame {
+                    detail: "grid tile irot/imir transforms are not supported".to_string(),
+                });
+            }
         }
     }
     Ok(decoded)
@@ -6416,8 +6427,11 @@ fn primary_icc_profile_from_resolved_avif_graph(
         if property.property.header.box_type.as_bytes() != *b"colr" {
             continue;
         }
-        let parsed_colr = property.property.parse_colr().ok()?;
-        if let isobmff::ColorInformation::Icc(profile) = parsed_colr.information {
+        // Tolerate individually malformed colr boxes (libheif parses each
+        // independently) instead of discarding an already-found profile.
+        if let Ok(parsed_colr) = property.property.parse_colr()
+            && let isobmff::ColorInformation::Icc(profile) = parsed_colr.information
+        {
             icc_profile = Some(profile.profile);
         }
     }
@@ -6426,26 +6440,35 @@ fn primary_icc_profile_from_resolved_avif_graph(
 
 fn primary_icc_profile_from_heic(input: &[u8]) -> Option<Vec<u8>> {
     // Provenance: primary-item colr extraction follows libheif item-property
-    // traversal in libheif/libheif/context.cc, with colr payload parsing from
+    // traversal in libheif/libheif/context.cc (including the grid item's
+    // first-tile ICC inheritance), with colr payload parsing from
     // libheif/libheif/nclx.cc:Box_colr::parse.
-    isobmff::parse_primary_heic_item_preflight_properties(input)
-        .ok()
-        .and_then(|properties| properties.colr.icc.map(|profile| profile.profile))
+    isobmff::primary_heic_icc_profile(input)
 }
 
 fn ycbcr_range_from_primary_colr(colr: &isobmff::PrimaryItemColorProperties) -> YCbCrRange {
     ycbcr_range_override_from_primary_colr(colr).unwrap_or(YCbCrRange::Full)
 }
 
+/// libheif treats an all-"unspecified" nclx (primaries 2, transfer 2,
+/// matrix 2, full range) as undefined and keeps the decoder-attached VUI
+/// profile instead (libheif/libheif/image-item.cc + nclx.cc:is_undefined).
+fn nclx_is_undefined(nclx: &isobmff::NclxColorProfile) -> bool {
+    nclx.colour_primaries == 2
+        && nclx.transfer_characteristics == 2
+        && nclx.matrix_coefficients == 2
+        && nclx.full_range_flag
+}
+
 fn ycbcr_range_override_from_primary_colr(
     colr: &isobmff::PrimaryItemColorProperties,
 ) -> Option<YCbCrRange> {
     // Provenance: mirrors libheif container color-profile override semantics:
-    // if no primary-item nclx exists, decoder-provided stream metadata remains
-    // in effect (libheif/libheif/color-conversion/yuv2rgb.cc:
-    // Op_YCbCr_to_RGB::convert_colorspace and
+    // if no primary-item nclx exists (or it is "undefined"), decoder-provided
+    // stream metadata remains in effect (libheif/libheif/color-conversion/
+    // yuv2rgb.cc:Op_YCbCr_to_RGB::convert_colorspace and
     // libheif/libheif/plugins/decoder_libde265.cc color-profile population).
-    colr.nclx.as_ref().map(|nclx| {
+    colr.nclx.as_ref().filter(|nclx| !nclx_is_undefined(nclx)).map(|nclx| {
         if nclx.full_range_flag {
             YCbCrRange::Full
         } else {
@@ -6465,7 +6488,10 @@ fn ycbcr_matrix_override_from_primary_colr(
 ) -> Option<YCbCrMatrixCoefficients> {
     // Provenance: default/parsed matrix metadata mirrors libheif nclx handling in
     // libheif/libheif/nclx.cc:{nclx_profile::set_undefined,Box_colr::parse}.
-    colr.nclx.as_ref().map(|nclx| YCbCrMatrixCoefficients {
+    colr.nclx
+        .as_ref()
+        .filter(|nclx| !nclx_is_undefined(nclx))
+        .map(|nclx| YCbCrMatrixCoefficients {
         matrix_coefficients: nclx.matrix_coefficients,
         colour_primaries: nclx.colour_primaries,
     })
