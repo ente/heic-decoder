@@ -738,8 +738,179 @@ decode_with_helper() {
   "$HELPER_BIN_DIR/heif-decode" --orientation preserve "$1" "$2"
 }
 
+failure_reason_from_log() {
+  tr '\n' ' ' < "$1" | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//'
+}
+
 decode_failure_category_from_log() {
   sed -nE 's/^Decode failed \[category=([^]]+)\]:.*/\1/p' "$1" | head -n 1
+}
+
+reason_contains() {
+  local haystack="$1"
+  local needle="$2"
+  case "$haystack" in
+    *"$needle"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+libheif_relative_path() {
+  local path="$1"
+  case "$path" in
+    "$LIBHEIF_SOURCE_DIR"/*) printf '%s\n' "${path#$LIBHEIF_SOURCE_DIR/}" ;;
+    "$ASSET_ROOT/libheif"/*) printf '%s\n' "${path#$ASSET_ROOT/libheif/}" ;;
+    .heic-test-assets/libheif/*) printf '%s\n' "${path#.heic-test-assets/libheif/}" ;;
+    libheif/*) printf '%s\n' "${path#libheif/}" ;;
+    *) return 1 ;;
+  esac
+}
+
+expected_validator_failure_kind() {
+  local input_file="$1"
+  local validator_reason="$2"
+  local rel_path
+  rel_path="$(libheif_relative_path "$input_file")" || return 1
+
+  case "$rel_path" in
+    fuzzing/data/corpus/avc32.heif|\
+    fuzzing/data/corpus/vvc32.heif)
+      reason_contains "$validator_reason" "Support for this compression format" || return 1
+      echo "missing-validator-codec"
+      return 0
+      ;;
+    fuzzing/data/corpus/avif32-mini.heif|\
+    fuzzing/data/corpus/hevc32-mini.heif|\
+    tests/data/lightning_mini.heif|\
+    tests/data/simple_osm_tile_alpha.avif|\
+    tests/data/simple_osm_tile_meta.avif)
+      reason_contains "$validator_reason" "No supported brands found" || return 1
+      echo "unsupported-brand"
+      return 0
+      ;;
+    fuzzing/data/corpus/clap-overflow-divide-zero.heic|\
+    fuzzing/data/corpus/clusterfuzz-testcase-minimized-file-fuzzer-4616081830051840.heic|\
+    fuzzing/data/corpus/clusterfuzz-testcase-minimized-file-fuzzer-5120279175102464.heic|\
+    fuzzing/data/corpus/clusterfuzz-testcase-minimized-file-fuzzer-5643900194127872.heic|\
+    fuzzing/data/corpus/clusterfuzz-testcase-minimized-file-fuzzer-5651556035198976.heic|\
+    fuzzing/data/corpus/clusterfuzz-testcase-minimized-file-fuzzer-5662360964956160.heic|\
+    fuzzing/data/corpus/clusterfuzz-testcase-minimized-file-fuzzer-5686319331672064.heic|\
+    fuzzing/data/corpus/clusterfuzz-testcase-minimized-file-fuzzer-5718632116518912.heic|\
+    fuzzing/data/corpus/clusterfuzz-testcase-minimized-file-fuzzer-5720856641142784.heic|\
+    fuzzing/data/corpus/clusterfuzz-testcase-minimized-file-fuzzer-5724458239655936.heic|\
+    fuzzing/data/corpus/clusterfuzz-testcase-minimized-file-fuzzer-5732616832024576.heic|\
+    fuzzing/data/corpus/clusterfuzz-testcase-minimized-file-fuzzer-5757633845264384.heic|\
+    fuzzing/data/corpus/crash-20ca2625096a205937b809a7841e7f019f0b2dc6.heic|\
+    fuzzing/data/corpus/github_138.heic|\
+    fuzzing/data/corpus/github_367_2.heic|\
+    fuzzing/data/corpus/github_44.heic|\
+    fuzzing/data/corpus/github_45.heic|\
+    fuzzing/data/corpus/github_48.heic|\
+    fuzzing/data/corpus/github_50.heic|\
+    fuzzing/data/corpus/j2k-siz-segment-undersized.heic|\
+    fuzzing/data/corpus/region-mask-missing-refs.heic)
+      reason_contains "$validator_reason" "Unsupported data version" || return 1
+      echo "unsupported-box-version"
+      return 0
+      ;;
+    fuzzing/data/corpus/github_15.heic|\
+    fuzzing/data/corpus/github_20.heic|\
+    fuzzing/data/corpus/github_46_2.heic|\
+    fuzzing/data/corpus/github_47.heic|\
+    fuzzing/data/corpus/github_49.heic)
+      reason_contains "$validator_reason" "valid box length" || return 1
+      echo "invalid-or-truncated-box"
+      return 0
+      ;;
+    fuzzing/data/corpus/github_46_1.heic)
+      reason_contains "$validator_reason" "Invalid box size" || return 1
+      echo "invalid-box-size"
+      return 0
+      ;;
+    fuzzing/data/corpus/clusterfuzz-testcase-minimized-file-fuzzer-6045213633282048.heic|\
+    fuzzing/data/corpus/rgb_generic_compressed_brotli.heic|\
+    fuzzing/data/corpus/rgb_generic_compressed_defl.heic|\
+    fuzzing/data/corpus/rgb_generic_compressed_zlib.heic)
+      reason_contains "$validator_reason" "Unsupported essential item property" || return 1
+      echo "unsupported-essential-property"
+      return 0
+      ;;
+    fuzzing/data/corpus/rgb_generic_compressed_tile_deflate.heic|\
+    fuzzing/data/corpus/rgb_generic_compressed_zlib_rows.heic|\
+    fuzzing/data/corpus/rgb_generic_compressed_zlib_tiled.heic)
+      reason_contains "$validator_reason" "Unsupported cmpC compressed unit type" || return 1
+      echo "unsupported-compressed-unit"
+      return 0
+      ;;
+    fuzzing/data/corpus/uncompressed_comp_Y16U16V16_422.heic|\
+    fuzzing/data/corpus/uncompressed_mix_Y16U16V16_422.heic|\
+    tests/data/uncompressed_comp_Y16U16V16_422.heif|\
+    tests/data/uncompressed_mix_Y16U16V16_422.heif)
+      reason_contains "$validator_reason" "Unsupported color conversion" || return 1
+      echo "unsupported-validator-color-conversion"
+      return 0
+      ;;
+    fuzzing/data/corpus/clusterfuzz-testcase-minimized-file-fuzzer-5671864958976000.heic|\
+    fuzzing/data/corpus/clusterfuzz-testcase-minimized-file-fuzzer-5752063708495872.heic)
+      reason_contains "$validator_reason" "Decoder plugin generated an error" || return 1
+      echo "validator-decoder-error"
+      return 0
+      ;;
+    fuzzing/data/corpus/hbo_heif_context.h_126_1.heic|\
+    fuzzing/data/corpus/uaf_heif_context.h_117_1.heic)
+      reason_contains "$validator_reason" "Non-existing item ID referenced" || return 1
+      echo "broken-item-reference"
+      return 0
+      ;;
+    fuzzing/data/corpus/github_367_1.heic)
+      reason_contains "$validator_reason" "Security limit exceeded" || return 1
+      echo "validator-security-limit"
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+expected_rust_failure_kind() {
+  local input_file="$1"
+  local rust_category="$2"
+  local rust_reason="$3"
+  local rel_path
+  rel_path="$(libheif_relative_path "$input_file")" || return 1
+
+  case "$rel_path" in
+    fuzzing/data/corpus/j2k32.heif)
+      [[ "$rust_category" == "parse" ]] || return 1
+      reason_contains "$rust_reason" "item_type j2k1" || return 1
+      echo "unsupported-jpeg2000-codec"
+      return 0
+      ;;
+    fuzzing/data/corpus/jpeg32.heif)
+      [[ "$rust_category" == "parse" ]] || return 1
+      reason_contains "$rust_reason" "item_type jpeg" || return 1
+      echo "unsupported-jpeg-codec"
+      return 0
+      ;;
+    fuzzing/data/corpus/unci32.heif)
+      [[ "$rust_category" == "unsupported-feature" ]] || return 1
+      reason_contains "$rust_reason" "uncC block/endian flags" || return 1
+      echo "unsupported-uncompressed-variant"
+      return 0
+      ;;
+    fuzzing/data/corpus/avc32.heif)
+      [[ "$rust_category" == "parse" ]] || return 1
+      reason_contains "$rust_reason" "item_type avc1" || return 1
+      echo "unsupported-avc-codec"
+      return 0
+      ;;
+    fuzzing/data/corpus/vvc32.heif)
+      [[ "$rust_category" == "parse" ]] || return 1
+      reason_contains "$rust_reason" "item_type vvc1" || return 1
+      echo "unsupported-vvc-codec"
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 image_dim() {
@@ -880,10 +1051,12 @@ EOF
 
   echo "mode=$mode files=${#files[@]}" > "$report_file"
   local total=0 skipped=0 passed=0 failed=0
+  local expected_validator_failed=0 expected_validator_rust_decoded=0 expected_validator_rust_errors=0
+  local expected_rust_failed=0
   local comparable_heif=0 comparable_heic=0 comparable_avif=0
   local failures=()
 
-  local input_file rel_path id ref_png rust_png ref_raw rust_raw ref_actual rust_actual
+  local input_file rel_path id ref_png rust_png ref_raw rust_raw ref_actual rust_actual validator_log
   for input_file in "${files[@]}"; do
     total=$((total + 1))
     rel_path="$(display_path "$input_file")"
@@ -892,10 +1065,53 @@ EOF
     rust_png="$rust_dir/$id.png"
     ref_raw="$tmp_dir/$id.ref.rgba"
     rust_raw="$tmp_dir/$id.rust.rgba"
+    validator_log="$tmp_dir/$id.validator.decode.stderr.log"
 
-    if ! "$LIBHEIF_DEC_BIN" --quiet "$input_file" "$ref_png" >/dev/null 2>&1; then
-      skipped=$((skipped + 1))
-      echo "SKIP $rel_path (validator decode failed)" >> "$report_file"
+    clean_output_variants "$ref_png"
+    if "$LIBHEIF_DEC_BIN" --quiet "$input_file" "$ref_png" >/dev/null 2>"$validator_log"; then
+      :
+    else
+      local validator_reason expected_kind
+      validator_reason="$(failure_reason_from_log "$validator_log")"
+      if expected_kind="$(expected_validator_failure_kind "$input_file" "$validator_reason")"; then
+        local rust_log rust_status rust_category rust_reason
+        rust_log="$tmp_dir/$id.rust.decode.stderr.log"
+        clean_output_variants "$rust_png"
+        if decode_with_helper "$input_file" "$rust_png" >/dev/null 2>"$rust_log"; then
+          rust_status=0
+        else
+          rust_status=$?
+        fi
+
+        if [[ "$rust_status" -eq 0 ]]; then
+          if rust_actual="$(resolve_output_file "$rust_png")"; then
+            expected_validator_failed=$((expected_validator_failed + 1))
+            expected_validator_rust_decoded=$((expected_validator_rust_decoded + 1))
+            echo "EXPECTED_VALIDATOR_FAIL $rel_path (kind=$expected_kind; rust decoded)" >> "$report_file"
+            [[ "$keep_artifacts" -eq 1 ]] || rm -f "$rust_actual"
+          else
+            failed=$((failed + 1))
+            failures+=("$rel_path :: expected validator failure kind=$expected_kind, but Rust exited successfully without output")
+            echo "FAIL $rel_path (expected validator failure kind=$expected_kind; rust output file not found)" >> "$report_file"
+          fi
+        else
+          rust_category="$(decode_failure_category_from_log "$rust_log")"
+          rust_reason="$(failure_reason_from_log "$rust_log")"
+          if [[ "$rust_status" -le 128 && -n "$rust_category" ]]; then
+            expected_validator_failed=$((expected_validator_failed + 1))
+            expected_validator_rust_errors=$((expected_validator_rust_errors + 1))
+            echo "EXPECTED_VALIDATOR_FAIL $rel_path (kind=$expected_kind; rust failed category=$rust_category)" >> "$report_file"
+          else
+            failed=$((failed + 1))
+            failures+=("$rel_path :: expected validator failure kind=$expected_kind, but Rust robustness check failed status=$rust_status category=${rust_category:-none}: $rust_reason")
+            echo "FAIL $rel_path (expected validator failure kind=$expected_kind; rust robustness failed status=$rust_status category=${rust_category:-none})" >> "$report_file"
+          fi
+        fi
+      else
+        failed=$((failed + 1))
+        failures+=("$rel_path :: validator decode failed unexpectedly: ${validator_reason:-no stderr}")
+        echo "FAIL $rel_path (unexpected validator decode failure: ${validator_reason:-no stderr})" >> "$report_file"
+      fi
       continue
     fi
     if ! ref_actual="$(resolve_output_file "$ref_png")"; then
@@ -912,14 +1128,25 @@ EOF
     esac
 
     local rust_log="$tmp_dir/$id.rust.decode.stderr.log"
-    if ! decode_with_helper "$input_file" "$rust_png" >/dev/null 2>"$rust_log"; then
-      failed=$((failed + 1))
-      local category
+    local rust_status
+    if decode_with_helper "$input_file" "$rust_png" >/dev/null 2>"$rust_log"; then
+      rust_status=0
+    else
+      rust_status=$?
+    fi
+    if [[ "$rust_status" -ne 0 ]]; then
+      local category rust_reason expected_rust_kind
       category="$(decode_failure_category_from_log "$rust_log")"
-      if [[ -n "$category" ]]; then
+      rust_reason="$(failure_reason_from_log "$rust_log")"
+      if expected_rust_kind="$(expected_rust_failure_kind "$input_file" "$category" "$rust_reason")"; then
+        expected_rust_failed=$((expected_rust_failed + 1))
+        echo "EXPECTED_RUST_FAIL $rel_path (kind=$expected_rust_kind; category=$category)" >> "$report_file"
+      elif [[ -n "$category" ]]; then
+        failed=$((failed + 1))
         failures+=("$rel_path :: rust decoder failed (category=$category)")
         echo "FAIL $rel_path (rust decode failed category=$category)" >> "$report_file"
       else
+        failed=$((failed + 1))
         failures+=("$rel_path :: rust decoder failed")
         echo "FAIL $rel_path (rust decode failed)" >> "$report_file"
       fi
@@ -973,7 +1200,7 @@ EOF
   done
 
   [[ "$keep_artifacts" -eq 1 ]] || rm -rf "$tmp_dir"
-  log verify "Summary: total=$total skipped=$skipped passed=$passed failed=$failed"
+  log verify "Summary: total=$total skipped=$skipped expected_validator_fail=$expected_validator_failed expected_validator_rust_decoded=$expected_validator_rust_decoded expected_validator_rust_errors=$expected_validator_rust_errors expected_rust_fail=$expected_rust_failed passed=$passed failed=$failed"
   log verify "Report: $report_file"
 
   if [[ "$failed" -gt 0 ]]; then
