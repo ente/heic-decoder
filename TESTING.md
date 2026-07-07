@@ -32,6 +32,14 @@ into this repository.
 - `image` adapter vs direct decode timing
 - path/read concurrent decode timing and RSS
 
+`verify` has explicit accounting for corpus files that cannot produce a
+pixel oracle. `EXPECTED_VALIDATOR_FAIL` means libheif failed with an
+allowlisted reason, but the Rust decoder was still run as a robustness smoke
+check. `EXPECTED_RUST_FAIL` means libheif produced an oracle, but the file
+uses a known unsupported Rust codec or feature and failed with the expected
+category/message. Any new validator failure, uncategorized Rust failure, or
+pixel mismatch is still a hard failure.
+
 ## Setup
 
 Put a libheif checkout or symlink under the ignored asset directory:

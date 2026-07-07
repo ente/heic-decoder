@@ -22,20 +22,18 @@ Suggested setup: a `cargo-fuzz` target calling
 4:2:2, 4:4:4, lossless) are the least battle-tested against hostile input.
 Longer term, OSS-Fuzz integration would run it continuously.
 
-## 2. Make `scripts/heic_tests.sh all` able to pass
+## 2. Keep expected-failure accounting tight
 
-Three corpus files fail `verify` because they use codecs this crate does not
-implement (`j2k32.heif` JPEG 2000, `jpeg32.heif` JPEG, `unci32.heif` an
-uncompressed variant). Since `verify` exits non-zero on any failure, the
-`all` command aborts before its benchmark half — it has never completed on
-this corpus. Add a known-failures allowlist (assert these files fail with the
-*expected* category, count them separately) so `all` can go green and
-actually gate the benches. Implementing the missing codecs is the
-alternative, but they are rare in the wild.
+`scripts/heic_tests.sh verify` now distinguishes pixel comparisons from
+expected no-oracle cases. Files the libheif validator cannot decode are still
+run through the Rust decoder as a robustness smoke check and counted as
+`EXPECTED_VALIDATOR_FAIL`; known unsupported Rust codecs/features are counted
+as `EXPECTED_RUST_FAIL`.
 
-The 50 "skipped" files are fine as-is: those are inputs the libheif
-validator itself cannot decode in this build, so there is no oracle to
-compare against.
+Keep those allowlists explicit. If a future libheif build starts decoding an
+old no-oracle file, the harness should either compare pixels or require a
+specific expected Rust failure. If upstream adds new fuzz corpus failures,
+classify them deliberately instead of reintroducing broad skips.
 
 ## 3. Memory usage
 
