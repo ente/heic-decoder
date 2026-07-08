@@ -4587,28 +4587,33 @@ fn resolve_grid_tile_hvcc_colr_and_transforms(
     Ok((hvcc, colr, transforms))
 }
 
-/// ICC colour profile for the primary HEIC item, mirroring libheif: the
-/// primary item's own `colr` ICC wins; a `grid` primary without one inherits
-/// the first tile's ICC (libheif/libheif/context.cc).
-pub fn primary_heic_icc_profile(input: &[u8]) -> Option<Vec<u8>> {
+/// Colour properties for the primary HEIC item, mirroring libheif: the primary
+/// item's own `colr` properties win; a `grid` primary without one inherits the
+/// first tile's colour properties (libheif/libheif/context.cc).
+pub fn primary_heic_color_properties(input: &[u8]) -> Option<PrimaryItemColorProperties> {
     let (_meta, resolved) = resolve_primary_heic_item_graph(input).ok()?;
 
-    let mut icc = None;
+    let mut colr = PrimaryItemColorProperties::default();
     for property in &resolved.primary_item.properties {
         if property.property.header.box_type.as_bytes() != COLR_BOX_TYPE {
             continue;
         }
-        if let Ok(parsed_colr) = property.property.parse_colr()
-            && let ColorInformation::Icc(profile) = parsed_colr.information
-        {
-            icc = Some(profile.profile);
+        if let Ok(parsed_colr) = property.property.parse_colr() {
+            match parsed_colr.information {
+                ColorInformation::Nclx(profile) => {
+                    colr.nclx = Some(profile);
+                }
+                ColorInformation::Icc(profile) => {
+                    colr.icc = Some(profile);
+                }
+            }
         }
     }
-    if icc.is_some() {
-        return icc;
+    if colr.icc.is_some() || colr.nclx.is_some() {
+        return Some(colr);
     }
 
-    // Grid primary without its own ICC: inherit the first tile's.
+    // Grid primary without its own colour properties: inherit the first tile's.
     let item_type = resolved.primary_item.item_info.item_type?;
     if item_type.as_bytes() != GRID_ITEM_TYPE {
         return None;
@@ -4632,7 +4637,14 @@ pub fn primary_heic_icc_profile(input: &[u8]) -> Option<Vec<u8>> {
         &flattened_properties,
     )
     .ok()?;
-    tile_colr.icc.map(|profile| profile.profile)
+    Some(tile_colr)
+}
+
+/// ICC colour profile for the primary HEIC item, mirroring libheif: the
+/// primary item's own `colr` ICC wins; a `grid` primary without one inherits
+/// the first tile's ICC (libheif/libheif/context.cc).
+pub fn primary_heic_icc_profile(input: &[u8]) -> Option<Vec<u8>> {
+    primary_heic_color_properties(input).and_then(|colr| colr.icc.map(|profile| profile.profile))
 }
 
 fn resolve_primary_heic_item_graph<'a>(

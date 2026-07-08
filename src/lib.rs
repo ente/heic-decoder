@@ -11,6 +11,9 @@ extern crate alloc;
 use brotli::Decompressor as BrotliDecompressor;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 use heic_decoder::DecodedFrame as HeicFrame;
+use moxcms::{
+    CicpColorPrimaries, CicpProfile, ColorProfile, MatrixCoefficients, TransferCharacteristics,
+};
 use rav1d::include::dav1d::data::Dav1dData;
 use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
 use rav1d::include::dav1d::headers::{
@@ -2406,12 +2409,14 @@ fn decode_primary_uncompressed_to_image_internal(
         });
     }
 
+    let icc_profile = icc_profile_from_color_properties(&properties.colr);
+
     Ok(DecodedUncompressedImage {
         width,
         height,
         bit_depth: output_bit_depth,
         rgba,
-        icc_profile: properties.colr.icc.map(|profile| profile.profile),
+        icc_profile,
     })
 }
 
@@ -6426,20 +6431,26 @@ fn primary_icc_profile_from_resolved_avif_graph(
     // Provenance: primary-item colr extraction follows libheif item-property
     // traversal in libheif/libheif/context.cc, with colr payload parsing from
     // libheif/libheif/nclx.cc:Box_colr::parse.
-    let mut icc_profile = None;
+    let mut colr = isobmff::PrimaryItemColorProperties::default();
     for property in &resolved.primary_item.properties {
         if property.property.header.box_type.as_bytes() != *b"colr" {
             continue;
         }
         // Tolerate individually malformed colr boxes (libheif parses each
         // independently) instead of discarding an already-found profile.
-        if let Ok(parsed_colr) = property.property.parse_colr()
-            && let isobmff::ColorInformation::Icc(profile) = parsed_colr.information
-        {
-            icc_profile = Some(profile.profile);
+        if let Ok(parsed_colr) = property.property.parse_colr() {
+            match parsed_colr.information {
+                isobmff::ColorInformation::Nclx(profile) => {
+                    colr.nclx = Some(profile);
+                }
+                isobmff::ColorInformation::Icc(profile) => {
+                    colr.icc = Some(profile);
+                }
+            }
         }
     }
-    icc_profile
+
+    icc_profile_from_color_properties(&colr)
 }
 
 fn primary_icc_profile_from_heic(input: &[u8]) -> Option<Vec<u8>> {
@@ -6447,7 +6458,45 @@ fn primary_icc_profile_from_heic(input: &[u8]) -> Option<Vec<u8>> {
     // traversal in libheif/libheif/context.cc (including the grid item's
     // first-tile ICC inheritance), with colr payload parsing from
     // libheif/libheif/nclx.cc:Box_colr::parse.
-    isobmff::primary_heic_icc_profile(input)
+    isobmff::primary_heic_color_properties(input)
+        .and_then(|colr| icc_profile_from_color_properties(&colr))
+}
+
+fn icc_profile_from_color_properties(
+    colr: &isobmff::PrimaryItemColorProperties,
+) -> Option<Vec<u8>> {
+    if let Some(profile) = &colr.icc {
+        return Some(profile.profile.clone());
+    }
+
+    colr.nclx.as_ref().and_then(nclx_to_icc_profile)
+}
+
+fn nclx_to_icc_profile(nclx: &isobmff::NclxColorProfile) -> Option<Vec<u8>> {
+    if nclx_is_undefined(nclx) {
+        return None;
+    }
+
+    let cicp = CicpProfile {
+        color_primaries: CicpColorPrimaries::try_from(u8::try_from(nclx.colour_primaries).ok()?)
+            .ok()?,
+        transfer_characteristics: TransferCharacteristics::try_from(
+            u8::try_from(nclx.transfer_characteristics).ok()?,
+        )
+        .ok()?,
+        matrix_coefficients: MatrixCoefficients::try_from(
+            u8::try_from(nclx.matrix_coefficients).ok()?,
+        )
+        .ok()?,
+        full_range: nclx.full_range_flag,
+    };
+
+    let profile = ColorProfile::new_from_cicp(cicp);
+    if !profile.is_matrix_shaper() {
+        return None;
+    }
+
+    profile.encode().ok()
 }
 
 fn ycbcr_range_from_primary_colr(colr: &isobmff::PrimaryItemColorProperties) -> YCbCrRange {
@@ -6472,13 +6521,16 @@ fn ycbcr_range_override_from_primary_colr(
     // stream metadata remains in effect (libheif/libheif/color-conversion/
     // yuv2rgb.cc:Op_YCbCr_to_RGB::convert_colorspace and
     // libheif/libheif/plugins/decoder_libde265.cc color-profile population).
-    colr.nclx.as_ref().filter(|nclx| !nclx_is_undefined(nclx)).map(|nclx| {
-        if nclx.full_range_flag {
-            YCbCrRange::Full
-        } else {
-            YCbCrRange::Limited
-        }
-    })
+    colr.nclx
+        .as_ref()
+        .filter(|nclx| !nclx_is_undefined(nclx))
+        .map(|nclx| {
+            if nclx.full_range_flag {
+                YCbCrRange::Full
+            } else {
+                YCbCrRange::Limited
+            }
+        })
 }
 
 fn ycbcr_matrix_from_primary_colr(
@@ -6496,9 +6548,9 @@ fn ycbcr_matrix_override_from_primary_colr(
         .as_ref()
         .filter(|nclx| !nclx_is_undefined(nclx))
         .map(|nclx| YCbCrMatrixCoefficients {
-        matrix_coefficients: nclx.matrix_coefficients,
-        colour_primaries: nclx.colour_primaries,
-    })
+            matrix_coefficients: nclx.matrix_coefficients,
+            colour_primaries: nclx.colour_primaries,
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -7745,8 +7797,7 @@ fn convert_avif_to_rgba8(decoded: &DecodedAvifImage) -> Result<Vec<u8>, DecodeAv
         decoded.layout == AvifPixelLayout::Yuv420,
     );
     // 8-bit grayscale: libheif's Op_mono_to_RGB24_32 copies Y verbatim.
-    let mono_verbatim =
-        matches!(chroma, ChromaPlanesU8::Monochrome) && decoded.bit_depth == 8;
+    let mono_verbatim = matches!(chroma, ChromaPlanesU8::Monochrome) && decoded.bit_depth == 8;
 
     for y in 0..height {
         let row_start = y * width;
@@ -8751,8 +8802,8 @@ fn scale_sample_to_u16(sample: u16, bit_depth: u8) -> u16 {
     // the low bits only and vanishes in the harness's 8-bit pixel comparison.
     let shift = 16 - u32::from(bit_depth);
     let v = u32::from(sample);
-    ((v << shift) | (v >> (u32::from(bit_depth).saturating_sub(shift))))
-        .min(u32::from(u16::MAX)) as u16
+    ((v << shift) | (v >> (u32::from(bit_depth).saturating_sub(shift)))).min(u32::from(u16::MAX))
+        as u16
 }
 
 #[derive(Default)]
@@ -9084,4 +9135,41 @@ fn copy_plane_samples(
     }
 
     Ok(AvifPlaneSamples::U16(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use moxcms::{CicpColorPrimaries, ColorProfile, DataColorSpace, TransferCharacteristics};
+
+    use super::{isobmff, nclx_to_icc_profile};
+
+    #[test]
+    fn synthesizes_icc_profile_from_display_p3_nclx() {
+        let nclx = isobmff::NclxColorProfile {
+            colour_primaries: 12,
+            transfer_characteristics: 13,
+            matrix_coefficients: 1,
+            full_range_flag: true,
+        };
+
+        let icc = nclx_to_icc_profile(&nclx).expect("expected synthesized ICC");
+        let parsed = ColorProfile::new_from_slice(&icc).expect("synthesized ICC should parse");
+
+        assert_eq!(parsed.color_space, DataColorSpace::Rgb);
+        let cicp = parsed.cicp.expect("synthesized ICC should carry CICP");
+        assert_eq!(cicp.color_primaries, CicpColorPrimaries::Smpte432);
+        assert_eq!(cicp.transfer_characteristics, TransferCharacteristics::Srgb);
+    }
+
+    #[test]
+    fn skips_undefined_nclx_profile() {
+        let nclx = isobmff::NclxColorProfile {
+            colour_primaries: 2,
+            transfer_characteristics: 2,
+            matrix_coefficients: 2,
+            full_range_flag: true,
+        };
+
+        assert!(nclx_to_icc_profile(&nclx).is_none());
+    }
 }
