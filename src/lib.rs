@@ -7782,7 +7782,7 @@ fn apply_primary_item_transforms_rgba<T: Copy + Default>(
                 let (next_width, next_height, next_pixels) = crop_rgba_by_clean_aperture(
                     current_width,
                     current_height,
-                    &current_pixels,
+                    current_pixels,
                     *clean_aperture,
                 )?;
                 current_width = next_width;
@@ -7989,7 +7989,7 @@ fn mirror_rgba<T: Copy + Default>(
 fn crop_rgba_by_clean_aperture<T: Copy>(
     width: u32,
     height: u32,
-    pixels: &[T],
+    pixels: Vec<T>,
     clean_aperture: isobmff::ImageCleanApertureProperty,
 ) -> Result<(u32, u32, Vec<T>), DecodeError> {
     if width == 0 || height == 0 {
@@ -8054,6 +8054,10 @@ fn crop_rgba_by_clean_aperture<T: Copy>(
             value: crop_height_i128,
         })
     })?;
+
+    if left == 0 && top == 0 && crop_width == width && crop_height == height {
+        return Ok((width, height, pixels));
+    }
 
     let src_width = usize::try_from(width).map_err(|_| {
         DecodeError::TransformGuard(TransformGuardError::DimensionTooLargeForPlatform {
