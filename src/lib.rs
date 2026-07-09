@@ -608,6 +608,16 @@ pub struct DecodedRgbaImage {
     pub icc_profile: Option<Vec<u8>>,
 }
 
+#[cfg(feature = "image-integration")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DecodedRgbaLayout {
+    pub width: u32,
+    pub height: u32,
+    pub source_bit_depth: u8,
+    pub storage_bit_depth: u8,
+    pub icc_profile: Option<Vec<u8>>,
+}
+
 /// HEIF EXIF-orientation inspection result for caller-controlled display transforms.
 ///
 /// `exif_orientation` is the raw EXIF orientation value (`1..=8`) when present.
@@ -6913,6 +6923,678 @@ fn decode_primary_heic_to_rgba_from_resolved_input(
     }
 }
 
+#[cfg(feature = "image-integration")]
+fn heic_bit_depth_for_png_conversion_metadata(
+    metadata: &DecodedHeicImageMetadata,
+) -> Result<u8, DecodeHeicError> {
+    if metadata.bit_depth_luma != metadata.bit_depth_chroma {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "HEIC luma/chroma bit-depth mismatch during PNG conversion: {}/{}",
+                metadata.bit_depth_luma, metadata.bit_depth_chroma
+            ),
+        });
+    }
+
+    if metadata.bit_depth_luma == 0 || metadata.bit_depth_luma > 16 {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "HEIC bit depth {} is outside supported PNG conversion range 1..=16",
+                metadata.bit_depth_luma
+            ),
+        });
+    }
+
+    Ok(metadata.bit_depth_luma)
+}
+
+#[cfg(feature = "image-integration")]
+fn heic_grid_source_bit_depth_for_png_conversion(
+    grid_data: &isobmff::HeicGridPrimaryItemData,
+) -> Result<u8, DecodeHeicError> {
+    let first_tile =
+        grid_data
+            .tiles
+            .first()
+            .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                detail: "grid tile list cannot be empty".to_string(),
+            })?;
+    let stream = assemble_heic_hevc_stream_from_components(&first_tile.hvcc, &first_tile.payload)?;
+    let metadata = decode_hevc_stream_metadata_from_sps(&stream)?;
+    heic_bit_depth_for_png_conversion_metadata(&metadata)
+}
+
+#[cfg(feature = "image-integration")]
+fn decoded_rgba_layout_from_heic_geometry(
+    width: u32,
+    height: u32,
+    source_bit_depth: u8,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+    icc_profile: Option<Vec<u8>>,
+) -> Result<DecodedRgbaLayout, DecodeError> {
+    let (width, height) = transformed_rgba_dimensions(width, height, transforms)?;
+    Ok(DecodedRgbaLayout {
+        width,
+        height,
+        source_bit_depth,
+        storage_bit_depth: if source_bit_depth <= 8 { 8 } else { 16 },
+        icc_profile,
+    })
+}
+
+#[cfg(feature = "image-integration")]
+fn decode_heif_bytes_to_rgba_layout(
+    input: &[u8],
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbaLayout, DecodeError> {
+    match isobmff::parse_primary_uncompressed_item_properties(input) {
+        Ok(_) => {
+            return Err(DecodeError::Unsupported(
+                "lazy image adapter does not yet support uncompressed HEIF".to_string(),
+            ));
+        }
+        Err(isobmff::ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType {
+            ..
+        }) => {}
+        Err(err) => return Err(DecodeUncompressedError::ParsePrimaryProperties(err).into()),
+    }
+
+    let transforms = isobmff::parse_primary_item_transform_properties(input)
+        .map_err(DecodeHeicError::ParsePrimaryTransforms)?
+        .transforms;
+    let icc_profile = primary_icc_profile_from_heic(input);
+    let primary_with_grid =
+        isobmff::extract_primary_heic_item_data_with_grid(input).map_err(DecodeHeicError::from)?;
+
+    match primary_with_grid {
+        isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
+            guardrails.enforce_pixel_count(
+                grid_data.descriptor.output_width,
+                grid_data.descriptor.output_height,
+            )?;
+            let source_bit_depth = heic_grid_source_bit_depth_for_png_conversion(&grid_data)?;
+            decoded_rgba_layout_from_heic_geometry(
+                grid_data.descriptor.output_width,
+                grid_data.descriptor.output_height,
+                source_bit_depth,
+                &transforms,
+                icc_profile,
+            )
+        }
+        isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
+            let (_, metadata, _, _) =
+                decode_primary_heic_stream_and_metadata_from_coded_item_data(input, &item_data)?;
+            guardrails.enforce_pixel_count(metadata.width, metadata.height)?;
+            let source_bit_depth = heic_bit_depth_for_png_conversion_metadata(&metadata)?;
+            decoded_rgba_layout_from_heic_geometry(
+                metadata.width,
+                metadata.height,
+                source_bit_depth,
+                &transforms,
+                icc_profile,
+            )
+        }
+    }
+}
+
+#[cfg(feature = "image-integration")]
+fn copy_decoded_rgba8_to_slice(
+    decoded: DecodedRgbaImage,
+    out: &mut [u8],
+) -> Result<(), DecodeError> {
+    match decoded.pixels {
+        DecodedRgbaPixels::U8(pixels) => {
+            if pixels.len() != out.len() {
+                return Err(DecodeError::TransformGuard(
+                    TransformGuardError::RgbaSampleCountMismatch {
+                        stage: "RGBA8 image adapter handoff",
+                        actual: out.len(),
+                        expected: pixels.len(),
+                        width: decoded.width,
+                        height: decoded.height,
+                    },
+                ));
+            }
+            out.copy_from_slice(&pixels);
+            Ok(())
+        }
+        DecodedRgbaPixels::U16(_) => Err(DecodeError::Unsupported(
+            "decoded image storage is RGBA16, not RGBA8".to_string(),
+        )),
+    }
+}
+
+#[cfg(feature = "image-integration")]
+fn copy_decoded_rgba16_to_slice(
+    decoded: DecodedRgbaImage,
+    out: &mut [u16],
+) -> Result<(), DecodeError> {
+    match decoded.pixels {
+        DecodedRgbaPixels::U16(pixels) => {
+            if pixels.len() != out.len() {
+                return Err(DecodeError::TransformGuard(
+                    TransformGuardError::RgbaSampleCountMismatch {
+                        stage: "RGBA16 image adapter handoff",
+                        actual: out.len(),
+                        expected: pixels.len(),
+                        width: decoded.width,
+                        height: decoded.height,
+                    },
+                ));
+            }
+            out.copy_from_slice(&pixels);
+            Ok(())
+        }
+        DecodedRgbaPixels::U8(_) => Err(DecodeError::Unsupported(
+            "decoded image storage is RGBA8, not RGBA16".to_string(),
+        )),
+    }
+}
+
+#[cfg(feature = "image-integration")]
+fn grid_transforms_can_write_directly(
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+) -> bool {
+    transforms.iter().all(|transform| {
+        matches!(
+            transform,
+            isobmff::PrimaryItemTransformProperty::Rotation(_)
+                | isobmff::PrimaryItemTransformProperty::Mirror(_)
+        )
+    })
+}
+
+#[cfg(feature = "image-integration")]
+fn decode_primary_heic_grid_to_rgba8_slice(
+    grid_data: &isobmff::HeicGridPrimaryItemData,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+    auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
+    out: &mut [u8],
+) -> Result<(), DecodeError> {
+    if auxiliary_alpha.is_none() && grid_transforms_can_write_directly(transforms) {
+        let first_tile_data =
+            grid_data
+                .tiles
+                .first()
+                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                    detail: "grid tile list cannot be empty".to_string(),
+                })?;
+        let first_tile = decode_heic_grid_tile_to_image(first_tile_data)?;
+        validate_decoded_heic_grid_first_tile(&grid_data.descriptor, &first_tile)?;
+        let source_bit_depth = heic_bit_depth_for_png_conversion(&first_tile)?;
+        if source_bit_depth > 8 {
+            return Err(DecodeError::Unsupported(
+                "HEIC grid storage is RGBA16, not RGBA8".to_string(),
+            ));
+        }
+
+        let direct_orientation_transform = rgba_orientation_transform_from_primary_transforms(
+            grid_data.descriptor.output_width,
+            grid_data.descriptor.output_height,
+            transforms,
+        )?;
+        let output_width = direct_orientation_transform
+            .as_ref()
+            .map_or(grid_data.descriptor.output_width, |transform| {
+                transform.destination_width
+            });
+        let output_height = direct_orientation_transform
+            .as_ref()
+            .map_or(grid_data.descriptor.output_height, |transform| {
+                transform.destination_height
+            });
+        let expected = checked_rgba_sample_count(output_width, output_height)?;
+        if out.len() != expected {
+            return Err(DecodeError::TransformGuard(
+                TransformGuardError::RgbaSampleCountMismatch {
+                    stage: "HEIC grid RGBA8 image adapter output",
+                    actual: out.len(),
+                    expected,
+                    width: output_width,
+                    height: output_height,
+                },
+            ));
+        }
+
+        let tile_width = first_tile.width;
+        let tile_height = first_tile.height;
+        let reference_layout = first_tile.layout;
+        let reference_bit_depth_luma = first_tile.bit_depth_luma;
+        let reference_bit_depth_chroma = first_tile.bit_depth_chroma;
+        let reference_ycbcr_range = first_tile.ycbcr_range;
+        let reference_ycbcr_matrix = first_tile.ycbcr_matrix;
+        let conversion_ycbcr_range = ycbcr_range_override_from_primary_colr(&grid_data.colr)
+            .unwrap_or(reference_ycbcr_range);
+        let conversion_ycbcr_matrix = ycbcr_matrix_override_from_primary_colr(&grid_data.colr)
+            .unwrap_or(reference_ycbcr_matrix);
+        return paste_heic_grid_tiles_to_rgba8(
+            grid_data,
+            first_tile,
+            out,
+            tile_width,
+            tile_height,
+            reference_layout,
+            reference_bit_depth_luma,
+            reference_bit_depth_chroma,
+            reference_ycbcr_range,
+            reference_ycbcr_matrix,
+            conversion_ycbcr_range,
+            conversion_ycbcr_matrix,
+            direct_orientation_transform.as_ref(),
+        );
+    }
+
+    let decoded =
+        decode_primary_heic_grid_to_rgba_image(grid_data, transforms, auxiliary_alpha, None)?;
+    copy_decoded_rgba8_to_slice(decoded, out)
+}
+
+#[cfg(feature = "image-integration")]
+fn decode_primary_heic_grid_to_rgba16_slice(
+    grid_data: &isobmff::HeicGridPrimaryItemData,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+    auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
+    out: &mut [u16],
+) -> Result<(), DecodeError> {
+    if auxiliary_alpha.is_none() && grid_transforms_can_write_directly(transforms) {
+        let first_tile_data =
+            grid_data
+                .tiles
+                .first()
+                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                    detail: "grid tile list cannot be empty".to_string(),
+                })?;
+        let first_tile = decode_heic_grid_tile_to_image(first_tile_data)?;
+        validate_decoded_heic_grid_first_tile(&grid_data.descriptor, &first_tile)?;
+        let source_bit_depth = heic_bit_depth_for_png_conversion(&first_tile)?;
+        if source_bit_depth <= 8 {
+            return Err(DecodeError::Unsupported(
+                "HEIC grid storage is RGBA8, not RGBA16".to_string(),
+            ));
+        }
+
+        let direct_orientation_transform = rgba_orientation_transform_from_primary_transforms(
+            grid_data.descriptor.output_width,
+            grid_data.descriptor.output_height,
+            transforms,
+        )?;
+        let output_width = direct_orientation_transform
+            .as_ref()
+            .map_or(grid_data.descriptor.output_width, |transform| {
+                transform.destination_width
+            });
+        let output_height = direct_orientation_transform
+            .as_ref()
+            .map_or(grid_data.descriptor.output_height, |transform| {
+                transform.destination_height
+            });
+        let expected = checked_rgba_sample_count(output_width, output_height)?;
+        if out.len() != expected {
+            return Err(DecodeError::TransformGuard(
+                TransformGuardError::RgbaSampleCountMismatch {
+                    stage: "HEIC grid RGBA16 image adapter output",
+                    actual: out.len(),
+                    expected,
+                    width: output_width,
+                    height: output_height,
+                },
+            ));
+        }
+
+        let tile_width = first_tile.width;
+        let tile_height = first_tile.height;
+        let reference_layout = first_tile.layout;
+        let reference_bit_depth_luma = first_tile.bit_depth_luma;
+        let reference_bit_depth_chroma = first_tile.bit_depth_chroma;
+        let reference_ycbcr_range = first_tile.ycbcr_range;
+        let reference_ycbcr_matrix = first_tile.ycbcr_matrix;
+        let conversion_ycbcr_range = ycbcr_range_override_from_primary_colr(&grid_data.colr)
+            .unwrap_or(reference_ycbcr_range);
+        let conversion_ycbcr_matrix = ycbcr_matrix_override_from_primary_colr(&grid_data.colr)
+            .unwrap_or(reference_ycbcr_matrix);
+        return paste_heic_grid_tiles_to_rgba16(
+            grid_data,
+            first_tile,
+            out,
+            tile_width,
+            tile_height,
+            reference_layout,
+            reference_bit_depth_luma,
+            reference_bit_depth_chroma,
+            reference_ycbcr_range,
+            reference_ycbcr_matrix,
+            conversion_ycbcr_range,
+            conversion_ycbcr_matrix,
+            direct_orientation_transform.as_ref(),
+        );
+    }
+
+    let decoded =
+        decode_primary_heic_grid_to_rgba_image(grid_data, transforms, auxiliary_alpha, None)?;
+    copy_decoded_rgba16_to_slice(decoded, out)
+}
+
+#[cfg(feature = "image-integration")]
+fn decoded_heic_to_rgba8_slice(
+    mut decoded: DecodedHeicImage,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+    auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
+    out: &mut [u8],
+) -> Result<(), DecodeError> {
+    let mut remaining_transforms = transforms;
+    if auxiliary_alpha.is_none() {
+        while let Some(isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture)) =
+            remaining_transforms.first()
+        {
+            decoded = crop_heic_by_clean_aperture(decoded, *clean_aperture)?;
+            remaining_transforms = &remaining_transforms[1..];
+        }
+    }
+
+    let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
+    if source_bit_depth > 8 {
+        return Err(DecodeError::Unsupported(
+            "HEIC storage is RGBA16, not RGBA8".to_string(),
+        ));
+    }
+
+    if remaining_transforms.is_empty() {
+        convert_heic_to_rgba8_slice(&decoded, out)?;
+        if let Some(alpha) = auxiliary_alpha {
+            apply_auxiliary_alpha_to_rgba8(out, decoded.width, decoded.height, alpha)?;
+        }
+        return Ok(());
+    }
+
+    let mut pixels = convert_heic_to_rgba8(&decoded)?;
+    if let Some(alpha) = auxiliary_alpha {
+        apply_auxiliary_alpha_to_rgba8(&mut pixels, decoded.width, decoded.height, alpha)?;
+    }
+    let (width, height, pixels) = apply_primary_item_transforms_rgba(
+        decoded.width,
+        decoded.height,
+        pixels,
+        remaining_transforms,
+    )?;
+    copy_decoded_rgba8_to_slice(
+        DecodedRgbaImage {
+            width,
+            height,
+            source_bit_depth,
+            pixels: DecodedRgbaPixels::U8(pixels),
+            icc_profile: None,
+        },
+        out,
+    )
+}
+
+#[cfg(feature = "image-integration")]
+fn decoded_heic_to_rgba16_slice(
+    mut decoded: DecodedHeicImage,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+    auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
+    out: &mut [u16],
+) -> Result<(), DecodeError> {
+    let mut remaining_transforms = transforms;
+    if auxiliary_alpha.is_none() {
+        while let Some(isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture)) =
+            remaining_transforms.first()
+        {
+            decoded = crop_heic_by_clean_aperture(decoded, *clean_aperture)?;
+            remaining_transforms = &remaining_transforms[1..];
+        }
+    }
+
+    let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
+    if source_bit_depth <= 8 {
+        return Err(DecodeError::Unsupported(
+            "HEIC storage is RGBA8, not RGBA16".to_string(),
+        ));
+    }
+
+    if remaining_transforms.is_empty() {
+        convert_heic_to_rgba16_slice(&decoded, out)?;
+        if let Some(alpha) = auxiliary_alpha {
+            apply_auxiliary_alpha_to_rgba16(out, decoded.width, decoded.height, alpha)?;
+        }
+        return Ok(());
+    }
+
+    let mut pixels = convert_heic_to_rgba16(&decoded)?;
+    if let Some(alpha) = auxiliary_alpha {
+        apply_auxiliary_alpha_to_rgba16(&mut pixels, decoded.width, decoded.height, alpha)?;
+    }
+    let (width, height, pixels) = apply_primary_item_transforms_rgba(
+        decoded.width,
+        decoded.height,
+        pixels,
+        remaining_transforms,
+    )?;
+    copy_decoded_rgba16_to_slice(
+        DecodedRgbaImage {
+            width,
+            height,
+            source_bit_depth,
+            pixels: DecodedRgbaPixels::U16(pixels),
+            icc_profile: None,
+        },
+        out,
+    )
+}
+
+#[cfg(feature = "image-integration")]
+fn decode_heif_bytes_to_rgba8_slice(
+    input: &[u8],
+    guardrails: DecodeGuardrails,
+    out: &mut [u8],
+) -> Result<(), DecodeError> {
+    match decode_primary_uncompressed_to_image(input) {
+        Ok(decoded) => {
+            guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
+            let transforms = isobmff::parse_primary_item_transform_properties(input)
+                .map_err(DecodeUncompressedError::ParsePrimaryTransforms)?
+                .transforms;
+            let decoded = decoded_uncompressed_to_rgba_image(decoded, &transforms)?;
+            return copy_decoded_rgba8_to_slice(decoded, out);
+        }
+        Err(DecodeUncompressedError::ParsePrimaryProperties(
+            isobmff::ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType { .. },
+        )) => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    let transforms = isobmff::parse_primary_item_transform_properties(input)
+        .map_err(DecodeHeicError::ParsePrimaryTransforms)?
+        .transforms;
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    let primary_with_grid =
+        isobmff::extract_primary_heic_item_data_with_grid(input).map_err(DecodeHeicError::from)?;
+
+    match primary_with_grid {
+        isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
+            guardrails.enforce_pixel_count(
+                grid_data.descriptor.output_width,
+                grid_data.descriptor.output_height,
+            )?;
+            let auxiliary_alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
+                input,
+                &mut source,
+                grid_data.descriptor.output_width,
+                grid_data.descriptor.output_height,
+            );
+            decode_primary_heic_grid_to_rgba8_slice(
+                &grid_data,
+                &transforms,
+                auxiliary_alpha.as_ref(),
+                out,
+            )
+        }
+        isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
+            let (stream, metadata, ycbcr_range_override, ycbcr_matrix_override) =
+                decode_primary_heic_stream_and_metadata_from_coded_item_data(input, &item_data)?;
+            let mut decoded = decode_hevc_stream_to_image(&stream)?;
+            if let Some(ycbcr_range) = ycbcr_range_override {
+                decoded.ycbcr_range = ycbcr_range;
+            }
+            if let Some(ycbcr_matrix) = ycbcr_matrix_override {
+                decoded.ycbcr_matrix = ycbcr_matrix;
+            }
+            validate_decoded_heic_image_against_metadata(&decoded, &metadata)?;
+            guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
+            let auxiliary_alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
+                input,
+                &mut source,
+                decoded.width,
+                decoded.height,
+            );
+            decoded_heic_to_rgba8_slice(decoded, &transforms, auxiliary_alpha.as_ref(), out)
+        }
+    }
+}
+
+#[cfg(feature = "image-integration")]
+fn decode_heif_bytes_to_rgba16_slice(
+    input: &[u8],
+    guardrails: DecodeGuardrails,
+    out: &mut [u16],
+) -> Result<(), DecodeError> {
+    match decode_primary_uncompressed_to_image(input) {
+        Ok(decoded) => {
+            guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
+            let transforms = isobmff::parse_primary_item_transform_properties(input)
+                .map_err(DecodeUncompressedError::ParsePrimaryTransforms)?
+                .transforms;
+            let decoded = decoded_uncompressed_to_rgba_image(decoded, &transforms)?;
+            return copy_decoded_rgba16_to_slice(decoded, out);
+        }
+        Err(DecodeUncompressedError::ParsePrimaryProperties(
+            isobmff::ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType { .. },
+        )) => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    let transforms = isobmff::parse_primary_item_transform_properties(input)
+        .map_err(DecodeHeicError::ParsePrimaryTransforms)?
+        .transforms;
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    let primary_with_grid =
+        isobmff::extract_primary_heic_item_data_with_grid(input).map_err(DecodeHeicError::from)?;
+
+    match primary_with_grid {
+        isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
+            guardrails.enforce_pixel_count(
+                grid_data.descriptor.output_width,
+                grid_data.descriptor.output_height,
+            )?;
+            let auxiliary_alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
+                input,
+                &mut source,
+                grid_data.descriptor.output_width,
+                grid_data.descriptor.output_height,
+            );
+            decode_primary_heic_grid_to_rgba16_slice(
+                &grid_data,
+                &transforms,
+                auxiliary_alpha.as_ref(),
+                out,
+            )
+        }
+        isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
+            let (stream, metadata, ycbcr_range_override, ycbcr_matrix_override) =
+                decode_primary_heic_stream_and_metadata_from_coded_item_data(input, &item_data)?;
+            let mut decoded = decode_hevc_stream_to_image(&stream)?;
+            if let Some(ycbcr_range) = ycbcr_range_override {
+                decoded.ycbcr_range = ycbcr_range;
+            }
+            if let Some(ycbcr_matrix) = ycbcr_matrix_override {
+                decoded.ycbcr_matrix = ycbcr_matrix;
+            }
+            validate_decoded_heic_image_against_metadata(&decoded, &metadata)?;
+            guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
+            let auxiliary_alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
+                input,
+                &mut source,
+                decoded.width,
+                decoded.height,
+            );
+            decoded_heic_to_rgba16_slice(decoded, &transforms, auxiliary_alpha.as_ref(), out)
+        }
+    }
+}
+
+#[cfg(feature = "image-integration")]
+fn decode_bytes_to_rgba_layout_with_hint_and_guardrails(
+    input: &[u8],
+    hint: Option<HeifInputFamily>,
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbaLayout, DecodeError> {
+    guardrails.enforce_input_bytes(input.len() as u64)?;
+    let family = detect_input_family_from_ftyp(input)
+        .or(hint)
+        .ok_or_else(|| {
+            DecodeError::Unsupported(
+                "Unsupported HEIF/AVIF file type: could not infer image family from ftyp brands"
+                    .to_string(),
+            )
+        })?;
+    match family {
+        HeifInputFamily::Heif => decode_heif_bytes_to_rgba_layout(input, guardrails),
+        HeifInputFamily::Avif => Err(DecodeError::Unsupported(
+            "lazy image adapter does not yet support AVIF preflight".to_string(),
+        )),
+    }
+}
+
+#[cfg(feature = "image-integration")]
+fn decode_bytes_to_rgba8_slice_with_hint_and_guardrails(
+    input: &[u8],
+    hint: Option<HeifInputFamily>,
+    guardrails: DecodeGuardrails,
+    out: &mut [u8],
+) -> Result<(), DecodeError> {
+    guardrails.enforce_input_bytes(input.len() as u64)?;
+    let family = detect_input_family_from_ftyp(input)
+        .or(hint)
+        .ok_or_else(|| {
+            DecodeError::Unsupported(
+                "Unsupported HEIF/AVIF file type: could not infer image family from ftyp brands"
+                    .to_string(),
+            )
+        })?;
+    match family {
+        HeifInputFamily::Heif => decode_heif_bytes_to_rgba8_slice(input, guardrails, out),
+        HeifInputFamily::Avif => {
+            let decoded = decode_avif_bytes_to_rgba(input, guardrails)?;
+            copy_decoded_rgba8_to_slice(decoded, out)
+        }
+    }
+}
+
+#[cfg(feature = "image-integration")]
+fn decode_bytes_to_rgba16_slice_with_hint_and_guardrails(
+    input: &[u8],
+    hint: Option<HeifInputFamily>,
+    guardrails: DecodeGuardrails,
+    out: &mut [u16],
+) -> Result<(), DecodeError> {
+    guardrails.enforce_input_bytes(input.len() as u64)?;
+    let family = detect_input_family_from_ftyp(input)
+        .or(hint)
+        .ok_or_else(|| {
+            DecodeError::Unsupported(
+                "Unsupported HEIF/AVIF file type: could not infer image family from ftyp brands"
+                    .to_string(),
+            )
+        })?;
+    match family {
+        HeifInputFamily::Heif => decode_heif_bytes_to_rgba16_slice(input, guardrails, out),
+        HeifInputFamily::Avif => {
+            let decoded = decode_avif_bytes_to_rgba(input, guardrails)?;
+            copy_decoded_rgba16_to_slice(decoded, out)
+        }
+    }
+}
+
 fn decode_avif_bytes_to_png(
     input: &[u8],
     output_path: &Path,
@@ -8489,28 +9171,24 @@ fn mirror_rgba<T: Copy + Default>(
     Ok(out)
 }
 
-fn crop_rgba_by_clean_aperture<T: Copy>(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CleanApertureCropBounds {
+    left: i128,
+    right: i128,
+    top: i128,
+    bottom: i128,
     width: u32,
     height: u32,
-    pixels: Vec<T>,
+}
+
+fn clean_aperture_crop_bounds(
+    width: u32,
+    height: u32,
     clean_aperture: isobmff::ImageCleanApertureProperty,
-) -> Result<(u32, u32, Vec<T>), DecodeError> {
+) -> Result<CleanApertureCropBounds, DecodeError> {
     if width == 0 || height == 0 {
         return Err(DecodeError::TransformGuard(
             TransformGuardError::EmptyImageGeometry { width, height },
-        ));
-    }
-
-    let expected = checked_rgba_sample_count(width, height)?;
-    if pixels.len() != expected {
-        return Err(DecodeError::TransformGuard(
-            TransformGuardError::RgbaSampleCountMismatch {
-                stage: "clean-aperture input",
-                actual: pixels.len(),
-                expected,
-                width,
-                height,
-            },
         ));
     }
 
@@ -8558,7 +9236,74 @@ fn crop_rgba_by_clean_aperture<T: Copy>(
         })
     })?;
 
-    if left == 0 && top == 0 && crop_width == width && crop_height == height {
+    Ok(CleanApertureCropBounds {
+        left,
+        right,
+        top,
+        bottom,
+        width: crop_width,
+        height: crop_height,
+    })
+}
+
+fn transformed_rgba_dimensions(
+    width: u32,
+    height: u32,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+) -> Result<(u32, u32), DecodeError> {
+    let mut current_width = width;
+    let mut current_height = height;
+
+    for transform in transforms {
+        match *transform {
+            isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture) => {
+                let crop =
+                    clean_aperture_crop_bounds(current_width, current_height, clean_aperture)?;
+                current_width = crop.width;
+                current_height = crop.height;
+            }
+            isobmff::PrimaryItemTransformProperty::Rotation(rotation) => {
+                match rotation.rotation_ccw_degrees % 360 {
+                    0 | 180 => {}
+                    90 | 270 => std::mem::swap(&mut current_width, &mut current_height),
+                    _ => {
+                        return Err(DecodeError::TransformGuard(
+                            TransformGuardError::UnsupportedRotation {
+                                rotation_ccw_degrees: rotation.rotation_ccw_degrees,
+                            },
+                        ));
+                    }
+                }
+            }
+            isobmff::PrimaryItemTransformProperty::Mirror(_) => {}
+        }
+    }
+
+    Ok((current_width, current_height))
+}
+
+fn crop_rgba_by_clean_aperture<T: Copy>(
+    width: u32,
+    height: u32,
+    pixels: Vec<T>,
+    clean_aperture: isobmff::ImageCleanApertureProperty,
+) -> Result<(u32, u32, Vec<T>), DecodeError> {
+    let expected = checked_rgba_sample_count(width, height)?;
+    if pixels.len() != expected {
+        return Err(DecodeError::TransformGuard(
+            TransformGuardError::RgbaSampleCountMismatch {
+                stage: "clean-aperture input",
+                actual: pixels.len(),
+                expected,
+                width,
+                height,
+            },
+        ));
+    }
+
+    let crop = clean_aperture_crop_bounds(width, height, clean_aperture)?;
+
+    if crop.left == 0 && crop.top == 0 && crop.width == width && crop.height == height {
         return Ok((width, height, pixels));
     }
 
@@ -8569,32 +9314,32 @@ fn crop_rgba_by_clean_aperture<T: Copy>(
             value: u64::from(width),
         })
     })?;
-    let left_usize = usize::try_from(left).map_err(|_| {
+    let left_usize = usize::try_from(crop.left).map_err(|_| {
         DecodeError::TransformGuard(TransformGuardError::CleanApertureBoundOutOfRange {
             bound: "left",
-            value: left,
+            value: crop.left,
         })
     })?;
-    let right_usize = usize::try_from(right).map_err(|_| {
+    let right_usize = usize::try_from(crop.right).map_err(|_| {
         DecodeError::TransformGuard(TransformGuardError::CleanApertureBoundOutOfRange {
             bound: "right",
-            value: right,
+            value: crop.right,
         })
     })?;
-    let top_usize = usize::try_from(top).map_err(|_| {
+    let top_usize = usize::try_from(crop.top).map_err(|_| {
         DecodeError::TransformGuard(TransformGuardError::CleanApertureBoundOutOfRange {
             bound: "top",
-            value: top,
+            value: crop.top,
         })
     })?;
-    let bottom_usize = usize::try_from(bottom).map_err(|_| {
+    let bottom_usize = usize::try_from(crop.bottom).map_err(|_| {
         DecodeError::TransformGuard(TransformGuardError::CleanApertureBoundOutOfRange {
             bound: "bottom",
-            value: bottom,
+            value: crop.bottom,
         })
     })?;
 
-    let out_len = checked_rgba_sample_count(crop_width, crop_height)?;
+    let out_len = checked_rgba_sample_count(crop.width, crop.height)?;
     let mut out = Vec::with_capacity(out_len);
     for y in top_usize..=bottom_usize {
         let row_pixel_start = y
@@ -8641,7 +9386,7 @@ fn crop_rgba_by_clean_aperture<T: Copy>(
     }
 
     debug_assert_eq!(out.len(), out_len);
-    Ok((crop_width, crop_height, out))
+    Ok((crop.width, crop.height, out))
 }
 
 #[derive(Clone, Copy)]
@@ -9105,6 +9850,27 @@ fn convert_heic_to_rgba8_into(
     decoded: &DecodedHeicImage,
     out: &mut Vec<u8>,
 ) -> Result<(), DecodeHeicError> {
+    let output_len = checked_heic_rgba_output_len(decoded)?;
+    out.resize(output_len, 0);
+    convert_heic_to_rgba8_slice(decoded, out)
+}
+
+fn checked_heic_rgba_output_len(decoded: &DecodedHeicImage) -> Result<usize, DecodeHeicError> {
+    let expected_y_samples = heic_sample_count(decoded.width, decoded.height, "Y")?;
+    expected_y_samples
+        .checked_mul(4)
+        .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "RGBA output sample count overflow for {}x{}",
+                decoded.width, decoded.height
+            ),
+        })
+}
+
+fn convert_heic_to_rgba8_slice(
+    decoded: &DecodedHeicImage,
+    out: &mut [u8],
+) -> Result<(), DecodeHeicError> {
     let ycbcr_transform =
         ycbcr_transform_from_matrix(decoded.ycbcr_matrix).map_err(|matrix_coefficients| {
             DecodeHeicError::UnsupportedMatrixCoefficients {
@@ -9142,7 +9908,14 @@ fn convert_heic_to_rgba8_into(
                     decoded.width, decoded.height
                 ),
             })?;
-    out.resize(output_len, 0);
+    if out.len() != output_len {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "RGBA8 output has {} samples, expected {output_len}",
+                out.len()
+            ),
+        });
+    }
 
     let chroma = prepare_heic_chroma(decoded)?;
     let chroma_midpoint = chroma_midpoint(bit_depth);
@@ -9210,6 +9983,15 @@ fn convert_heic_to_rgba16_into(
     decoded: &DecodedHeicImage,
     out: &mut Vec<u16>,
 ) -> Result<(), DecodeHeicError> {
+    let output_len = checked_heic_rgba_output_len(decoded)?;
+    out.resize(output_len, 0);
+    convert_heic_to_rgba16_slice(decoded, out)
+}
+
+fn convert_heic_to_rgba16_slice(
+    decoded: &DecodedHeicImage,
+    out: &mut [u16],
+) -> Result<(), DecodeHeicError> {
     let ycbcr_transform =
         ycbcr_transform_from_matrix(decoded.ycbcr_matrix).map_err(|matrix_coefficients| {
             DecodeHeicError::UnsupportedMatrixCoefficients {
@@ -9247,7 +10029,14 @@ fn convert_heic_to_rgba16_into(
                     decoded.width, decoded.height
                 ),
             })?;
-    out.resize(output_len, 0);
+    if out.len() != output_len {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "RGBA16 output has {} samples, expected {output_len}",
+                out.len()
+            ),
+        });
+    }
 
     let chroma = prepare_heic_chroma(decoded)?;
     let chroma_midpoint = chroma_midpoint(bit_depth);

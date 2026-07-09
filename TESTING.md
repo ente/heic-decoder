@@ -34,6 +34,10 @@ fetches; bump those pins in the workflow to move the CI validator or corpus
 forward deliberately.
 
 - pixel-for-pixel PNG comparison against an external `heif-dec` validator
+- pixel-for-pixel comparison of the `image` crate integration hook output
+  (`ImageReader`/`DynamicImage::from_decoder`) against the direct Rust decode
+  for every comparable verifier file, including exact ICC-profile equality
+  through the hook decoder's `ImageDecoder::icc_profile`
 - embedded ICC colour-profile comparison against the validator's PNG output:
   when `heif-dec` embeds a profile, the Rust PNG must carry byte-identical
   profile data; a Rust-only profile is allowed (the Rust decoder synthesizes

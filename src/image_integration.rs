@@ -8,10 +8,13 @@
 //! See `API.md` in the crate root for end-to-end examples.
 
 use crate::{
-    DecodeError, DecodeGuardrails, DecodedRgbaImage, DecodedRgbaPixels, HeifInputFamily,
-    decode_bufread_to_rgba_with_guardrails, decode_bytes_to_rgba_with_guardrails,
-    decode_path_to_rgba_with_guardrails, decode_read_to_rgba_with_guardrails,
-    decode_seekable_to_rgba_with_hint_and_guardrails,
+    DecodeError, DecodeGuardrailError, DecodeGuardrails, DecodedRgbaImage, DecodedRgbaLayout,
+    DecodedRgbaPixels, HeifInputFamily, decode_bufread_to_rgba_with_guardrails,
+    decode_bytes_to_rgba_layout_with_hint_and_guardrails, decode_bytes_to_rgba_with_guardrails,
+    decode_bytes_to_rgba_with_hint_and_guardrails,
+    decode_bytes_to_rgba8_slice_with_hint_and_guardrails,
+    decode_bytes_to_rgba16_slice_with_hint_and_guardrails, decode_path_to_rgba_with_guardrails,
+    decode_read_to_rgba_with_guardrails, decode_seekable_to_rgba_with_hint_and_guardrails,
 };
 use image::error::{
     DecodingError, ImageFormatHint, ParameterError, ParameterErrorKind, UnsupportedError,
@@ -22,7 +25,7 @@ use image::{ColorType, DynamicImage, ImageBuffer, ImageDecoder, ImageError, Imag
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
-use std::io::{BufRead, Read, Seek};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Once;
 
@@ -243,6 +246,191 @@ impl ImageDecoder for HeifImageDecoder {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LazyHeifImageDecoder {
+    input: Vec<u8>,
+    hint: Option<HeifInputFamily>,
+    guardrails: DecodeGuardrails,
+    layout: DecodedRgbaLayout,
+}
+
+impl LazyHeifImageDecoder {
+    fn from_encoded_input(
+        input: Vec<u8>,
+        hint: Option<HeifInputFamily>,
+        guardrails: DecodeGuardrails,
+        layout: DecodedRgbaLayout,
+    ) -> Self {
+        Self {
+            input,
+            hint,
+            guardrails,
+            layout,
+        }
+    }
+
+    fn storage_color_type(&self) -> ColorType {
+        storage_color_type_from_bit_depth(self.layout.storage_bit_depth)
+    }
+
+    fn expected_total_bytes(&self) -> ImageResult<usize> {
+        expected_rgba_byte_count(
+            self.layout.width,
+            self.layout.height,
+            self.layout.storage_bit_depth,
+        )
+        .ok_or_else(|| {
+            parameter_error(format!(
+                "decoded RGBA buffer size overflow for {}x{} image",
+                self.layout.width, self.layout.height
+            ))
+        })
+    }
+}
+
+impl ImageDecoder for LazyHeifImageDecoder {
+    fn dimensions(&self) -> (u32, u32) {
+        (self.layout.width, self.layout.height)
+    }
+
+    fn color_type(&self) -> ColorType {
+        self.storage_color_type()
+    }
+
+    fn icc_profile(&mut self) -> ImageResult<Option<Vec<u8>>> {
+        Ok(self.layout.icc_profile.clone())
+    }
+
+    fn read_image(self, buf: &mut [u8]) -> ImageResult<()>
+    where
+        Self: Sized,
+    {
+        let expected_total_bytes = self.expected_total_bytes()?;
+        if buf.len() != expected_total_bytes {
+            return Err(ImageError::Parameter(ParameterError::from_kind(
+                ParameterErrorKind::DimensionMismatch,
+            )));
+        }
+
+        match self.layout.storage_bit_depth {
+            8 => decode_bytes_to_rgba8_slice_with_hint_and_guardrails(
+                &self.input,
+                self.hint,
+                self.guardrails,
+                buf,
+            )
+            .map_err(decode_error_to_image_error),
+            16 => {
+                if let Some(samples) = native_endian_bytes_as_u16_slice_mut(buf) {
+                    decode_bytes_to_rgba16_slice_with_hint_and_guardrails(
+                        &self.input,
+                        self.hint,
+                        self.guardrails,
+                        samples,
+                    )
+                    .map_err(decode_error_to_image_error)
+                } else {
+                    let decoded = decode_bytes_to_rgba_with_hint_and_guardrails(
+                        &self.input,
+                        self.hint,
+                        self.guardrails,
+                    )
+                    .map_err(decode_error_to_image_error)?;
+                    HeifImageDecoder::from_decoded(decoded)?.read_image(buf)
+                }
+            }
+            other => {
+                unreachable!("validated storage bit depth must be 8 or 16, got {other}")
+            }
+        }
+    }
+
+    fn read_image_boxed(self: Box<Self>, buf: &mut [u8]) -> ImageResult<()> {
+        (*self).read_image(buf)
+    }
+}
+
+fn decoder_from_seekable_with_hint_and_guardrails<R: Read + Seek>(
+    input_reader: R,
+    hint: Option<HeifInputFamily>,
+    guardrails: DecodeGuardrails,
+) -> ImageResult<Box<dyn ImageDecoder>> {
+    let input = read_seekable_input_to_vec(input_reader, &guardrails)?;
+    match decode_bytes_to_rgba_layout_with_hint_and_guardrails(&input, hint, guardrails.clone()) {
+        Ok(layout) => Ok(Box::new(LazyHeifImageDecoder::from_encoded_input(
+            input, hint, guardrails, layout,
+        ))),
+        Err(DecodeError::Unsupported(_)) => {
+            let decoded = decode_bytes_to_rgba_with_hint_and_guardrails(&input, hint, guardrails)
+                .map_err(decode_error_to_image_error)?;
+            Ok(Box::new(HeifImageDecoder::from_decoded(decoded)?))
+        }
+        Err(err) => Err(decode_error_to_image_error(err)),
+    }
+}
+
+fn read_seekable_input_to_vec<R: Read + Seek>(
+    mut input_reader: R,
+    guardrails: &DecodeGuardrails,
+) -> ImageResult<Vec<u8>> {
+    let input_len = input_reader
+        .seek(SeekFrom::End(0))
+        .map_err(ImageError::IoError)?;
+    if let Some(max_input_bytes) = guardrails.max_input_bytes
+        && input_len > max_input_bytes
+    {
+        return Err(decode_error_to_image_error(
+            DecodeGuardrailError::InputTooLarge {
+                actual_bytes: input_len,
+                max_input_bytes,
+            }
+            .into(),
+        ));
+    }
+
+    input_reader
+        .seek(SeekFrom::Start(0))
+        .map_err(ImageError::IoError)?;
+    let capacity = usize::try_from(input_len).map_err(|_| {
+        parameter_error(format!(
+            "input size {input_len} bytes does not fit in memory on this platform"
+        ))
+    })?;
+    let mut input = Vec::with_capacity(capacity);
+    input_reader
+        .read_to_end(&mut input)
+        .map_err(ImageError::IoError)?;
+
+    if let Some(max_input_bytes) = guardrails.max_input_bytes
+        && input.len() as u64 > max_input_bytes
+    {
+        return Err(decode_error_to_image_error(
+            DecodeGuardrailError::InputTooLarge {
+                actual_bytes: input.len() as u64,
+                max_input_bytes,
+            }
+            .into(),
+        ));
+    }
+
+    Ok(input)
+}
+
+fn native_endian_bytes_as_u16_slice_mut(buf: &mut [u8]) -> Option<&mut [u16]> {
+    if !buf.len().is_multiple_of(std::mem::size_of::<u16>()) {
+        return None;
+    }
+
+    // SAFETY: `u16` accepts every bit pattern. We only return the middle slice
+    // when the whole byte buffer was properly aligned and exactly covered.
+    let (prefix, samples, suffix) = unsafe { buf.align_to_mut::<u16>() };
+    if prefix.is_empty() && suffix.is_empty() {
+        Some(samples)
+    } else {
+        None
+    }
+}
+
 /// Result of attempting to install `image` crate decoder hooks for this crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImageHookRegistration {
@@ -282,35 +470,32 @@ pub fn register_image_decoder_hooks_with_guardrails(
     let heic_decoder_hook_registered = hooks::register_decoding_hook(
         OsString::from(HOOK_EXTENSION_HEIC),
         Box::new(move |reader| {
-            let decoder = HeifImageDecoder::from_seekable_with_hint_and_guardrails(
+            decoder_from_seekable_with_hint_and_guardrails(
                 reader,
                 Some(HeifInputFamily::Heif),
                 heif_guardrails.clone(),
-            )?;
-            Ok(Box::new(decoder))
+            )
         }),
     );
     let heif_guardrails = guardrails.clone();
     let heif_decoder_hook_registered = hooks::register_decoding_hook(
         OsString::from(HOOK_EXTENSION_HEIF),
         Box::new(move |reader| {
-            let decoder = HeifImageDecoder::from_seekable_with_hint_and_guardrails(
+            decoder_from_seekable_with_hint_and_guardrails(
                 reader,
                 Some(HeifInputFamily::Heif),
                 heif_guardrails.clone(),
-            )?;
-            Ok(Box::new(decoder))
+            )
         }),
     );
     let avif_decoder_hook_registered = hooks::register_decoding_hook(
         OsString::from(HOOK_EXTENSION_AVIF),
         Box::new(move |reader| {
-            let decoder = HeifImageDecoder::from_seekable_with_hint_and_guardrails(
+            decoder_from_seekable_with_hint_and_guardrails(
                 reader,
                 Some(HeifInputFamily::Avif),
                 guardrails.clone(),
-            )?;
-            Ok(Box::new(decoder))
+            )
         }),
     );
 
@@ -592,6 +777,16 @@ fn validate_decoded_rgba_image(decoded: &DecodedRgbaImage) -> ImageResult<()> {
 fn write_rgba16_native_endian_bytes(samples: &[u16], out: &mut [u8]) {
     for (sample, chunk) in samples.iter().zip(out.chunks_exact_mut(2)) {
         chunk.copy_from_slice(&sample.to_ne_bytes());
+    }
+}
+
+fn storage_color_type_from_bit_depth(storage_bit_depth: u8) -> ColorType {
+    match storage_bit_depth {
+        8 => ColorType::Rgba8,
+        16 => ColorType::Rgba16,
+        other => {
+            unreachable!("validated storage bit depth must be 8 or 16, got {other}")
+        }
     }
 }
 
