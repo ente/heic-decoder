@@ -5252,6 +5252,13 @@ fn apply_heic_grid_tile_transforms(
     for transform in transforms {
         match transform {
             isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture) => {
+                // KNOWN DIVERGENCE: libheif converts a 4:2:0/4:2:2 tile to
+                // 4:4:4 before a chroma-unaligned clap crop
+                // (libheif/libheif/pixelimage.cc:HeifPixelImage::crop);
+                // cropping the subsampled planes here floors the chroma
+                // origin instead, shifting chroma phase for odd left/top
+                // offsets. Tiles have no post-conversion RGBA fallback
+                // before pasting, so this stays until tile decode grows one.
                 decoded = crop_heic_by_clean_aperture(decoded, *clean_aperture)?;
             }
             // A 0-degree rotation is a no-op; some muxers write the property
@@ -5270,6 +5277,53 @@ fn apply_heic_grid_tile_transforms(
         }
     }
     Ok(decoded)
+}
+
+/// Whether a clean-aperture crop can be applied to the subsampled Y/U/V
+/// planes without shifting the chroma phase of the converted RGBA output.
+///
+/// Provenance: mirrors libheif's crop guard in
+/// libheif/libheif/pixelimage.cc:HeifPixelImage::crop, which converts to
+/// 4:4:4 before cropping when a 4:2:2 crop has an odd left offset or a 4:2:0
+/// crop has an odd left/top offset. Cropping the subsampled planes in those
+/// cases floors the chroma origin, so the later RGBA conversion samples
+/// chroma half a luma sample off from heif-dec output.
+fn heic_clean_aperture_crop_preserves_chroma_phase(
+    decoded: &DecodedHeicImage,
+    clean_aperture: isobmff::ImageCleanApertureProperty,
+) -> bool {
+    let (subsample_x, subsample_y) = heic_chroma_subsampling(decoded.layout);
+    if subsample_x == 1 && subsample_y == 1 {
+        return true;
+    }
+    let Ok(crop) = clean_aperture_crop_bounds(decoded.width, decoded.height, clean_aperture) else {
+        // Invalid crops also fall back to the RGBA transform path, which
+        // recomputes the bounds and reports the error.
+        return false;
+    };
+    crop.left % i128::from(subsample_x) == 0 && crop.top % i128::from(subsample_y) == 0
+}
+
+/// Apply leading clean-aperture transforms to the subsampled planes when the
+/// crop is chroma-phase-preserving, returning the cropped image and the
+/// transforms that remain for the RGBA path. Cropping before RGBA conversion
+/// keeps peak memory proportional to the cropped geometry; unaligned crops
+/// stay on the RGBA path for pixel parity with libheif (see
+/// [`heic_clean_aperture_crop_preserves_chroma_phase`]).
+fn crop_heic_by_leading_chroma_aligned_clean_apertures(
+    mut decoded: DecodedHeicImage,
+    mut transforms: &[isobmff::PrimaryItemTransformProperty],
+) -> Result<(DecodedHeicImage, &[isobmff::PrimaryItemTransformProperty]), DecodeError> {
+    while let Some(isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture)) =
+        transforms.first()
+    {
+        if !heic_clean_aperture_crop_preserves_chroma_phase(&decoded, *clean_aperture) {
+            break;
+        }
+        decoded = crop_heic_by_clean_aperture(decoded, *clean_aperture)?;
+        transforms = &transforms[1..];
+    }
+    Ok((decoded, transforms))
 }
 
 fn crop_heic_by_clean_aperture(
@@ -7291,12 +7345,8 @@ fn decoded_heic_to_rgba8_slice(
 ) -> Result<(), DecodeError> {
     let mut remaining_transforms = transforms;
     if auxiliary_alpha.is_none() {
-        while let Some(isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture)) =
-            remaining_transforms.first()
-        {
-            decoded = crop_heic_by_clean_aperture(decoded, *clean_aperture)?;
-            remaining_transforms = &remaining_transforms[1..];
-        }
+        (decoded, remaining_transforms) =
+            crop_heic_by_leading_chroma_aligned_clean_apertures(decoded, remaining_transforms)?;
     }
 
     let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
@@ -7345,12 +7395,8 @@ fn decoded_heic_to_rgba16_slice(
 ) -> Result<(), DecodeError> {
     let mut remaining_transforms = transforms;
     if auxiliary_alpha.is_none() {
-        while let Some(isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture)) =
-            remaining_transforms.first()
-        {
-            decoded = crop_heic_by_clean_aperture(decoded, *clean_aperture)?;
-            remaining_transforms = &remaining_transforms[1..];
-        }
+        (decoded, remaining_transforms) =
+            crop_heic_by_leading_chroma_aligned_clean_apertures(decoded, remaining_transforms)?;
     }
 
     let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
@@ -8674,12 +8720,8 @@ fn decoded_heic_to_rgba_image(
 ) -> Result<DecodedRgbaImage, DecodeError> {
     let mut remaining_transforms = transforms;
     if auxiliary_alpha.is_none() {
-        while let Some(isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture)) =
-            remaining_transforms.first()
-        {
-            decoded = crop_heic_by_clean_aperture(decoded, *clean_aperture)?;
-            remaining_transforms = &remaining_transforms[1..];
-        }
+        (decoded, remaining_transforms) =
+            crop_heic_by_leading_chroma_aligned_clean_apertures(decoded, remaining_transforms)?;
     }
 
     let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
@@ -11281,6 +11323,204 @@ mod tests {
         assert_eq!(width, orientation_transform.destination_width);
         assert_eq!(height, orientation_transform.destination_height);
         assert_eq!(direct, transformed);
+    }
+
+    // Clean-aperture chroma-phase tests: libheif refuses to crop subsampled
+    // planes when the crop origin is chroma-unaligned and converts to 4:4:4
+    // first (libheif/libheif/pixelimage.cc:HeifPixelImage::crop), so the
+    // YUV-space clap fast path must only run for aligned crops; unaligned
+    // crops fall back to cropping after RGBA conversion.
+
+    /// 8x8 test image whose luma and chroma gradients stay far from the
+    /// clamping range, so a one-sample chroma phase shift always changes the
+    /// converted RGBA output.
+    fn synthetic_yuv_image(layout: super::HeicPixelLayout) -> super::DecodedHeicImage {
+        let width = 8_u32;
+        let height = 8_u32;
+        let y_samples = (0..width * height)
+            .map(|index| (64 + index) as u16)
+            .collect();
+        let (subsample_x, subsample_y) = super::heic_chroma_subsampling(layout);
+        let chroma_width = width.div_ceil(subsample_x);
+        let chroma_height = height.div_ceil(subsample_y);
+        let mut u_samples = Vec::new();
+        let mut v_samples = Vec::new();
+        for chroma_y in 0..chroma_height {
+            for chroma_x in 0..chroma_width {
+                u_samples.push((100 + chroma_x * 12) as u16);
+                v_samples.push((96 + chroma_y * 12) as u16);
+            }
+        }
+        super::DecodedHeicImage {
+            width,
+            height,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            layout,
+            ycbcr_range: super::YCbCrRange::Full,
+            ycbcr_matrix: super::YCbCrMatrixCoefficients {
+                matrix_coefficients: 1,
+                colour_primaries: 1,
+            },
+            y_plane: super::HeicPlane {
+                width,
+                height,
+                samples: y_samples,
+            },
+            u_plane: Some(super::HeicPlane {
+                width: chroma_width,
+                height: chroma_height,
+                samples: u_samples,
+            }),
+            v_plane: Some(super::HeicPlane {
+                width: chroma_width,
+                height: chroma_height,
+                samples: v_samples,
+            }),
+        }
+    }
+
+    /// 4x4 clean aperture on the 8x8 test image: the crop origin lands at
+    /// `(horizontal_offset + 2, vertical_offset + 2)`.
+    fn synthetic_clean_aperture(
+        horizontal_offset: i32,
+        vertical_offset: i32,
+    ) -> isobmff::ImageCleanApertureProperty {
+        isobmff::ImageCleanApertureProperty {
+            clean_aperture_width_num: 4,
+            clean_aperture_width_den: 1,
+            clean_aperture_height_num: 4,
+            clean_aperture_height_den: 1,
+            horizontal_offset_num: horizontal_offset,
+            horizontal_offset_den: 1,
+            vertical_offset_num: vertical_offset,
+            vertical_offset_den: 1,
+        }
+    }
+
+    /// Reference pixels: full-frame RGBA conversion followed by RGBA-domain
+    /// transforms, the path whose output the clap fast path must reproduce.
+    fn rgba8_reference_after_transforms(
+        image: &super::DecodedHeicImage,
+        transforms: &[isobmff::PrimaryItemTransformProperty],
+    ) -> (u32, u32, Vec<u8>) {
+        let pixels =
+            super::convert_heic_to_rgba8(image).expect("full-frame conversion should succeed");
+        super::apply_primary_item_transforms_rgba(image.width, image.height, pixels, transforms)
+            .expect("reference RGBA transform should succeed")
+    }
+
+    #[test]
+    fn odd_clean_aperture_crop_falls_back_to_rgba_transform_path() {
+        let image = synthetic_yuv_image(super::HeicPixelLayout::Yuv420);
+        let clean_aperture = synthetic_clean_aperture(-1, -1); // origin (1, 1)
+        assert!(!super::heic_clean_aperture_crop_preserves_chroma_phase(
+            &image,
+            clean_aperture
+        ));
+
+        let transforms = [isobmff::PrimaryItemTransformProperty::CleanAperture(
+            clean_aperture,
+        )];
+        let (reference_width, reference_height, reference_pixels) =
+            rgba8_reference_after_transforms(&image, &transforms);
+        assert_eq!((reference_width, reference_height), (4, 4));
+
+        // The YUV-space crop floors the chroma origin, so its output must
+        // differ from the reference; otherwise this fixture could not detect
+        // a regression that re-enables the fast path for odd offsets.
+        let yuv_cropped = super::crop_heic_by_clean_aperture(image.clone(), clean_aperture)
+            .expect("YUV clap crop should succeed");
+        let phase_shifted =
+            super::convert_heic_to_rgba8(&yuv_cropped).expect("cropped conversion should succeed");
+        assert_ne!(
+            phase_shifted, reference_pixels,
+            "fixture must expose the chroma phase shift"
+        );
+
+        let decoded = super::decoded_heic_to_rgba_image(image, &transforms, None, None)
+            .expect("decode should succeed");
+        assert_eq!((decoded.width, decoded.height), (4, 4));
+        assert_eq!(
+            decoded.pixels,
+            super::DecodedRgbaPixels::U8(reference_pixels)
+        );
+    }
+
+    #[test]
+    fn chroma_aligned_clean_aperture_yuv_crop_matches_rgba_transform_path() {
+        let image = synthetic_yuv_image(super::HeicPixelLayout::Yuv420);
+        let clean_aperture = synthetic_clean_aperture(0, 0); // origin (2, 2)
+        assert!(super::heic_clean_aperture_crop_preserves_chroma_phase(
+            &image,
+            clean_aperture
+        ));
+
+        let transforms = [isobmff::PrimaryItemTransformProperty::CleanAperture(
+            clean_aperture,
+        )];
+        let (_, _, reference_pixels) = rgba8_reference_after_transforms(&image, &transforms);
+
+        let decoded = super::decoded_heic_to_rgba_image(image, &transforms, None, None)
+            .expect("decode should succeed");
+        assert_eq!((decoded.width, decoded.height), (4, 4));
+        assert_eq!(
+            decoded.pixels,
+            super::DecodedRgbaPixels::U8(reference_pixels)
+        );
+    }
+
+    #[test]
+    fn clean_aperture_chroma_phase_guard_mirrors_libheif_conditions() {
+        let odd_left = synthetic_clean_aperture(-1, 0); // origin (1, 2)
+        let odd_top = synthetic_clean_aperture(0, -1); // origin (2, 1)
+        let aligned = synthetic_clean_aperture(0, 0); // origin (2, 2)
+
+        let yuv420 = synthetic_yuv_image(super::HeicPixelLayout::Yuv420);
+        assert!(!super::heic_clean_aperture_crop_preserves_chroma_phase(
+            &yuv420, odd_left
+        ));
+        assert!(!super::heic_clean_aperture_crop_preserves_chroma_phase(
+            &yuv420, odd_top
+        ));
+        assert!(super::heic_clean_aperture_crop_preserves_chroma_phase(
+            &yuv420, aligned
+        ));
+
+        // 4:2:2 chroma is only horizontally subsampled: an odd top offset
+        // keeps the chroma phase, matching libheif's left-only check.
+        let yuv422 = synthetic_yuv_image(super::HeicPixelLayout::Yuv422);
+        assert!(!super::heic_clean_aperture_crop_preserves_chroma_phase(
+            &yuv422, odd_left
+        ));
+        assert!(super::heic_clean_aperture_crop_preserves_chroma_phase(
+            &yuv422, odd_top
+        ));
+
+        // 4:4:4 has no subsampling to misalign.
+        let yuv444 = synthetic_yuv_image(super::HeicPixelLayout::Yuv444);
+        assert!(super::heic_clean_aperture_crop_preserves_chroma_phase(
+            &yuv444, odd_left
+        ));
+        assert!(super::heic_clean_aperture_crop_preserves_chroma_phase(
+            &yuv444, odd_top
+        ));
+    }
+
+    #[cfg(feature = "image-integration")]
+    #[test]
+    fn odd_clean_aperture_slice_decode_matches_rgba_transform_path() {
+        let image = synthetic_yuv_image(super::HeicPixelLayout::Yuv420);
+        let clean_aperture = synthetic_clean_aperture(-1, -1); // origin (1, 1)
+        let transforms = [isobmff::PrimaryItemTransformProperty::CleanAperture(
+            clean_aperture,
+        )];
+        let (_, _, reference_pixels) = rgba8_reference_after_transforms(&image, &transforms);
+
+        let mut out = vec![0_u8; reference_pixels.len()];
+        super::decoded_heic_to_rgba8_slice(image, &transforms, None, &mut out)
+            .expect("slice decode should succeed");
+        assert_eq!(out, reference_pixels);
     }
 
     #[test]
