@@ -7156,6 +7156,10 @@ fn decode_primary_heic_grid_to_rgba8_slice(
             ));
         }
 
+        // Caller-provided ImageDecoder buffers are not guaranteed to be
+        // pre-cleared. Preserve the owned grid path's zero-filled gaps when
+        // clipped tiles do not cover the descriptor output exactly.
+        out.fill(0);
         let tile_width = first_tile.width;
         let tile_height = first_tile.height;
         let reference_layout = first_tile.layout;
@@ -7241,6 +7245,10 @@ fn decode_primary_heic_grid_to_rgba16_slice(
             ));
         }
 
+        // Caller-provided ImageDecoder buffers are not guaranteed to be
+        // pre-cleared. Preserve the owned grid path's zero-filled gaps when
+        // clipped tiles do not cover the descriptor output exactly.
+        out.fill(0);
         let tile_width = first_tile.width;
         let tile_height = first_tile.height;
         let reference_layout = first_tile.layout;
@@ -9246,6 +9254,7 @@ fn clean_aperture_crop_bounds(
     })
 }
 
+#[cfg(feature = "image-integration")]
 fn transformed_rgba_dimensions(
     width: u32,
     height: u32,
