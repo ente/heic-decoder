@@ -7081,8 +7081,254 @@ fn read_u64_be(input: &[u8]) -> u64 {
 mod tests {
     use super::{
         FourCc, IccColorProfile, NclxColorProfile, PrimaryItemColorProperties,
-        merge_primary_and_grid_tile_color_properties,
+        merge_primary_and_grid_tile_color_properties, primary_heic_color_properties,
     };
+
+    // -- Minimal ISOBMFF builders -------------------------------------------
+    //
+    // These synthesize just enough `meta` structure for the primary-item
+    // colour-property graph (pitm/iloc/iinf/iprp/iref); no image payload is
+    // needed because colour resolution never touches item data.
+
+    fn plain_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&u32::try_from(8 + payload.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(box_type);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn full_box(box_type: &[u8; 4], version: u8, flags: u32, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(4 + payload.len());
+        body.extend_from_slice(&((u32::from(version) << 24) | flags).to_be_bytes());
+        body.extend_from_slice(payload);
+        plain_box(box_type, &body)
+    }
+
+    fn pitm_box(item_id: u16) -> Vec<u8> {
+        full_box(b"pitm", 0, 0, &item_id.to_be_bytes())
+    }
+
+    /// iloc v0 with zero-size offset/length/base_offset fields and no extents:
+    /// enough for graph resolution, which only requires the entry to exist.
+    fn iloc_box(item_ids: &[u16]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0_u16.to_be_bytes()); // all size fields zero
+        payload.extend_from_slice(&u16::try_from(item_ids.len()).unwrap().to_be_bytes());
+        for item_id in item_ids {
+            payload.extend_from_slice(&item_id.to_be_bytes());
+            payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+            payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+        }
+        full_box(b"iloc", 0, 0, &payload)
+    }
+
+    fn infe_box(item_id: u16, item_type: &[u8; 4]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&item_id.to_be_bytes());
+        payload.extend_from_slice(&0_u16.to_be_bytes()); // item_protection_index
+        payload.extend_from_slice(item_type);
+        payload.push(0); // empty item_name
+        full_box(b"infe", 2, 0, &payload)
+    }
+
+    fn iinf_box(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u16::try_from(entries.len()).unwrap().to_be_bytes());
+        for entry in entries {
+            payload.extend_from_slice(entry);
+        }
+        full_box(b"iinf", 0, 0, &payload)
+    }
+
+    fn colr_nclx_box(
+        colour_primaries: u16,
+        transfer_characteristics: u16,
+        matrix_coefficients: u16,
+        full_range: bool,
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"nclx");
+        payload.extend_from_slice(&colour_primaries.to_be_bytes());
+        payload.extend_from_slice(&transfer_characteristics.to_be_bytes());
+        payload.extend_from_slice(&matrix_coefficients.to_be_bytes());
+        payload.push(if full_range { 0x80 } else { 0 });
+        plain_box(b"colr", &payload)
+    }
+
+    fn colr_icc_box(profile: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"prof");
+        payload.extend_from_slice(profile);
+        plain_box(b"colr", &payload)
+    }
+
+    /// Minimal parseable hvcC: configurationVersion 1, everything else zero,
+    /// zero NAL arrays.
+    fn hvcc_box() -> Vec<u8> {
+        let mut payload = vec![0_u8; 23];
+        payload[0] = 1;
+        plain_box(b"hvcC", &payload)
+    }
+
+    /// ipma v0/flags0: each entry is (item_id, 1-based ipco property indices).
+    fn ipma_box(entries: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32::try_from(entries.len()).unwrap().to_be_bytes());
+        for (item_id, property_indices) in entries {
+            payload.extend_from_slice(&item_id.to_be_bytes());
+            payload.push(u8::try_from(property_indices.len()).unwrap());
+            payload.extend_from_slice(property_indices);
+        }
+        full_box(b"ipma", 0, 0, &payload)
+    }
+
+    fn iprp_box(properties: &[Vec<u8>], ipma_entries: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut ipco_payload = Vec::new();
+        for property in properties {
+            ipco_payload.extend_from_slice(property);
+        }
+        let mut payload = plain_box(b"ipco", &ipco_payload);
+        payload.extend_from_slice(&ipma_box(ipma_entries));
+        plain_box(b"iprp", &payload)
+    }
+
+    fn iref_dimg_box(from_item_id: u16, to_item_ids: &[u16]) -> Vec<u8> {
+        let mut child_payload = Vec::new();
+        child_payload.extend_from_slice(&from_item_id.to_be_bytes());
+        child_payload.extend_from_slice(&u16::try_from(to_item_ids.len()).unwrap().to_be_bytes());
+        for to_item_id in to_item_ids {
+            child_payload.extend_from_slice(&to_item_id.to_be_bytes());
+        }
+        full_box(b"iref", 0, 0, &plain_box(b"dimg", &child_payload))
+    }
+
+    fn meta_file(children: &[Vec<u8>]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for child in children {
+            payload.extend_from_slice(child);
+        }
+        full_box(b"meta", 0, 0, &payload)
+    }
+
+    // -- Container-level colour resolution tests ----------------------------
+
+    #[test]
+    fn resolves_primary_nclx_and_icc_from_container_bytes() {
+        let file = meta_file(&[
+            pitm_box(1),
+            iloc_box(&[1]),
+            iinf_box(&[infe_box(1, b"hvc1")]),
+            iprp_box(
+                &[
+                    colr_nclx_box(12, 13, 6, true),
+                    colr_icc_box(&[9, 9, 9]),
+                    hvcc_box(),
+                ],
+                &[(1, &[1, 2, 3])],
+            ),
+        ]);
+
+        let colr = primary_heic_color_properties(&file).expect("expected colour properties");
+        assert_eq!(colr.nclx.as_ref().unwrap().colour_primaries, 12);
+        assert!(colr.nclx.as_ref().unwrap().full_range_flag);
+        assert_eq!(colr.icc.unwrap().profile, vec![9, 9, 9]);
+    }
+
+    #[test]
+    fn returns_none_without_any_colr_in_container_bytes() {
+        let file = meta_file(&[
+            pitm_box(1),
+            iloc_box(&[1]),
+            iinf_box(&[infe_box(1, b"hvc1")]),
+            iprp_box(&[hvcc_box()], &[(1, &[1])]),
+        ]);
+
+        assert!(primary_heic_color_properties(&file).is_none());
+    }
+
+    #[test]
+    fn grid_inherits_tile_icc_from_container_bytes() {
+        let file = meta_file(&[
+            pitm_box(1),
+            iloc_box(&[1, 2]),
+            iinf_box(&[infe_box(1, b"grid"), infe_box(2, b"hvc1")]),
+            iprp_box(&[hvcc_box(), colr_icc_box(&[1, 2, 3])], &[(2, &[1, 2])]),
+            iref_dimg_box(1, &[2]),
+        ]);
+
+        let colr = primary_heic_color_properties(&file).expect("expected colour properties");
+        assert_eq!(colr.icc.unwrap().profile, vec![1, 2, 3]);
+        assert!(colr.nclx.is_none());
+    }
+
+    #[test]
+    fn grid_with_undefined_nclx_inherits_tile_nclx_from_container_bytes() {
+        // The grid item carries only the all-"unspecified" sentinel; the real
+        // colour metadata lives on the first tile, as libheif inherits it.
+        let file = meta_file(&[
+            pitm_box(1),
+            iloc_box(&[1, 2]),
+            iinf_box(&[infe_box(1, b"grid"), infe_box(2, b"hvc1")]),
+            iprp_box(
+                &[
+                    colr_nclx_box(2, 2, 2, true),
+                    hvcc_box(),
+                    colr_nclx_box(1, 13, 6, true),
+                ],
+                &[(1, &[1]), (2, &[2, 3])],
+            ),
+            iref_dimg_box(1, &[2]),
+        ]);
+
+        let colr = primary_heic_color_properties(&file).expect("expected colour properties");
+        let nclx = colr.nclx.expect("expected inherited tile nclx");
+        assert_eq!(nclx.colour_primaries, 1);
+        assert_eq!(nclx.transfer_characteristics, 13);
+        assert!(colr.icc.is_none());
+    }
+
+    #[test]
+    fn grid_with_own_icc_still_inherits_tile_nclx_from_container_bytes() {
+        let file = meta_file(&[
+            pitm_box(1),
+            iloc_box(&[1, 2]),
+            iinf_box(&[infe_box(1, b"grid"), infe_box(2, b"hvc1")]),
+            iprp_box(
+                &[
+                    colr_icc_box(&[4, 5, 6]),
+                    hvcc_box(),
+                    colr_nclx_box(9, 16, 9, false),
+                ],
+                &[(1, &[1]), (2, &[2, 3])],
+            ),
+            iref_dimg_box(1, &[2]),
+        ]);
+
+        let colr = primary_heic_color_properties(&file).expect("expected colour properties");
+        assert_eq!(colr.icc.unwrap().profile, vec![4, 5, 6]);
+        assert_eq!(colr.nclx.unwrap().colour_primaries, 9);
+    }
+
+    #[test]
+    fn grid_keeps_own_nclx_when_tile_is_unresolvable_in_container_bytes() {
+        // The tile has no hvcC, so tile resolution fails; the primary item's
+        // own nclx must survive instead of being dropped.
+        let file = meta_file(&[
+            pitm_box(1),
+            iloc_box(&[1, 2]),
+            iinf_box(&[infe_box(1, b"grid"), infe_box(2, b"hvc1")]),
+            iprp_box(
+                &[colr_nclx_box(12, 13, 6, true), colr_icc_box(&[7, 7, 7])],
+                &[(1, &[1]), (2, &[2])],
+            ),
+            iref_dimg_box(1, &[2]),
+        ]);
+
+        let colr = primary_heic_color_properties(&file).expect("expected colour properties");
+        assert_eq!(colr.nclx.unwrap().colour_primaries, 12);
+        assert!(colr.icc.is_none());
+    }
 
     #[test]
     fn grid_primary_nclx_preserves_first_tile_icc_fallback() {
