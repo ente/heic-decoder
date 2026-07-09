@@ -26,6 +26,7 @@ brotli = "8.0"
 flate2 = "1.1"
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 libc = "0.2"
+moxcms = "0.8.1"
 png = "0.18"
 rav1d = { git = "https://github.com/ente-io/rav1d.git", branch = "arm32_stable", default-features = false, features = [
     "bitdepth_8",

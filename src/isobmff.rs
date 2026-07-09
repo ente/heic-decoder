@@ -875,6 +875,19 @@ pub struct NclxColorProfile {
     pub full_range_flag: bool,
 }
 
+impl NclxColorProfile {
+    /// libheif treats an all-"unspecified" nclx (primaries 2, transfer 2,
+    /// matrix 2, full range) as undefined and keeps decoder-attached colour
+    /// metadata instead (libheif/libheif/nclx.h:nclx_profile::undefined and
+    /// pixelimage.cc:has_nclx_color_profile).
+    pub fn is_undefined(&self) -> bool {
+        self.colour_primaries == 2
+            && self.transfer_characteristics == 2
+            && self.matrix_coefficients == 2
+            && self.full_range_flag
+    }
+}
+
 /// Parsed `colr` ICC profile payload fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IccColorProfile {
@@ -4587,52 +4600,94 @@ fn resolve_grid_tile_hvcc_colr_and_transforms(
     Ok((hvcc, colr, transforms))
 }
 
-/// ICC colour profile for the primary HEIC item, mirroring libheif: the
-/// primary item's own `colr` ICC wins; a `grid` primary without one inherits
-/// the first tile's ICC (libheif/libheif/context.cc).
-pub fn primary_heic_icc_profile(input: &[u8]) -> Option<Vec<u8>> {
+/// Colour properties for the primary HEIC item, mirroring libheif: the primary
+/// item's own `colr` properties win; a `grid` primary inherits whatever it
+/// lacks from its first tile, per profile type, with an all-"unspecified" nclx
+/// treated as absent (libheif/libheif/context.cc grid inheritance and
+/// pixelimage.cc:has_nclx_color_profile).
+pub fn primary_heic_color_properties(input: &[u8]) -> Option<PrimaryItemColorProperties> {
     let (_meta, resolved) = resolve_primary_heic_item_graph(input).ok()?;
 
-    let mut icc = None;
+    let mut primary_colr = PrimaryItemColorProperties::default();
     for property in &resolved.primary_item.properties {
         if property.property.header.box_type.as_bytes() != COLR_BOX_TYPE {
             continue;
         }
-        if let Ok(parsed_colr) = property.property.parse_colr()
-            && let ColorInformation::Icc(profile) = parsed_colr.information
-        {
-            icc = Some(profile.profile);
+        if let Ok(parsed_colr) = property.property.parse_colr() {
+            match parsed_colr.information {
+                ColorInformation::Nclx(profile) => {
+                    primary_colr.nclx = Some(profile);
+                }
+                ColorInformation::Icc(profile) => {
+                    primary_colr.icc = Some(profile);
+                }
+            }
         }
     }
-    if icc.is_some() {
-        return icc;
+    let is_grid_primary = resolved
+        .primary_item
+        .item_info
+        .item_type
+        .map(|item_type| item_type.as_bytes() == GRID_ITEM_TYPE)
+        .unwrap_or(false);
+    // A grid primary only consults its first tile for whatever it lacks: an
+    // ICC profile, or an nclx that is not the all-"unspecified" sentinel.
+    let primary_nclx_defined = primary_colr
+        .nclx
+        .as_ref()
+        .is_some_and(|nclx| !nclx.is_undefined());
+    if !is_grid_primary || (primary_colr.icc.is_some() && primary_nclx_defined) {
+        return (primary_colr.icc.is_some() || primary_colr.nclx.is_some()).then_some(primary_colr);
     }
-
-    // Grid primary without its own ICC: inherit the first tile's.
-    let item_type = resolved.primary_item.item_info.item_type?;
-    if item_type.as_bytes() != GRID_ITEM_TYPE {
-        return None;
-    }
-    let tile_item_id = resolved
+    // A grid whose first tile cannot be resolved still keeps the primary
+    // item's own colour properties instead of dropping them.
+    let tile_colr = resolved
         .primary_item
         .references
         .iter()
         .filter(|reference| reference.reference_type.as_bytes() == DIMG_REFERENCE_TYPE)
         .flat_map(|reference| reference.to_item_ids.iter().copied())
-        .next()?;
+        .next()
+        .and_then(|tile_item_id| {
+            let mut flattened_properties = Vec::new();
+            for property_container in &resolved.iprp.property_containers {
+                flattened_properties.extend(property_container.properties.iter().cloned());
+            }
+            resolve_grid_tile_hvcc_colr_and_transforms(
+                resolved.primary_item.item_id,
+                tile_item_id,
+                &resolved.iprp.associations,
+                &flattened_properties,
+            )
+            .ok()
+            .map(|(_, tile_colr, _)| tile_colr)
+        });
+    merge_primary_and_grid_tile_color_properties(primary_colr, tile_colr)
+}
 
-    let mut flattened_properties = Vec::new();
-    for property_container in &resolved.iprp.property_containers {
-        flattened_properties.extend(property_container.properties.iter().cloned());
-    }
-    let (_, tile_colr, _) = resolve_grid_tile_hvcc_colr_and_transforms(
-        resolved.primary_item.item_id,
-        tile_item_id,
-        &resolved.iprp.associations,
-        &flattened_properties,
-    )
-    .ok()?;
-    tile_colr.icc.map(|profile| profile.profile)
+fn merge_primary_and_grid_tile_color_properties(
+    primary_colr: PrimaryItemColorProperties,
+    tile_colr: Option<PrimaryItemColorProperties>,
+) -> Option<PrimaryItemColorProperties> {
+    // Mirrors libheif's grid inheritance (libheif/libheif/context.cc): the
+    // ICC and nclx profiles inherit from the first tile independently, and an
+    // all-"unspecified" nclx counts as absent on either side
+    // (pixelimage.cc:has_nclx_color_profile), so the merged properties never
+    // carry the undefined sentinel.
+    let tile_colr = tile_colr.unwrap_or_default();
+    let defined = |nclx: Option<NclxColorProfile>| nclx.filter(|nclx| !nclx.is_undefined());
+    let merged = PrimaryItemColorProperties {
+        nclx: defined(primary_colr.nclx).or(defined(tile_colr.nclx)),
+        icc: primary_colr.icc.or(tile_colr.icc),
+    };
+    (merged.nclx.is_some() || merged.icc.is_some()).then_some(merged)
+}
+
+/// ICC colour profile for the primary HEIC item, mirroring libheif: the
+/// primary item's own `colr` ICC wins; a `grid` primary without one inherits
+/// the first tile's ICC (libheif/libheif/context.cc).
+pub fn primary_heic_icc_profile(input: &[u8]) -> Option<Vec<u8>> {
+    primary_heic_color_properties(input).and_then(|colr| colr.icc.map(|profile| profile.profile))
 }
 
 fn resolve_primary_heic_item_graph<'a>(
@@ -7020,4 +7075,140 @@ fn read_u64_be(input: &[u8]) -> u64 {
     u64::from_be_bytes([
         input[0], input[1], input[2], input[3], input[4], input[5], input[6], input[7],
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FourCc, IccColorProfile, NclxColorProfile, PrimaryItemColorProperties,
+        merge_primary_and_grid_tile_color_properties,
+    };
+
+    #[test]
+    fn grid_primary_nclx_preserves_first_tile_icc_fallback() {
+        let primary = PrimaryItemColorProperties {
+            nclx: Some(nclx_profile(12)),
+            icc: None,
+        };
+        let tile = PrimaryItemColorProperties {
+            nclx: None,
+            icc: Some(icc_profile(vec![1, 2, 3])),
+        };
+
+        let merged = merge_primary_and_grid_tile_color_properties(primary, Some(tile))
+            .expect("expected merged color properties");
+
+        assert_eq!(merged.icc.unwrap().profile, vec![1, 2, 3]);
+        assert_eq!(merged.nclx.unwrap().colour_primaries, 12);
+    }
+
+    #[test]
+    fn grid_primary_icc_wins_over_first_tile_icc() {
+        let primary = PrimaryItemColorProperties {
+            nclx: None,
+            icc: Some(icc_profile(vec![4, 5, 6])),
+        };
+        let tile = PrimaryItemColorProperties {
+            nclx: None,
+            icc: Some(icc_profile(vec![1, 2, 3])),
+        };
+
+        let merged = merge_primary_and_grid_tile_color_properties(primary, Some(tile))
+            .expect("expected merged color properties");
+
+        assert_eq!(merged.icc.unwrap().profile, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn grid_primary_nclx_survives_without_first_tile_icc() {
+        let primary = PrimaryItemColorProperties {
+            nclx: Some(nclx_profile(12)),
+            icc: None,
+        };
+
+        let merged = merge_primary_and_grid_tile_color_properties(primary, None)
+            .expect("expected primary nclx color properties");
+
+        assert_eq!(merged.nclx.unwrap().colour_primaries, 12);
+        assert!(merged.icc.is_none());
+    }
+
+    #[test]
+    fn grid_primary_undefined_nclx_inherits_first_tile_nclx() {
+        let primary = PrimaryItemColorProperties {
+            nclx: Some(undefined_nclx()),
+            icc: None,
+        };
+        let tile = PrimaryItemColorProperties {
+            nclx: Some(nclx_profile(12)),
+            icc: None,
+        };
+
+        let merged = merge_primary_and_grid_tile_color_properties(primary, Some(tile))
+            .expect("expected inherited tile nclx");
+
+        assert_eq!(merged.nclx.unwrap().colour_primaries, 12);
+        assert!(merged.icc.is_none());
+    }
+
+    #[test]
+    fn grid_primary_undefined_nclx_takes_first_tile_nclx_alongside_tile_icc() {
+        let primary = PrimaryItemColorProperties {
+            nclx: Some(undefined_nclx()),
+            icc: None,
+        };
+        let tile = PrimaryItemColorProperties {
+            nclx: Some(nclx_profile(9)),
+            icc: Some(icc_profile(vec![1, 2, 3])),
+        };
+
+        let merged = merge_primary_and_grid_tile_color_properties(primary, Some(tile))
+            .expect("expected merged color properties");
+
+        assert_eq!(merged.nclx.unwrap().colour_primaries, 9);
+        assert_eq!(merged.icc.unwrap().profile, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn grid_primary_icc_keeps_inherited_tile_nclx() {
+        let primary = PrimaryItemColorProperties {
+            nclx: None,
+            icc: Some(icc_profile(vec![4, 5, 6])),
+        };
+        let tile = PrimaryItemColorProperties {
+            nclx: Some(nclx_profile(12)),
+            icc: Some(icc_profile(vec![1, 2, 3])),
+        };
+
+        let merged = merge_primary_and_grid_tile_color_properties(primary, Some(tile))
+            .expect("expected merged color properties");
+
+        assert_eq!(merged.icc.unwrap().profile, vec![4, 5, 6]);
+        assert_eq!(merged.nclx.unwrap().colour_primaries, 12);
+    }
+
+    fn undefined_nclx() -> NclxColorProfile {
+        NclxColorProfile {
+            colour_primaries: 2,
+            transfer_characteristics: 2,
+            matrix_coefficients: 2,
+            full_range_flag: true,
+        }
+    }
+
+    fn nclx_profile(colour_primaries: u16) -> NclxColorProfile {
+        NclxColorProfile {
+            colour_primaries,
+            transfer_characteristics: 13,
+            matrix_coefficients: 1,
+            full_range_flag: true,
+        }
+    }
+
+    fn icc_profile(profile: Vec<u8>) -> IccColorProfile {
+        IccColorProfile {
+            profile_type: FourCc::new(*b"prof"),
+            profile,
+        }
+    }
 }
