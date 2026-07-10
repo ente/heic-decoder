@@ -375,7 +375,7 @@ fn decoder_from_seekable_with_hint_and_guardrails<R: Read + Seek>(
 /// capacity-overflow panic) before a single byte arrives. `read_to_end` still
 /// grows the buffer past this for genuinely larger, guardrail-permitted
 /// inputs.
-const MAX_INPUT_PREALLOCATION_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_INPUT_PREALLOCATION_BYTES: u64 = 128 * 1024 * 1024;
 
 fn read_seekable_input_to_vec<R: Read + Seek>(
     mut input_reader: R,
