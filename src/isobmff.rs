@@ -7204,14 +7204,22 @@ pub(crate) mod test_support {
         plain_box(b"iprp", &payload)
     }
 
-    pub(crate) fn iref_dimg_box(from_item_id: u16, to_item_ids: &[u16]) -> Vec<u8> {
+    pub(crate) fn iref_reference_box(
+        reference_type: &[u8; 4],
+        from_item_id: u16,
+        to_item_ids: &[u16],
+    ) -> Vec<u8> {
         let mut child_payload = Vec::new();
         child_payload.extend_from_slice(&from_item_id.to_be_bytes());
         child_payload.extend_from_slice(&u16::try_from(to_item_ids.len()).unwrap().to_be_bytes());
         for to_item_id in to_item_ids {
             child_payload.extend_from_slice(&to_item_id.to_be_bytes());
         }
-        full_box(b"iref", 0, 0, &plain_box(b"dimg", &child_payload))
+        full_box(b"iref", 0, 0, &plain_box(reference_type, &child_payload))
+    }
+
+    pub(crate) fn iref_dimg_box(from_item_id: u16, to_item_ids: &[u16]) -> Vec<u8> {
+        iref_reference_box(b"dimg", from_item_id, to_item_ids)
     }
 
     pub(crate) fn meta_file(children: &[Vec<u8>]) -> Vec<u8> {
@@ -7277,6 +7285,67 @@ pub(crate) mod test_support {
         file.extend_from_slice(&meta);
         file.extend_from_slice(&plain_box(b"mdat", &pixels_rgb));
         (file, expected_rgba)
+    }
+
+    /// [`minimal_uncompressed_rgb3_heif`] plus a cdsc-linked `Exif` item
+    /// whose big-endian TIFF block carries the given orientation.
+    ///
+    /// Returns the file bytes, the RGBA8 pixels a decode must produce, and
+    /// the raw TIFF block `ImageDecoder::exif_metadata` must hand back.
+    pub(crate) fn minimal_uncompressed_rgb3_heif_with_exif_orientation(
+        orientation: u16,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let pixels_rgb: [u8; 6] = [10, 20, 30, 200, 150, 100];
+        let expected_rgba: Vec<u8> = vec![10, 20, 30, 255, 200, 150, 100, 255];
+
+        // Big-endian TIFF: header, one IFD with a single SHORT orientation
+        // entry (value left-justified in the 4-byte field), no next IFD.
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"MM\x00\x2A");
+        tiff.extend_from_slice(&8_u32.to_be_bytes());
+        tiff.extend_from_slice(&1_u16.to_be_bytes());
+        tiff.extend_from_slice(&0x0112_u16.to_be_bytes());
+        tiff.extend_from_slice(&3_u16.to_be_bytes());
+        tiff.extend_from_slice(&1_u32.to_be_bytes());
+        tiff.extend_from_slice(&orientation.to_be_bytes());
+        tiff.extend_from_slice(&[0, 0]);
+        tiff.extend_from_slice(&0_u32.to_be_bytes());
+
+        // HEIF EXIF item payload: 4-byte exif_tiff_header_offset, then TIFF.
+        let mut exif_payload = Vec::new();
+        exif_payload.extend_from_slice(&0_u32.to_be_bytes());
+        exif_payload.extend_from_slice(&tiff);
+
+        let ftyp = ftyp_box(b"mif1");
+        let meta_with_data_offsets = |pixel_offset: u32, exif_offset: u32| {
+            meta_file(&[
+                pitm_box(1),
+                iloc_with_extent_box(&[
+                    (1, pixel_offset, u32::try_from(pixels_rgb.len()).unwrap()),
+                    (2, exif_offset, u32::try_from(exif_payload.len()).unwrap()),
+                ]),
+                iinf_box(&[infe_box(1, b"unci"), infe_box(2, b"Exif")]),
+                iref_reference_box(b"cdsc", 2, &[1]),
+                iprp_box(&[ispe_box(2, 1), uncc_v1_box(b"rgb3")], &[(1, &[1, 2])]),
+            ])
+        };
+        // The iloc extent offsets are file-absolute and all iloc fields are
+        // fixed-size, so a first pass with placeholder offsets yields the
+        // final layout to compute the real offsets from.
+        let meta_len = meta_with_data_offsets(0, 0).len();
+        let mdat_header_len = 8;
+        let pixel_offset = u32::try_from(ftyp.len() + meta_len + mdat_header_len).unwrap();
+        let exif_offset = pixel_offset + u32::try_from(pixels_rgb.len()).unwrap();
+        let meta = meta_with_data_offsets(pixel_offset, exif_offset);
+
+        let mut mdat_payload = pixels_rgb.to_vec();
+        mdat_payload.extend_from_slice(&exif_payload);
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&meta);
+        file.extend_from_slice(&plain_box(b"mdat", &mdat_payload));
+        (file, expected_rgba, tiff)
     }
 }
 

@@ -295,6 +295,15 @@ impl ImageDecoder for LazyHeifImageDecoder {
         Ok(self.layout.icc_profile.clone())
     }
 
+    // Decode does not bake EXIF orientation into pixels (libheif parity;
+    // orientation is applied at the application layer), so expose the EXIF
+    // block through the trait: `ImageDecoder::orientation()` derives from it,
+    // and without this override image-crate callers would always see
+    // `Orientation::NoTransforms` for EXIF-only-rotated files.
+    fn exif_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
+        Ok(crate::primary_exif_tiff_payload(&self.input))
+    }
+
     fn read_image(self, buf: &mut [u8]) -> ImageResult<()>
     where
         Self: Sized,
@@ -860,6 +869,41 @@ mod tests {
                 other => self.0.seek(other),
             }
         }
+    }
+
+    /// Decode does not bake EXIF orientation into pixels, so hook callers
+    /// rely on `exif_metadata`/`orientation` to rotate correctly; without
+    /// the override they would always see `Orientation::NoTransforms`.
+    #[test]
+    fn hook_decoder_exposes_exif_orientation() {
+        let (file, expected_rgba, expected_tiff) =
+            crate::isobmff::test_support::minimal_uncompressed_rgb3_heif_with_exif_orientation(6);
+
+        let mut decoder = decoder_from_seekable_with_hint_and_guardrails(
+            Cursor::new(file),
+            Some(HeifInputFamily::Heif),
+            DecodeGuardrails::default(),
+        )
+        .expect("hook construction should succeed");
+        assert_eq!(
+            decoder
+                .exif_metadata()
+                .expect("exif metadata read should succeed"),
+            Some(expected_tiff)
+        );
+        assert_eq!(
+            decoder
+                .orientation()
+                .expect("orientation read should succeed"),
+            image::metadata::Orientation::Rotate90
+        );
+
+        // Pixels stay unrotated; orientation is applied by the caller.
+        let mut pixels = vec![0_u8; expected_rgba.len()];
+        decoder
+            .read_image_boxed(&mut pixels)
+            .expect("lazy uncompressed decode should succeed");
+        assert_eq!(pixels, expected_rgba);
     }
 
     #[test]

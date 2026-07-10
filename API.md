@@ -286,6 +286,12 @@ let img = if let Some(orientation) = hint.orientation_to_apply() {
 };
 ```
 
+The registered hook decoder also exposes the primary item's EXIF block through
+the standard `ImageDecoder::exif_metadata`/`ImageDecoder::orientation` methods,
+so generic `image` code (`decoder.orientation()` +
+`DynamicImage::apply_orientation`) works without crate-specific helpers. Pixels
+stay unrotated either way; applying orientation remains the caller's choice.
+
 ### 3) Direct adapter usage (optional)
 
 `HeifImageDecoder` constructors:

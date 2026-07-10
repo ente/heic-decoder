@@ -6717,11 +6717,40 @@ fn primary_exif_orientation_from_heif(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
 ) -> Option<u16> {
-    let top_level = isobmff::parse_boxes(input).ok()?;
-    let meta_box = find_first_box_by_type(&top_level, META_BOX_TYPE)?;
-    let meta = meta_box.parse_meta().ok()?;
-    let resolved = meta.resolve_primary_item().ok()?;
-    let iref = resolved.iref.as_ref()?;
+    for payload in primary_exif_item_payloads(input, source) {
+        let Some(orientation) = parse_exif_orientation_from_item_payload(&payload) else {
+            continue;
+        };
+        if (1..=8).contains(&orientation) {
+            return Some(orientation);
+        }
+    }
+
+    None
+}
+
+/// Collect the payloads of every cdsc-linked EXIF candidate item that
+/// describes the primary item (usually zero or one).
+fn primary_exif_item_payloads(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+) -> Vec<Vec<u8>> {
+    let mut payloads = Vec::new();
+    let Ok(top_level) = isobmff::parse_boxes(input) else {
+        return payloads;
+    };
+    let Some(meta_box) = find_first_box_by_type(&top_level, META_BOX_TYPE) else {
+        return payloads;
+    };
+    let Ok(meta) = meta_box.parse_meta() else {
+        return payloads;
+    };
+    let Ok(resolved) = meta.resolve_primary_item() else {
+        return payloads;
+    };
+    let Some(iref) = resolved.iref.as_ref() else {
+        return payloads;
+    };
     let primary_item_id = resolved.primary_item.item_id;
 
     for reference in &iref.references {
@@ -6757,18 +6786,26 @@ fn primary_exif_orientation_from_heif(
             continue;
         }
 
-        let Some(payload) = extract_heic_item_payload_with_source(input, source, &meta, location)
-        else {
-            continue;
-        };
-        let Some(orientation) = parse_exif_orientation_from_item_payload(&payload) else {
-            continue;
-        };
-        if (1..=8).contains(&orientation) {
-            return Some(orientation);
+        if let Some(payload) = extract_heic_item_payload_with_source(input, source, &meta, location)
+        {
+            payloads.push(payload);
         }
     }
 
+    payloads
+}
+
+/// Raw TIFF-aligned EXIF block for the primary item, in the shape
+/// `ImageDecoder::exif_metadata` consumers expect (starting at the TIFF
+/// byte-order marker, i.e. what `Orientation::from_exif_chunk` parses).
+#[cfg(feature = "image-integration")]
+pub(crate) fn primary_exif_tiff_payload(input: &[u8]) -> Option<Vec<u8>> {
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    for payload in primary_exif_item_payloads(input, &mut source) {
+        if let Some(tiff_start) = exif_item_payload_tiff_start(&payload) {
+            return Some(payload[tiff_start..].to_vec());
+        }
+    }
     None
 }
 
@@ -6839,24 +6876,7 @@ fn exif_orientation_to_primary_item_transforms(
 }
 
 fn parse_exif_orientation_from_item_payload(payload: &[u8]) -> Option<u16> {
-    let mut candidates = Vec::new();
-    if payload.len() >= 4 {
-        let tiff_offset = u32::from_be_bytes(payload[0..4].try_into().ok()?);
-        let tiff_offset = usize::try_from(tiff_offset).ok()?;
-        let tiff_start = 4_usize.checked_add(tiff_offset)?;
-        candidates.push(tiff_start);
-    }
-    if let Some(exif_header_start) = find_subslice(payload, EXIF_HEADER) {
-        let tiff_start = exif_header_start.checked_add(EXIF_HEADER.len())?;
-        if !candidates.contains(&tiff_start) {
-            candidates.push(tiff_start);
-        }
-    }
-    if !candidates.contains(&0) {
-        candidates.push(0);
-    }
-
-    for tiff_start in candidates {
+    for tiff_start in exif_item_payload_tiff_start_candidates(payload) {
         let Some(orientation) = parse_exif_orientation_from_tiff(payload, tiff_start) else {
             continue;
         };
@@ -6865,6 +6885,40 @@ fn parse_exif_orientation_from_item_payload(payload: &[u8]) -> Option<u16> {
         }
     }
     None
+}
+
+/// Candidate offsets of the TIFF block inside a HEIF EXIF item payload: the
+/// 4-byte exif_tiff_header_offset prefix, an embedded "Exif\0\0" marker, and
+/// the payload start itself.
+fn exif_item_payload_tiff_start_candidates(payload: &[u8]) -> Vec<usize> {
+    let mut candidates = Vec::new();
+    if payload.len() >= 4
+        && let Ok(prefix) = <[u8; 4]>::try_from(&payload[0..4])
+    {
+        let tiff_offset = usize::try_from(u32::from_be_bytes(prefix)).ok();
+        if let Some(tiff_start) = tiff_offset.and_then(|offset| 4_usize.checked_add(offset)) {
+            candidates.push(tiff_start);
+        }
+    }
+    if let Some(tiff_start) = find_subslice(payload, EXIF_HEADER)
+        .and_then(|header_start| header_start.checked_add(EXIF_HEADER.len()))
+        && !candidates.contains(&tiff_start)
+    {
+        candidates.push(tiff_start);
+    }
+    if !candidates.contains(&0) {
+        candidates.push(0);
+    }
+    candidates
+}
+
+/// First candidate offset that carries a valid TIFF header, i.e. where the
+/// EXIF block handed to image-crate consumers must start.
+#[cfg(feature = "image-integration")]
+fn exif_item_payload_tiff_start(payload: &[u8]) -> Option<usize> {
+    exif_item_payload_tiff_start_candidates(payload)
+        .into_iter()
+        .find(|&tiff_start| tiff_byte_order_at(payload, tiff_start).is_some())
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -6882,7 +6936,9 @@ enum TiffByteOrder {
     BigEndian,
 }
 
-fn parse_exif_orientation_from_tiff(payload: &[u8], tiff_start: usize) -> Option<u16> {
+/// Byte order of the TIFF header at `tiff_start`, or `None` when no valid
+/// TIFF header (byte-order marker plus magic) starts there.
+fn tiff_byte_order_at(payload: &[u8], tiff_start: usize) -> Option<TiffByteOrder> {
     let byte_order = payload.get(tiff_start..tiff_start.checked_add(2)?)?;
     let byte_order = match byte_order {
         b"II" => TiffByteOrder::LittleEndian,
@@ -6894,7 +6950,11 @@ fn parse_exif_orientation_from_tiff(payload: &[u8], tiff_start: usize) -> Option
     if magic != TIFF_MAGIC_NUMBER {
         return None;
     }
+    Some(byte_order)
+}
 
+fn parse_exif_orientation_from_tiff(payload: &[u8], tiff_start: usize) -> Option<u16> {
+    let byte_order = tiff_byte_order_at(payload, tiff_start)?;
     let first_ifd_offset = read_tiff_u32(payload, tiff_start.checked_add(4)?, byte_order)?;
     let first_ifd_offset = usize::try_from(first_ifd_offset).ok()?;
     let first_ifd = tiff_start.checked_add(first_ifd_offset)?;
