@@ -265,9 +265,22 @@ fn read_seekable_input_to_vec<R: Read + Seek>(
         ))
     })?;
     let mut input = Vec::with_capacity(capacity);
-    input_reader
-        .read_to_end(&mut input)
-        .map_err(ImageError::IoError)?;
+    match guardrails
+        .max_input_bytes
+        .and_then(|max| max.checked_add(1))
+    {
+        Some(read_limit) => input_reader
+            .by_ref()
+            .take(read_limit)
+            .read_to_end(&mut input)
+            .map_err(ImageError::IoError)?,
+        // `None` is intentionally unbounded. A `u64::MAX` limit also has no
+        // representable sentinel byte, so reading it without `take` preserves
+        // the configured semantics without overflowing `max + 1`.
+        None => input_reader
+            .read_to_end(&mut input)
+            .map_err(ImageError::IoError)?,
+    };
 
     // Re-check the actual byte count: a reader may yield more bytes than its
     // seek-reported length claimed.
@@ -650,9 +663,11 @@ fn decode_error_to_image_error(err: DecodeError) -> ImageError {
 mod tests {
     use super::{
         ColorType, DecodeGuardrails, HeifInputFamily, ImageDecoder,
-        decoder_from_seekable_with_hint_and_guardrails,
+        decoder_from_seekable_with_hint_and_guardrails, read_seekable_input_to_vec,
     };
+    use std::cell::Cell;
     use std::io::Cursor;
+    use std::rc::Rc;
 
     /// Locks the uncompressed half of the lazy-adapter contract: layout
     /// probing and caller-buffer decoding must stay pixel-identical to the
@@ -699,6 +714,68 @@ mod tests {
                 other => self.0.seek(other),
             }
         }
+    }
+
+    struct UnderreportedLengthReader {
+        inner: Cursor<Vec<u8>>,
+        bytes_read: Rc<Cell<usize>>,
+    }
+
+    impl std::io::Read for UnderreportedLengthReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.inner.read(buf)?;
+            self.bytes_read.set(self.bytes_read.get() + read);
+            Ok(read)
+        }
+    }
+
+    impl std::io::Seek for UnderreportedLengthReader {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            match pos {
+                std::io::SeekFrom::End(0) => {
+                    self.inner.seek(std::io::SeekFrom::End(0))?;
+                    Ok(0)
+                }
+                other => self.inner.seek(other),
+            }
+        }
+    }
+
+    #[test]
+    fn hook_input_read_enforces_limit_while_buffering() {
+        let guardrails = DecodeGuardrails {
+            max_input_bytes: Some(8),
+            ..DecodeGuardrails::default()
+        };
+
+        let exact_reads = Rc::new(Cell::new(0));
+        let exact_input = vec![1_u8; 8];
+        let input = read_seekable_input_to_vec(
+            UnderreportedLengthReader {
+                inner: Cursor::new(exact_input.clone()),
+                bytes_read: Rc::clone(&exact_reads),
+            },
+            &guardrails,
+        )
+        .expect("an input exactly at max_input_bytes should be accepted");
+        assert_eq!(input, exact_input);
+        assert_eq!(exact_reads.get(), 8);
+
+        let oversized_reads = Rc::new(Cell::new(0));
+        let error = read_seekable_input_to_vec(
+            UnderreportedLengthReader {
+                inner: Cursor::new(vec![2_u8; 64]),
+                bytes_read: Rc::clone(&oversized_reads),
+            },
+            &guardrails,
+        )
+        .expect_err("an input larger than max_input_bytes should be rejected");
+        assert_eq!(oversized_reads.get(), 9);
+        assert!(
+            error
+                .to_string()
+                .contains("input exceeds configured max_input_bytes")
+        );
     }
 
     /// Decode does not bake EXIF orientation into pixels, so hook callers
