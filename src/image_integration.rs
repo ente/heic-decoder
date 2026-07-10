@@ -330,6 +330,9 @@ impl ImageDecoder for LazyHeifImageDecoder {
                     )
                     .map_err(decode_error_to_image_error)
                 } else {
+                    // Sole sanctioned decode-then-copy fallback on the lazy
+                    // path: the caller's byte buffer is not u16-aligned, which
+                    // is outside our control and vanishingly rare in practice.
                     let decoded = decode_bytes_to_rgba_with_hint_and_guardrails(
                         &self.input,
                         self.hint,
@@ -350,6 +353,19 @@ impl ImageDecoder for LazyHeifImageDecoder {
     }
 }
 
+/// Build the hook decoder: lazy when the layout probe supports the input,
+/// eager otherwise.
+///
+/// Invariant pair the hook relies on:
+/// - Coverage: whatever the layout probe rejects as `Unsupported` (today:
+///   uncompressed HEIF and AVIF) MUST decode through the eager fallback
+///   below, so hooks decode everything the owned decode APIs can.
+/// - Memory: once the probe accepts an input, the lazy decoder's slice paths
+///   either decode straight into the caller's buffer or fail loudly — they
+///   never silently fall back to a full decode plus copy (enforced by
+///   `reject_uncompressed_heif_on_lazy_adapter_paths` and the slice
+///   dispatchers' AVIF rejection in `lib.rs`). A probe/slice mismatch shows
+///   up as hard decode failures in the verify harness's per-file hook check.
 fn decoder_from_seekable_with_hint_and_guardrails<R: Read + Seek>(
     input_reader: R,
     hint: Option<HeifInputFamily>,
@@ -829,5 +845,38 @@ fn decode_error_to_image_error(err: DecodeError) -> ImageError {
             ))
         }
         other => ImageError::Decoding(DecodingError::new(heif_image_format_hint(), other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ColorType, DecodeGuardrails, HeifInputFamily, ImageDecoder,
+        decoder_from_seekable_with_hint_and_guardrails,
+    };
+    use std::io::Cursor;
+
+    /// Locks the hook coverage half of the lazy-adapter contract: inputs the
+    /// layout probe rejects as unsupported (here: uncompressed HEIF) must
+    /// still decode through the eager fallback, pixel-identical to the
+    /// direct decode APIs.
+    #[test]
+    fn hook_decoder_falls_back_to_eager_for_uncompressed_heif() {
+        let (file, expected_rgba) = crate::isobmff::test_support::minimal_uncompressed_rgb3_heif();
+
+        let decoder = decoder_from_seekable_with_hint_and_guardrails(
+            Cursor::new(file),
+            Some(HeifInputFamily::Heif),
+            DecodeGuardrails::default(),
+        )
+        .expect("hook construction must fall back to the eager decoder");
+        assert_eq!(decoder.dimensions(), (2, 1));
+        assert_eq!(decoder.color_type(), ColorType::Rgba8);
+
+        let mut pixels = vec![0_u8; expected_rgba.len()];
+        decoder
+            .read_image_boxed(&mut pixels)
+            .expect("eager fallback decode should succeed");
+        assert_eq!(pixels, expected_rgba);
     }
 }

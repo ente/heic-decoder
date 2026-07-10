@@ -6996,22 +6996,37 @@ fn decoded_rgba_layout_from_heic_geometry(
     })
 }
 
+/// Gate keeping uncompressed HEIF off every lazy-image-adapter path.
+///
+/// The lazy adapter's contract is that `read_image` decodes into the caller's
+/// buffer without materializing an owned RGBA copy. The uncompressed decode
+/// path has no into-slice implementation yet, so the layout probe and the
+/// slice decoders all route uncompressed primaries through this rejection:
+/// the probe's `Unsupported` makes the hook constructor fall back to the
+/// eager decoder (so hook coverage never regresses), and the slice decoders
+/// refuse outright so a future probe change cannot silently reintroduce a
+/// hidden full-decode-and-copy. Teaching the lazy adapter uncompressed HEIF
+/// means implementing a true slice decode and removing this gate everywhere
+/// (the contract tests next to `minimal_uncompressed_rgb3_heif` will insist).
+#[cfg(feature = "image-integration")]
+fn reject_uncompressed_heif_on_lazy_adapter_paths(input: &[u8]) -> Result<(), DecodeError> {
+    match isobmff::parse_primary_uncompressed_item_properties(input) {
+        Ok(_) => Err(DecodeError::Unsupported(
+            "lazy image adapter does not yet support uncompressed HEIF".to_string(),
+        )),
+        Err(isobmff::ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType {
+            ..
+        }) => Ok(()),
+        Err(err) => Err(DecodeUncompressedError::ParsePrimaryProperties(err).into()),
+    }
+}
+
 #[cfg(feature = "image-integration")]
 fn decode_heif_bytes_to_rgba_layout(
     input: &[u8],
     guardrails: DecodeGuardrails,
 ) -> Result<DecodedRgbaLayout, DecodeError> {
-    match isobmff::parse_primary_uncompressed_item_properties(input) {
-        Ok(_) => {
-            return Err(DecodeError::Unsupported(
-                "lazy image adapter does not yet support uncompressed HEIF".to_string(),
-            ));
-        }
-        Err(isobmff::ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType {
-            ..
-        }) => {}
-        Err(err) => return Err(DecodeUncompressedError::ParsePrimaryProperties(err).into()),
-    }
+    reject_uncompressed_heif_on_lazy_adapter_paths(input)?;
 
     let transforms = isobmff::parse_primary_item_transform_properties(input)
         .map_err(DecodeHeicError::ParsePrimaryTransforms)?
@@ -7340,20 +7355,7 @@ fn decode_heif_bytes_to_rgba8_slice(
     guardrails: DecodeGuardrails,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
-    match decode_primary_uncompressed_to_image(input) {
-        Ok(decoded) => {
-            guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
-            let transforms = isobmff::parse_primary_item_transform_properties(input)
-                .map_err(DecodeUncompressedError::ParsePrimaryTransforms)?
-                .transforms;
-            let decoded = decoded_uncompressed_to_rgba_image(decoded, &transforms)?;
-            return copy_decoded_rgba8_to_slice(decoded, out);
-        }
-        Err(DecodeUncompressedError::ParsePrimaryProperties(
-            isobmff::ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType { .. },
-        )) => {}
-        Err(err) => return Err(err.into()),
-    }
+    reject_uncompressed_heif_on_lazy_adapter_paths(input)?;
 
     let transforms = isobmff::parse_primary_item_transform_properties(input)
         .map_err(DecodeHeicError::ParsePrimaryTransforms)?
@@ -7395,20 +7397,7 @@ fn decode_heif_bytes_to_rgba16_slice(
     guardrails: DecodeGuardrails,
     out: &mut [u16],
 ) -> Result<(), DecodeError> {
-    match decode_primary_uncompressed_to_image(input) {
-        Ok(decoded) => {
-            guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
-            let transforms = isobmff::parse_primary_item_transform_properties(input)
-                .map_err(DecodeUncompressedError::ParsePrimaryTransforms)?
-                .transforms;
-            let decoded = decoded_uncompressed_to_rgba_image(decoded, &transforms)?;
-            return copy_decoded_rgba16_to_slice(decoded, out);
-        }
-        Err(DecodeUncompressedError::ParsePrimaryProperties(
-            isobmff::ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType { .. },
-        )) => {}
-        Err(err) => return Err(err.into()),
-    }
+    reject_uncompressed_heif_on_lazy_adapter_paths(input)?;
 
     let transforms = isobmff::parse_primary_item_transform_properties(input)
         .map_err(DecodeHeicError::ParsePrimaryTransforms)?
@@ -7485,10 +7474,13 @@ fn decode_bytes_to_rgba8_slice_with_hint_and_guardrails(
         })?;
     match family {
         HeifInputFamily::Heif => decode_heif_bytes_to_rgba8_slice(input, guardrails, out),
-        HeifInputFamily::Avif => {
-            let decoded = decode_avif_bytes_to_rgba(input, guardrails)?;
-            copy_decoded_rgba8_to_slice(decoded, out)
-        }
+        // Mirrors the layout probe's AVIF rejection: as long as the probe
+        // sends AVIF to the eager decoder, the slice path refuses instead of
+        // silently decoding to an owned copy (see
+        // reject_uncompressed_heif_on_lazy_adapter_paths for the contract).
+        HeifInputFamily::Avif => Err(DecodeError::Unsupported(
+            "lazy image adapter does not yet support AVIF".to_string(),
+        )),
     }
 }
 
@@ -7510,10 +7502,10 @@ fn decode_bytes_to_rgba16_slice_with_hint_and_guardrails(
         })?;
     match family {
         HeifInputFamily::Heif => decode_heif_bytes_to_rgba16_slice(input, guardrails, out),
-        HeifInputFamily::Avif => {
-            let decoded = decode_avif_bytes_to_rgba(input, guardrails)?;
-            copy_decoded_rgba16_to_slice(decoded, out)
-        }
+        // Mirrors the layout probe's AVIF rejection; see the RGBA8 variant.
+        HeifInputFamily::Avif => Err(DecodeError::Unsupported(
+            "lazy image adapter does not yet support AVIF".to_string(),
+        )),
     }
 }
 
@@ -11581,5 +11573,63 @@ mod tests {
         };
 
         assert!(nclx_to_icc_profile(&nclx).is_none());
+    }
+
+    // Lazy-image-adapter contract tests: uncompressed HEIF must decode
+    // through the eager APIs (coverage) while every lazy path refuses it
+    // (memory contract) until a true into-caller-buffer implementation
+    // exists. See reject_uncompressed_heif_on_lazy_adapter_paths.
+
+    #[test]
+    fn eager_decode_supports_minimal_uncompressed_heif() {
+        let (file, expected_rgba) = isobmff::test_support::minimal_uncompressed_rgb3_heif();
+
+        let decoded = super::decode_bytes_to_rgba(&file).expect("eager decode should succeed");
+        assert_eq!((decoded.width, decoded.height), (2, 1));
+        assert_eq!(decoded.pixels, super::DecodedRgbaPixels::U8(expected_rgba));
+    }
+
+    #[cfg(feature = "image-integration")]
+    #[test]
+    fn lazy_layout_probe_rejects_uncompressed_heif() {
+        let (file, _) = isobmff::test_support::minimal_uncompressed_rgb3_heif();
+
+        let err = super::decode_bytes_to_rgba_layout_with_hint_and_guardrails(
+            &file,
+            None,
+            super::DecodeGuardrails::default(),
+        )
+        .expect_err("layout probe must reject uncompressed HEIF");
+        assert!(
+            matches!(err, super::DecodeError::Unsupported(_)),
+            "probe rejection must be Unsupported so the hook falls back to \
+             the eager decoder, got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "image-integration")]
+    #[test]
+    fn lazy_slice_decodes_reject_uncompressed_heif() {
+        let (file, expected_rgba) = isobmff::test_support::minimal_uncompressed_rgb3_heif();
+
+        let mut rgba8 = vec![0_u8; expected_rgba.len()];
+        let rgba8_err = super::decode_bytes_to_rgba8_slice_with_hint_and_guardrails(
+            &file,
+            None,
+            super::DecodeGuardrails::default(),
+            &mut rgba8,
+        )
+        .expect_err("RGBA8 slice decode must refuse uncompressed HEIF");
+        assert!(matches!(rgba8_err, super::DecodeError::Unsupported(_)));
+
+        let mut rgba16 = vec![0_u16; expected_rgba.len()];
+        let rgba16_err = super::decode_bytes_to_rgba16_slice_with_hint_and_guardrails(
+            &file,
+            None,
+            super::DecodeGuardrails::default(),
+            &mut rgba16,
+        )
+        .expect_err("RGBA16 slice decode must refuse uncompressed HEIF");
+        assert!(matches!(rgba16_err, super::DecodeError::Unsupported(_)));
     }
 }

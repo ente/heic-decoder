@@ -7077,20 +7077,15 @@ fn read_u64_be(input: &[u8]) -> u64 {
     ])
 }
 
+/// Minimal ISOBMFF builders shared by container-level tests across modules.
+///
+/// These synthesize just enough structure for the paths under test: `meta`
+/// graphs (pitm/iloc/iinf/iprp/iref) for colour-property resolution, and a
+/// complete decodable uncompressed `rgb3` file for the lazy-image-adapter
+/// contract tests in `lib.rs` and `image_integration.rs`.
 #[cfg(test)]
-mod tests {
-    use super::{
-        FourCc, IccColorProfile, NclxColorProfile, PrimaryItemColorProperties,
-        merge_primary_and_grid_tile_color_properties, primary_heic_color_properties,
-    };
-
-    // -- Minimal ISOBMFF builders -------------------------------------------
-    //
-    // These synthesize just enough `meta` structure for the primary-item
-    // colour-property graph (pitm/iloc/iinf/iprp/iref); no image payload is
-    // needed because colour resolution never touches item data.
-
-    fn plain_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+pub(crate) mod test_support {
+    pub(crate) fn plain_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(8 + payload.len());
         out.extend_from_slice(&u32::try_from(8 + payload.len()).unwrap().to_be_bytes());
         out.extend_from_slice(box_type);
@@ -7098,20 +7093,20 @@ mod tests {
         out
     }
 
-    fn full_box(box_type: &[u8; 4], version: u8, flags: u32, payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn full_box(box_type: &[u8; 4], version: u8, flags: u32, payload: &[u8]) -> Vec<u8> {
         let mut body = Vec::with_capacity(4 + payload.len());
         body.extend_from_slice(&((u32::from(version) << 24) | flags).to_be_bytes());
         body.extend_from_slice(payload);
         plain_box(box_type, &body)
     }
 
-    fn pitm_box(item_id: u16) -> Vec<u8> {
+    pub(crate) fn pitm_box(item_id: u16) -> Vec<u8> {
         full_box(b"pitm", 0, 0, &item_id.to_be_bytes())
     }
 
     /// iloc v0 with zero-size offset/length/base_offset fields and no extents:
     /// enough for graph resolution, which only requires the entry to exist.
-    fn iloc_box(item_ids: &[u16]) -> Vec<u8> {
+    pub(crate) fn iloc_box(item_ids: &[u16]) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&0_u16.to_be_bytes()); // all size fields zero
         payload.extend_from_slice(&u16::try_from(item_ids.len()).unwrap().to_be_bytes());
@@ -7123,7 +7118,23 @@ mod tests {
         full_box(b"iloc", 0, 0, &payload)
     }
 
-    fn infe_box(item_id: u16, item_type: &[u8; 4]) -> Vec<u8> {
+    /// iloc v0 with one file-absolute extent (construction method 0) per item.
+    pub(crate) fn iloc_with_extent_box(items: &[(u16, u32, u32)]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        // offset_size 4, length_size 4, base_offset_size 0.
+        payload.extend_from_slice(&0x4400_u16.to_be_bytes());
+        payload.extend_from_slice(&u16::try_from(items.len()).unwrap().to_be_bytes());
+        for (item_id, extent_offset, extent_length) in items {
+            payload.extend_from_slice(&item_id.to_be_bytes());
+            payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+            payload.extend_from_slice(&1_u16.to_be_bytes()); // extent_count
+            payload.extend_from_slice(&extent_offset.to_be_bytes());
+            payload.extend_from_slice(&extent_length.to_be_bytes());
+        }
+        full_box(b"iloc", 0, 0, &payload)
+    }
+
+    pub(crate) fn infe_box(item_id: u16, item_type: &[u8; 4]) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&item_id.to_be_bytes());
         payload.extend_from_slice(&0_u16.to_be_bytes()); // item_protection_index
@@ -7132,7 +7143,7 @@ mod tests {
         full_box(b"infe", 2, 0, &payload)
     }
 
-    fn iinf_box(entries: &[Vec<u8>]) -> Vec<u8> {
+    pub(crate) fn iinf_box(entries: &[Vec<u8>]) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&u16::try_from(entries.len()).unwrap().to_be_bytes());
         for entry in entries {
@@ -7141,7 +7152,7 @@ mod tests {
         full_box(b"iinf", 0, 0, &payload)
     }
 
-    fn colr_nclx_box(
+    pub(crate) fn colr_nclx_box(
         colour_primaries: u16,
         transfer_characteristics: u16,
         matrix_coefficients: u16,
@@ -7156,7 +7167,7 @@ mod tests {
         plain_box(b"colr", &payload)
     }
 
-    fn colr_icc_box(profile: &[u8]) -> Vec<u8> {
+    pub(crate) fn colr_icc_box(profile: &[u8]) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(b"prof");
         payload.extend_from_slice(profile);
@@ -7165,14 +7176,14 @@ mod tests {
 
     /// Minimal parseable hvcC: configurationVersion 1, everything else zero,
     /// zero NAL arrays.
-    fn hvcc_box() -> Vec<u8> {
+    pub(crate) fn hvcc_box() -> Vec<u8> {
         let mut payload = vec![0_u8; 23];
         payload[0] = 1;
         plain_box(b"hvcC", &payload)
     }
 
     /// ipma v0/flags0: each entry is (item_id, 1-based ipco property indices).
-    fn ipma_box(entries: &[(u16, &[u8])]) -> Vec<u8> {
+    pub(crate) fn ipma_box(entries: &[(u16, &[u8])]) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&u32::try_from(entries.len()).unwrap().to_be_bytes());
         for (item_id, property_indices) in entries {
@@ -7183,7 +7194,7 @@ mod tests {
         full_box(b"ipma", 0, 0, &payload)
     }
 
-    fn iprp_box(properties: &[Vec<u8>], ipma_entries: &[(u16, &[u8])]) -> Vec<u8> {
+    pub(crate) fn iprp_box(properties: &[Vec<u8>], ipma_entries: &[(u16, &[u8])]) -> Vec<u8> {
         let mut ipco_payload = Vec::new();
         for property in properties {
             ipco_payload.extend_from_slice(property);
@@ -7193,7 +7204,7 @@ mod tests {
         plain_box(b"iprp", &payload)
     }
 
-    fn iref_dimg_box(from_item_id: u16, to_item_ids: &[u16]) -> Vec<u8> {
+    pub(crate) fn iref_dimg_box(from_item_id: u16, to_item_ids: &[u16]) -> Vec<u8> {
         let mut child_payload = Vec::new();
         child_payload.extend_from_slice(&from_item_id.to_be_bytes());
         child_payload.extend_from_slice(&u16::try_from(to_item_ids.len()).unwrap().to_be_bytes());
@@ -7203,13 +7214,82 @@ mod tests {
         full_box(b"iref", 0, 0, &plain_box(b"dimg", &child_payload))
     }
 
-    fn meta_file(children: &[Vec<u8>]) -> Vec<u8> {
+    pub(crate) fn meta_file(children: &[Vec<u8>]) -> Vec<u8> {
         let mut payload = Vec::new();
         for child in children {
             payload.extend_from_slice(child);
         }
         full_box(b"meta", 0, 0, &payload)
     }
+
+    pub(crate) fn ftyp_box(major_brand: &[u8; 4]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(major_brand);
+        payload.extend_from_slice(&0_u32.to_be_bytes()); // minor_version
+        payload.extend_from_slice(major_brand); // compatible brand
+        plain_box(b"ftyp", &payload)
+    }
+
+    pub(crate) fn ispe_box(width: u32, height: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&width.to_be_bytes());
+        payload.extend_from_slice(&height.to_be_bytes());
+        full_box(b"ispe", 0, 0, &payload)
+    }
+
+    /// uncC version 1: the whole payload is the profile FourCC.
+    pub(crate) fn uncc_v1_box(profile: &[u8; 4]) -> Vec<u8> {
+        full_box(b"uncC", 1, 0, profile)
+    }
+
+    /// A complete, decodable uncompressed HEIF file: `mif1` brand, a 2x1
+    /// `unci` primary item with the version-1 `rgb3` (8-bit interleaved RGB)
+    /// profile, and the pixel payload in a trailing `mdat`.
+    ///
+    /// Returns the file bytes and the RGBA8 pixels a decode must produce.
+    pub(crate) fn minimal_uncompressed_rgb3_heif() -> (Vec<u8>, Vec<u8>) {
+        let pixels_rgb: [u8; 6] = [10, 20, 30, 200, 150, 100];
+        let expected_rgba: Vec<u8> = vec![10, 20, 30, 255, 200, 150, 100, 255];
+
+        let ftyp = ftyp_box(b"mif1");
+        let meta_with_pixel_offset = |pixel_offset: u32| {
+            meta_file(&[
+                pitm_box(1),
+                iloc_with_extent_box(&[(
+                    1,
+                    pixel_offset,
+                    u32::try_from(pixels_rgb.len()).unwrap(),
+                )]),
+                iinf_box(&[infe_box(1, b"unci")]),
+                iprp_box(&[ispe_box(2, 1), uncc_v1_box(b"rgb3")], &[(1, &[1, 2])]),
+            ])
+        };
+        // The iloc extent offset is file-absolute and all iloc fields are
+        // fixed-size, so a first pass with a placeholder offset yields the
+        // final layout to compute the real offset from.
+        let meta_len = meta_with_pixel_offset(0).len();
+        let mdat_header_len = 8;
+        let pixel_offset = u32::try_from(ftyp.len() + meta_len + mdat_header_len).unwrap();
+        let meta = meta_with_pixel_offset(pixel_offset);
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&meta);
+        file.extend_from_slice(&plain_box(b"mdat", &pixels_rgb));
+        (file, expected_rgba)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{
+        colr_icc_box, colr_nclx_box, hvcc_box, iinf_box, iloc_box, infe_box, iprp_box,
+        iref_dimg_box, meta_file, pitm_box,
+    };
+    use super::{
+        FourCc, IccColorProfile, NclxColorProfile, PrimaryItemColorProperties,
+        merge_primary_and_grid_tile_color_properties, primary_heic_color_properties,
+    };
 
     // -- Container-level colour resolution tests ----------------------------
 
