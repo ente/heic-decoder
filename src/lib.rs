@@ -8172,6 +8172,14 @@ fn nclx_to_icc_profile(nclx: &isobmff::NclxColorProfile) -> Option<Vec<u8>> {
     // while honouring genuinely different curves — so encode the sRGB curve.
     // A literal 709-curve profile renders brighter in lcms-class viewers and
     // darker on Apple than the source image.
+    //
+    // DELIBERATE DIVERGENCE — do not "fix" this to the mathematically
+    // literal BT.709 OETF. The synthesized profile intentionally describes
+    // how still-image consumers render these transfers, not the coded curve;
+    // making it literal reintroduces the brightness mismatches above. The
+    // qcms rendering-contract tests
+    // (bt709_family_profiles_are_srgb_identity_in_qcms and friends) encode
+    // this decision and fail on any change to the aliasing.
     let transfer_characteristics = match nclx.transfer_characteristics {
         1 | 6 | 14 | 15 => 13,
         other => other,
