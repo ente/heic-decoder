@@ -242,6 +242,12 @@ fn orientation_to_apply(path: &Path) -> Result<Option<u8>, heic_decoder::DecodeE
 
 Requires `image-integration` feature.
 
+Hook decodes buffer the entire encoded input in memory before decoding; in
+exchange, pixels decode straight into the buffer `image` hands over, without
+an intermediate owned RGBA copy. Set `max_input_bytes` in the registration
+guardrails to bound that input buffer (the default guardrails leave it
+unbounded).
+
 ### 1) Register hooks once at startup
 
 ```rust

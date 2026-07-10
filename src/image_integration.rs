@@ -369,6 +369,14 @@ fn decoder_from_seekable_with_hint_and_guardrails<R: Read + Seek>(
     }
 }
 
+/// Read the whole encoded input into memory.
+///
+/// This is a deliberate trade: the lazy decoder needs the full input as a
+/// byte slice so `read_image` can decode directly into the caller's buffer
+/// (dropping the owned RGBA copy the eager path carries, which dominates
+/// peak memory). The cost is that the encoded input — usually far smaller
+/// than the decoded RGBA — is held in memory for the decoder's lifetime,
+/// bounded only by `guardrails.max_input_bytes`.
 fn read_seekable_input_to_vec<R: Read + Seek>(
     mut input_reader: R,
     guardrails: &DecodeGuardrails,
@@ -458,11 +466,22 @@ impl ImageHookRegistration {
 /// After registration, `image::ImageReader` can decode `.heic`, `.heif`, and
 /// `.avif` inputs through this crate's pure-Rust decode path, including direct
 /// extension-based dispatch and content-based `ftyp` guesses for common brands.
+///
+/// Memory: hook decodes buffer the entire encoded input in memory before
+/// decoding (in exchange, pixels decode straight into the caller's buffer
+/// without an intermediate RGBA copy). The default guardrails leave that
+/// input buffer unbounded; production callers should prefer
+/// [`register_image_decoder_hooks_with_guardrails`] with
+/// [`DecodeGuardrails::max_input_bytes`] set.
 pub fn register_image_decoder_hooks() -> ImageHookRegistration {
     register_image_decoder_hooks_with_guardrails(DecodeGuardrails::default())
 }
 
 /// Register HEIF/HEIC/AVIF decoder hooks with `image::hooks`, applying the provided guardrails to all hook decodes.
+///
+/// Hook decodes buffer the entire encoded input in memory (see
+/// [`register_image_decoder_hooks`]); `guardrails.max_input_bytes` bounds
+/// that buffer.
 pub fn register_image_decoder_hooks_with_guardrails(
     guardrails: DecodeGuardrails,
 ) -> ImageHookRegistration {
