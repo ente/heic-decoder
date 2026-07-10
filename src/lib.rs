@@ -7804,12 +7804,6 @@ fn decode_avif_bytes_to_rgba_layout(
 trait RgbaSampleOutput<T: Copy> {
     fn sample_len(&self) -> usize;
     fn write_sample(&mut self, index: usize, sample: T);
-
-    fn fill(&mut self, sample: T) {
-        for index in 0..self.sample_len() {
-            self.write_sample(index, sample);
-        }
-    }
 }
 
 #[cfg(feature = "image-integration")]
@@ -7823,10 +7817,6 @@ impl<T: Copy> RgbaSampleOutput<T> for SliceRgbaOutput<'_, T> {
 
     fn write_sample(&mut self, index: usize, sample: T) {
         self.0[index] = sample;
-    }
-
-    fn fill(&mut self, sample: T) {
-        self.0.fill(sample);
     }
 }
 
@@ -7842,13 +7832,6 @@ impl RgbaSampleOutput<u16> for NativeEndianRgba16Output<'_> {
     fn write_sample(&mut self, index: usize, sample: u16) {
         let byte_index = index * std::mem::size_of::<u16>();
         self.0[byte_index..byte_index + 2].copy_from_slice(&sample.to_ne_bytes());
-    }
-
-    fn fill(&mut self, sample: u16) {
-        let bytes = sample.to_ne_bytes();
-        for chunk in self.0.chunks_exact_mut(2) {
-            chunk.copy_from_slice(&bytes);
-        }
     }
 }
 
@@ -7936,13 +7919,23 @@ fn decode_primary_heic_grid_to_rgba_output<T: Copy + Default, O: RgbaSampleOutpu
     }
 
     let reference = HeicGridTileReference::from_first_tile(&first_tile, &grid_data.colr);
-    // Caller-provided ImageDecoder buffers are not guaranteed to be
-    // pre-cleared. Match the owned grid path (and libheif's zero-filled YUV
-    // canvas) for descriptor pixels clipped tiles do not cover: the opaque
-    // converted-zero-YUV color, not transparent black.
-    if heic_grid_tiles_cover_descriptor(&grid_data.descriptor, &reference) {
-        out.fill(T::default());
-    } else {
+    // The paste loop indexes the alpha plane's samples directly, so validate
+    // it up front regardless of tile coverage.
+    if let Some(alpha) = auxiliary_alpha {
+        validate_auxiliary_alpha_plane(
+            alpha,
+            grid_data.descriptor.output_width,
+            grid_data.descriptor.output_height,
+        )?;
+    }
+    // When the tiles cover the whole descriptor, the paste below rewrites
+    // every destination sample (alpha included), so the caller's buffer —
+    // while not guaranteed to be pre-cleared — needs no seeding. Otherwise
+    // match the owned grid path (and libheif's zero-filled YUV canvas) for
+    // descriptor pixels clipped tiles do not cover: the opaque
+    // converted-zero-YUV color (not transparent black), with the auxiliary
+    // alpha plane applied across the whole canvas.
+    if !heic_grid_tiles_cover_descriptor(&grid_data.descriptor, &reference) {
         let gap_pixel = heic_grid_gap_rgba_pixel(&reference, convert_tile)?;
         let mut sample_index = 0;
         while sample_index < expected {
@@ -7952,47 +7945,45 @@ fn decode_primary_heic_grid_to_rgba_output<T: Copy + Default, O: RgbaSampleOutpu
             out.write_sample(sample_index + 3, gap_pixel[3]);
             sample_index += 4;
         }
-    }
-    if let Some(alpha) = auxiliary_alpha {
-        validate_auxiliary_alpha_plane(
-            alpha,
-            grid_data.descriptor.output_width,
-            grid_data.descriptor.output_height,
-        )?;
-        let source_width = usize::try_from(grid_data.descriptor.output_width).map_err(|_| {
-            DecodeHeicError::InvalidDecodedFrame {
-                detail: "grid alpha width cannot be represented".to_string(),
-            }
-        })?;
-        let source_height = usize::try_from(grid_data.descriptor.output_height).map_err(|_| {
-            DecodeHeicError::InvalidDecodedFrame {
-                detail: "grid alpha height cannot be represented".to_string(),
-            }
-        })?;
-        let destination_width =
-            usize::try_from(transform_plan.destination_width).map_err(|_| {
-                DecodeHeicError::InvalidDecodedFrame {
-                    detail: "transformed grid alpha width cannot be represented".to_string(),
+        if let Some(alpha) = auxiliary_alpha {
+            let source_width =
+                usize::try_from(grid_data.descriptor.output_width).map_err(|_| {
+                    DecodeHeicError::InvalidDecodedFrame {
+                        detail: "grid alpha width cannot be represented".to_string(),
+                    }
+                })?;
+            let source_height =
+                usize::try_from(grid_data.descriptor.output_height).map_err(|_| {
+                    DecodeHeicError::InvalidDecodedFrame {
+                        detail: "grid alpha height cannot be represented".to_string(),
+                    }
+                })?;
+            let destination_width =
+                usize::try_from(transform_plan.destination_width).map_err(|_| {
+                    DecodeHeicError::InvalidDecodedFrame {
+                        detail: "transformed grid alpha width cannot be represented".to_string(),
+                    }
+                })?;
+            // The owned path applies the auxiliary plane to the whole
+            // gap-filled grid canvas, including any descriptor pixels not
+            // covered by tiles. Seed alpha for every transformed source pixel
+            // before tile RGB is pasted so the direct path preserves those
+            // gap pixels exactly.
+            for source_y in 0..source_height {
+                for source_x in 0..source_width {
+                    let Some((destination_x, destination_y)) =
+                        transform_plan.map_source_pixel(source_x, source_y)?
+                    else {
+                        continue;
+                    };
+                    let source_index = source_y * source_width + source_x;
+                    let destination_alpha_index =
+                        (destination_y * destination_width + destination_x) * 4 + 3;
+                    out.write_sample(
+                        destination_alpha_index,
+                        scale_alpha(alpha.samples[source_index], alpha.bit_depth),
+                    );
                 }
-            })?;
-        // The owned path applies the auxiliary plane to the whole gap-filled
-        // grid canvas, including any descriptor pixels not covered by tiles.
-        // Seed alpha for every transformed source pixel before tile RGB is
-        // pasted so the direct path preserves those gap pixels exactly.
-        for source_y in 0..source_height {
-            for source_x in 0..source_width {
-                let Some((destination_x, destination_y)) =
-                    transform_plan.map_source_pixel(source_x, source_y)?
-                else {
-                    continue;
-                };
-                let source_index = source_y * source_width + source_x;
-                let destination_alpha_index =
-                    (destination_y * destination_width + destination_x) * 4 + 3;
-                out.write_sample(
-                    destination_alpha_index,
-                    scale_alpha(alpha.samples[source_index], alpha.bit_depth),
-                );
             }
         }
     }
