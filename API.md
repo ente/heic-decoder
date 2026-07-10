@@ -245,9 +245,10 @@ Requires `image-integration` feature.
 Hook decodes buffer the entire encoded input in memory before decoding; in
 exchange, pixels decode straight into the buffer `image` hands over, without
 an additional full-frame owned RGBA allocation. Codec-native planes and a
-single grid-tile scratch buffer may still be allocated. Set `max_input_bytes`
-in the registration guardrails to bound the encoded input buffer (the default
-guardrails leave it unbounded).
+single grid-tile scratch buffer may still be allocated.
+`register_image_decoder_hooks()` caps the encoded input buffer at
+`DEFAULT_HOOK_MAX_INPUT_BYTES` (128 MiB); register with explicit guardrails
+to choose a different `max_input_bytes` bound (or `None` for unbounded).
 
 ### 1) Register hooks once at startup
 

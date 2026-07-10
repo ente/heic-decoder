@@ -376,14 +376,6 @@ fn decoder_from_seekable_with_hint_and_guardrails<R: Read + Seek>(
     )))
 }
 
-/// Read the whole encoded input into memory.
-///
-/// This is a deliberate trade: the lazy decoder needs the full input as a
-/// byte slice so `read_image` can decode directly into the caller's buffer
-/// (without an additional full-frame owned RGBA allocation, which would
-/// dominate peak memory). The cost is that the encoded input — usually far
-/// smaller than the decoded RGBA — is held in memory for the decoder's
-/// lifetime, bounded only by `guardrails.max_input_bytes`.
 /// Pre-allocation ceiling for the seek-reported input length. The reported
 /// length is untrusted until the bytes are actually read: a lying or corrupt
 /// reader could otherwise trigger a multi-gigabyte allocation (or a
@@ -392,6 +384,23 @@ fn decoder_from_seekable_with_hint_and_guardrails<R: Read + Seek>(
 /// inputs.
 const MAX_INPUT_PREALLOCATION_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Default `max_input_bytes` applied by [`register_image_decoder_hooks`].
+///
+/// Hook decodes buffer the entire encoded input, so an unbounded default
+/// would let a single oversized file (e.g. a motion-photo HEIC with a
+/// multi-gigabyte `mdat`) allocate its full size. Callers that need larger
+/// inputs can register with explicit guardrails via
+/// [`register_image_decoder_hooks_with_guardrails`].
+pub const DEFAULT_HOOK_MAX_INPUT_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Read the whole encoded input into memory.
+///
+/// This is a deliberate trade: the lazy decoder needs the full input as a
+/// byte slice so `read_image` can decode directly into the caller's buffer
+/// (without an additional full-frame owned RGBA allocation, which would
+/// dominate peak memory). The cost is that the encoded input — usually far
+/// smaller than the decoded RGBA — is held in memory for the decoder's
+/// lifetime, bounded by `guardrails.max_input_bytes`.
 fn read_seekable_input_to_vec<R: Read + Seek>(
     mut input_reader: R,
     guardrails: &DecodeGuardrails,
@@ -457,13 +466,16 @@ impl ImageHookRegistration {
 /// Memory: hook decodes buffer the entire encoded input in memory before
 /// decoding (in exchange, pixels decode straight into the caller's buffer
 /// without an additional full-frame RGBA allocation). Codec-native planes
-/// and a single grid-tile scratch buffer may still be allocated. The default
-/// guardrails leave the encoded input buffer unbounded; production callers
-/// should prefer
+/// and a single grid-tile scratch buffer may still be allocated. The encoded
+/// input buffer is capped at [`DEFAULT_HOOK_MAX_INPUT_BYTES`]; callers that
+/// need a different bound (or none) should use
 /// [`register_image_decoder_hooks_with_guardrails`] with
-/// [`DecodeGuardrails::max_input_bytes`] set.
+/// [`DecodeGuardrails::max_input_bytes`] set accordingly.
 pub fn register_image_decoder_hooks() -> ImageHookRegistration {
-    register_image_decoder_hooks_with_guardrails(DecodeGuardrails::default())
+    register_image_decoder_hooks_with_guardrails(DecodeGuardrails {
+        max_input_bytes: Some(DEFAULT_HOOK_MAX_INPUT_BYTES),
+        ..DecodeGuardrails::default()
+    })
 }
 
 /// Register HEIF/HEIC/AVIF decoder hooks with `image::hooks`, applying the provided guardrails to all hook decodes.
