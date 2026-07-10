@@ -15,8 +15,12 @@ use moxcms::{
     CicpColorPrimaries, CicpProfile, ColorProfile, LocalizableString, MatrixCoefficients,
     ProfileText, TransferCharacteristics, Xyzd,
 };
+#[cfg(feature = "image-integration")]
+use rav1d::dav1d_parse_sequence_header;
 use rav1d::include::dav1d::data::Dav1dData;
 use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
+#[cfg(feature = "image-integration")]
+use rav1d::include::dav1d::headers::Dav1dSequenceHeader;
 use rav1d::include::dav1d::headers::{
     DAV1D_PIXEL_LAYOUT_I400, DAV1D_PIXEL_LAYOUT_I420, DAV1D_PIXEL_LAYOUT_I422,
     DAV1D_PIXEL_LAYOUT_I444,
@@ -842,6 +846,7 @@ pub enum DecodeAvifError {
     UnsupportedMatrixCoefficients {
         matrix_coefficients: u16,
     },
+    MissingSequenceHeader,
 }
 
 impl DecodeAvifError {
@@ -867,9 +872,8 @@ impl DecodeAvifError {
             | DecodeAvifError::DecodedGeometryMismatch { .. }
             | DecodeAvifError::PlaneSampleTypeMismatch { .. }
             | DecodeAvifError::PlaneDimensionsMismatch { .. }
-            | DecodeAvifError::PlaneSampleCountMismatch { .. } => {
-                DecodeErrorCategory::MalformedInput
-            }
+            | DecodeAvifError::PlaneSampleCountMismatch { .. }
+            | DecodeAvifError::MissingSequenceHeader => DecodeErrorCategory::MalformedInput,
         }
     }
 }
@@ -896,6 +900,12 @@ impl Display for DecodeAvifError {
             ),
             DecodeAvifError::UnsupportedBitDepth { bit_depth } => {
                 write!(f, "decoded AV1 frame has unsupported bit depth {bit_depth}")
+            }
+            DecodeAvifError::MissingSequenceHeader => {
+                write!(
+                    f,
+                    "AV1 sequence header not found in av1C configOBUs or primary item payload"
+                )
             }
             DecodeAvifError::UnsupportedPixelLayout { layout } => {
                 write!(
@@ -7571,7 +7581,7 @@ fn decode_avif_bytes_to_rgba_layout(
     input: &[u8],
     guardrails: DecodeGuardrails,
 ) -> Result<DecodedRgbaLayout, DecodeError> {
-    let (_, resolved) = isobmff::resolve_primary_avif_item_graph(input)
+    let (meta, resolved) = isobmff::resolve_primary_avif_item_graph(input)
         .map_err(DecodeAvifError::ExtractPrimaryPayload)?;
     let properties =
         isobmff::parse_primary_avif_item_preflight_properties_from_resolved_graph(&resolved)
@@ -7581,13 +7591,8 @@ fn decode_avif_bytes_to_rgba_layout(
             .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
     guardrails.enforce_pixel_count(properties.ispe.width, properties.ispe.height)?;
 
-    let source_bit_depth = if properties.av1c.twelve_bit {
-        12
-    } else if properties.av1c.high_bitdepth {
-        10
-    } else {
-        8
-    };
+    let source_bit_depth =
+        avif_probe_source_bit_depth(input, &meta, &resolved, &properties.av1c.config_obus)?;
     let (width, height) = transformed_rgba_dimensions(
         properties.ispe.width,
         properties.ispe.height,
@@ -11923,6 +11928,64 @@ impl Drop for DecoderPictureGuard {
     }
 }
 
+/// Parse the coded bit depth (8, 10, or 12) from the AV1 sequence header in
+/// raw OBU bytes, or `None` when the bytes contain no sequence header.
+#[cfg(feature = "image-integration")]
+fn av1_sequence_header_bit_depth(obus: &[u8]) -> Option<u8> {
+    if obus.is_empty() {
+        return None;
+    }
+    let mut header = MaybeUninit::<Dav1dSequenceHeader>::uninit();
+    let result = unsafe {
+        // SAFETY: `header` is valid writable storage for one sequence header
+        // and `obus` is a live slice for the duration of the call.
+        dav1d_parse_sequence_header(
+            Some(NonNull::new_unchecked(header.as_mut_ptr())),
+            NonNull::new(obus.as_ptr().cast_mut()),
+            obus.len(),
+        )
+    };
+    if result.0 != 0 {
+        return None;
+    }
+    // SAFETY: initialized by the successful parse above.
+    let header = unsafe { header.assume_init() };
+    Some(match header.hbd {
+        0 => 8,
+        1 => 10,
+        _ => 12,
+    })
+}
+
+/// Coded bit depth for the AVIF layout probe, read from the actual AV1
+/// sequence header rather than the av1C flags. The slice decode validates
+/// its output depth against the decoded frame (and the direct API trusts
+/// only the decoded frame), so trusting flags that can disagree with the
+/// coded stream would advertise a layout `read_image` then rejects. The
+/// sequence header normally sits in av1C's configOBUs; fall back to the
+/// primary item payload when it is not there.
+#[cfg(feature = "image-integration")]
+fn avif_probe_source_bit_depth(
+    input: &[u8],
+    meta: &isobmff::MetaBox<'_>,
+    resolved: &isobmff::ResolvedPrimaryItemGraph<'_>,
+    config_obus: &[u8],
+) -> Result<u8, DecodeAvifError> {
+    if let Some(bit_depth) = av1_sequence_header_bit_depth(config_obus) {
+        return Ok(bit_depth);
+    }
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    let (_, payload) = isobmff::extract_avif_item_payload_from_location(
+        input,
+        &mut source,
+        meta,
+        &resolved.primary_item.location,
+        resolved.primary_item.item_id,
+    )
+    .map_err(DecodeAvifError::ExtractPrimaryPayload)?;
+    av1_sequence_header_bit_depth(&payload).ok_or(DecodeAvifError::MissingSequenceHeader)
+}
+
 fn decode_av1_bitstream_to_image(bitstream: &[u8]) -> Result<DecodedAvifImage, DecodeAvifError> {
     let mut settings = MaybeUninit::<Dav1dSettings>::uninit();
     // SAFETY: `dav1d_default_settings` writes a full valid `Dav1dSettings`.
@@ -12388,6 +12451,21 @@ mod tests {
         assert_eq!(width, orientation_transform.destination_width);
         assert_eq!(height, orientation_transform.destination_height);
         assert_eq!(direct, transformed);
+    }
+
+    #[cfg(feature = "image-integration")]
+    #[test]
+    fn av1_sequence_header_bit_depth_reads_coded_depth() {
+        // Minimal monochrome reduced-still-picture sequence-header OBUs,
+        // preceded by a temporal-delimiter OBU to exercise the OBU scan the
+        // layout probe relies on for av1C configOBUs.
+        let eight_bit = [0x12, 0x00, 0x0A, 0x04, 0x18, 0x00, 0x00, 0x15];
+        let ten_bit = [0x12, 0x00, 0x0A, 0x04, 0x18, 0x00, 0x00, 0x35];
+        assert_eq!(super::av1_sequence_header_bit_depth(&eight_bit), Some(8));
+        assert_eq!(super::av1_sequence_header_bit_depth(&ten_bit), Some(10));
+        assert_eq!(super::av1_sequence_header_bit_depth(&[]), None);
+        // A lone temporal delimiter has no sequence header to find.
+        assert_eq!(super::av1_sequence_header_bit_depth(&[0x12, 0x00]), None);
     }
 
     #[test]
