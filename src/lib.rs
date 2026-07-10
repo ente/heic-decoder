@@ -8300,112 +8300,17 @@ fn decoded_avif_to_rgba8_slice(
             "AVIF storage is RGBA16, not RGBA8".to_string(),
         ));
     }
-    let transform_plan =
-        RgbaTransformPlan::from_primary_transforms(decoded.width, decoded.height, transforms)?;
-    let expected = checked_rgba_sample_count(
-        transform_plan.destination_width,
-        transform_plan.destination_height,
-    )?;
-    if out.len() != expected {
-        return Err(DecodeError::TransformGuard(
-            TransformGuardError::RgbaSampleCountMismatch {
-                stage: "AVIF direct transformed RGBA8 image adapter output",
-                actual: out.len(),
-                expected,
-                width: transform_plan.destination_width,
-                height: transform_plan.destination_height,
-            },
-        ));
-    }
-
-    let ycbcr_transform =
-        ycbcr_transform_from_matrix(decoded.ycbcr_matrix).map_err(|matrix_coefficients| {
-            DecodeAvifError::UnsupportedMatrixCoefficients {
-                matrix_coefficients,
-            }
-        })?;
-    validate_plane_dimensions(&decoded.y_plane, decoded.width, decoded.height, "Y")?;
-    let y_samples = plane_samples_u8(&decoded.y_plane, "Y")?;
-    let expected_y_samples = sample_count(decoded.width, decoded.height, "Y")?;
-    if y_samples.len() != expected_y_samples {
-        return Err(DecodeAvifError::PlaneSampleCountMismatch {
-            plane: "Y",
-            expected: expected_y_samples,
-            actual: y_samples.len(),
-        }
-        .into());
-    }
-    let source_width =
-        usize::try_from(decoded.width).map_err(|_| DecodeAvifError::PlaneSizeOverflow {
-            plane: "RGBA",
-            width: decoded.width,
-            height: decoded.height,
-        })?;
-    let destination_width = usize::try_from(transform_plan.destination_width).map_err(|_| {
-        DecodeAvifError::PlaneSizeOverflow {
-            plane: "RGBA",
-            width: transform_plan.destination_width,
-            height: transform_plan.destination_height,
-        }
-    })?;
-    let destination_height = usize::try_from(transform_plan.destination_height).map_err(|_| {
-        DecodeAvifError::PlaneSizeOverflow {
-            plane: "RGBA",
-            width: transform_plan.destination_width,
-            height: transform_plan.destination_height,
-        }
-    })?;
-    let chroma = prepare_chroma_u8(decoded)?;
-    let alpha = prepare_avif_auxiliary_alpha(decoded, expected_y_samples)?;
-    let chroma_midpoint = chroma_midpoint(decoded.bit_depth);
-    let converter = PreparedYcbcrToRgb::new(
-        decoded.bit_depth,
-        decoded.ycbcr_range,
-        ycbcr_transform,
-        decoded.layout == AvifPixelLayout::Yuv420,
-    );
-    let mono_verbatim = matches!(chroma, ChromaPlanesU8::Monochrome) && decoded.bit_depth == 8;
-
-    for destination_y in 0..destination_height {
-        for destination_x in 0..destination_width {
-            let (source_x, source_y) =
-                transform_plan.map_destination_pixel(destination_x, destination_y)?;
-            let source_index = source_y * source_width + source_x;
-            let y_sample = i32::from(y_samples[source_index]);
-            let (cb_sample, cr_sample) = match &chroma {
-                ChromaPlanesU8::Monochrome => (chroma_midpoint, chroma_midpoint),
-                ChromaPlanesU8::Color {
-                    u_samples,
-                    v_samples,
-                    chroma_width,
-                    layout,
-                } => {
-                    let chroma_index =
-                        chroma_sample_index(source_x, source_y, *chroma_width, *layout);
-                    (
-                        i32::from(u_samples[chroma_index]),
-                        i32::from(v_samples[chroma_index]),
-                    )
-                }
-            };
-            let (red, green, blue) = if mono_verbatim {
-                let value = y_sample.clamp(0, 255) as u16;
-                (value, value, value)
-            } else {
-                converter.convert(y_sample, cb_sample, cr_sample)
-            };
-            let destination_index = (destination_y * destination_width + destination_x) * 4;
-            out[destination_index] = scale_sample_to_u8(red, decoded.bit_depth);
-            out[destination_index + 1] = scale_sample_to_u8(green, decoded.bit_depth);
-            out[destination_index + 2] = scale_sample_to_u8(blue, decoded.bit_depth);
-            out[destination_index + 3] = alpha
-                .as_ref()
-                .map(|plane| avif_auxiliary_alpha_sample_to_u8(plane, source_index))
-                .unwrap_or(u8::MAX);
-        }
-    }
-
-    Ok(())
+    let mut output = SliceRgbaOutput(out);
+    decoded_avif_to_rgba_output(
+        decoded,
+        transforms,
+        &mut output,
+        "AVIF direct transformed RGBA8 image adapter output",
+        plane_samples_u8,
+        avif_auxiliary_alpha_sample_to_u8,
+        scale_sample_to_u8,
+        u8::MAX,
+    )
 }
 
 #[cfg(feature = "image-integration")]
@@ -8419,6 +8324,39 @@ fn decoded_avif_to_rgba16_output<O: RgbaSampleOutput<u16>>(
             "AVIF storage is RGBA8, not RGBA16".to_string(),
         ));
     }
+    decoded_avif_to_rgba_output(
+        decoded,
+        transforms,
+        out,
+        "AVIF direct transformed RGBA16 image adapter output",
+        plane_samples_u16,
+        avif_auxiliary_alpha_sample_to_u16,
+        scale_sample_to_u16,
+        u16::MAX,
+    )
+}
+
+/// Shared AVIF caller-buffer conversion: transform-plan mapping, YCbCr
+/// conversion, and auxiliary alpha, generic over the source plane sample
+/// type `S` (u8/u16, gated by the wrappers' bit-depth checks) and the RGBA
+/// output sink.
+#[cfg(feature = "image-integration")]
+#[allow(clippy::too_many_arguments)]
+fn decoded_avif_to_rgba_output<S, T, O>(
+    decoded: &DecodedAvifImage,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+    out: &mut O,
+    sample_count_stage: &'static str,
+    plane_samples: for<'a> fn(&'a AvifPlane, &'static str) -> Result<&'a [S], DecodeAvifError>,
+    alpha_sample: fn(&AvifAuxiliaryAlpha<'_>, usize) -> T,
+    scale_sample: fn(u16, u8) -> T,
+    opaque_alpha: T,
+) -> Result<(), DecodeError>
+where
+    S: Copy + Into<i32>,
+    T: Copy,
+    O: RgbaSampleOutput<T>,
+{
     let transform_plan =
         RgbaTransformPlan::from_primary_transforms(decoded.width, decoded.height, transforms)?;
     let expected = checked_rgba_sample_count(
@@ -8428,7 +8366,7 @@ fn decoded_avif_to_rgba16_output<O: RgbaSampleOutput<u16>>(
     if out.sample_len() != expected {
         return Err(DecodeError::TransformGuard(
             TransformGuardError::RgbaSampleCountMismatch {
-                stage: "AVIF direct transformed RGBA16 image adapter output",
+                stage: sample_count_stage,
                 actual: out.sample_len(),
                 expected,
                 width: transform_plan.destination_width,
@@ -8444,7 +8382,7 @@ fn decoded_avif_to_rgba16_output<O: RgbaSampleOutput<u16>>(
             }
         })?;
     validate_plane_dimensions(&decoded.y_plane, decoded.width, decoded.height, "Y")?;
-    let y_samples = plane_samples_u16(&decoded.y_plane, "Y")?;
+    let y_samples = plane_samples(&decoded.y_plane, "Y")?;
     let expected_y_samples = sample_count(decoded.width, decoded.height, "Y")?;
     if y_samples.len() != expected_y_samples {
         return Err(DecodeAvifError::PlaneSampleCountMismatch {
@@ -8474,7 +8412,7 @@ fn decoded_avif_to_rgba16_output<O: RgbaSampleOutput<u16>>(
             height: transform_plan.destination_height,
         }
     })?;
-    let chroma = prepare_chroma_u16(decoded)?;
+    let chroma = prepare_chroma(decoded, plane_samples)?;
     let alpha = prepare_avif_auxiliary_alpha(decoded, expected_y_samples)?;
     let chroma_midpoint = chroma_midpoint(decoded.bit_depth);
     let converter = PreparedYcbcrToRgb::new(
@@ -8483,16 +8421,17 @@ fn decoded_avif_to_rgba16_output<O: RgbaSampleOutput<u16>>(
         ycbcr_transform,
         decoded.layout == AvifPixelLayout::Yuv420,
     );
+    let mono_verbatim = matches!(chroma, ChromaPlanes::Monochrome) && decoded.bit_depth == 8;
 
     for destination_y in 0..destination_height {
         for destination_x in 0..destination_width {
             let (source_x, source_y) =
                 transform_plan.map_destination_pixel(destination_x, destination_y)?;
             let source_index = source_y * source_width + source_x;
-            let y_sample = i32::from(y_samples[source_index]);
+            let y_sample: i32 = y_samples[source_index].into();
             let (cb_sample, cr_sample) = match &chroma {
-                ChromaPlanesU16::Monochrome => (chroma_midpoint, chroma_midpoint),
-                ChromaPlanesU16::Color {
+                ChromaPlanes::Monochrome => (chroma_midpoint, chroma_midpoint),
+                ChromaPlanes::Color {
                     u_samples,
                     v_samples,
                     chroma_width,
@@ -8501,31 +8440,30 @@ fn decoded_avif_to_rgba16_output<O: RgbaSampleOutput<u16>>(
                     let chroma_index =
                         chroma_sample_index(source_x, source_y, *chroma_width, *layout);
                     (
-                        i32::from(u_samples[chroma_index]),
-                        i32::from(v_samples[chroma_index]),
+                        u_samples[chroma_index].into(),
+                        v_samples[chroma_index].into(),
                     )
                 }
             };
-            let (red, green, blue) = converter.convert(y_sample, cb_sample, cr_sample);
+            let (red, green, blue) = if mono_verbatim {
+                let value = y_sample.clamp(0, 255) as u16;
+                (value, value, value)
+            } else {
+                converter.convert(y_sample, cb_sample, cr_sample)
+            };
             let destination_index = (destination_y * destination_width + destination_x) * 4;
-            out.write_sample(
-                destination_index,
-                scale_sample_to_u16(red, decoded.bit_depth),
-            );
+            out.write_sample(destination_index, scale_sample(red, decoded.bit_depth));
             out.write_sample(
                 destination_index + 1,
-                scale_sample_to_u16(green, decoded.bit_depth),
+                scale_sample(green, decoded.bit_depth),
             );
-            out.write_sample(
-                destination_index + 2,
-                scale_sample_to_u16(blue, decoded.bit_depth),
-            );
+            out.write_sample(destination_index + 2, scale_sample(blue, decoded.bit_depth));
             out.write_sample(
                 destination_index + 3,
                 alpha
                     .as_ref()
-                    .map(|plane| avif_auxiliary_alpha_sample_to_u16(plane, source_index))
-                    .unwrap_or(u16::MAX),
+                    .map(|plane| alpha_sample(plane, source_index))
+                    .unwrap_or(opaque_alpha),
             );
         }
     }
@@ -11548,106 +11486,69 @@ fn heic_chroma_sample_index(
     }
 }
 
-enum ChromaPlanesU8<'a> {
+enum ChromaPlanes<'a, S> {
     Monochrome,
     Color {
-        u_samples: &'a [u8],
-        v_samples: &'a [u8],
+        u_samples: &'a [S],
+        v_samples: &'a [S],
         chroma_width: usize,
         layout: AvifPixelLayout,
     },
 }
 
-enum ChromaPlanesU16<'a> {
-    Monochrome,
-    Color {
-        u_samples: &'a [u16],
-        v_samples: &'a [u16],
-        chroma_width: usize,
-        layout: AvifPixelLayout,
-    },
+type ChromaPlanesU8<'a> = ChromaPlanes<'a, u8>;
+type ChromaPlanesU16<'a> = ChromaPlanes<'a, u16>;
+
+fn prepare_chroma<S>(
+    decoded: &DecodedAvifImage,
+    plane_samples: for<'a> fn(&'a AvifPlane, &'static str) -> Result<&'a [S], DecodeAvifError>,
+) -> Result<ChromaPlanes<'_, S>, DecodeAvifError> {
+    if decoded.layout == AvifPixelLayout::Yuv400 {
+        return Ok(ChromaPlanes::Monochrome);
+    }
+
+    let (u_plane, v_plane, expected_width, expected_height) = require_chroma_planes(decoded)?;
+    validate_plane_dimensions(u_plane, expected_width, expected_height, "U")?;
+    validate_plane_dimensions(v_plane, expected_width, expected_height, "V")?;
+
+    let u_samples = plane_samples(u_plane, "U")?;
+    let v_samples = plane_samples(v_plane, "V")?;
+    let expected_samples = sample_count(expected_width, expected_height, "U/V")?;
+    if u_samples.len() != expected_samples {
+        return Err(DecodeAvifError::PlaneSampleCountMismatch {
+            plane: "U",
+            expected: expected_samples,
+            actual: u_samples.len(),
+        });
+    }
+    if v_samples.len() != expected_samples {
+        return Err(DecodeAvifError::PlaneSampleCountMismatch {
+            plane: "V",
+            expected: expected_samples,
+            actual: v_samples.len(),
+        });
+    }
+
+    let chroma_width =
+        usize::try_from(expected_width).map_err(|_| DecodeAvifError::PlaneSizeOverflow {
+            plane: "U",
+            width: expected_width,
+            height: expected_height,
+        })?;
+    Ok(ChromaPlanes::Color {
+        u_samples,
+        v_samples,
+        chroma_width,
+        layout: decoded.layout,
+    })
 }
 
 fn prepare_chroma_u8(decoded: &DecodedAvifImage) -> Result<ChromaPlanesU8<'_>, DecodeAvifError> {
-    if decoded.layout == AvifPixelLayout::Yuv400 {
-        return Ok(ChromaPlanesU8::Monochrome);
-    }
-
-    let (u_plane, v_plane, expected_width, expected_height) = require_chroma_planes(decoded)?;
-    validate_plane_dimensions(u_plane, expected_width, expected_height, "U")?;
-    validate_plane_dimensions(v_plane, expected_width, expected_height, "V")?;
-
-    let u_samples = plane_samples_u8(u_plane, "U")?;
-    let v_samples = plane_samples_u8(v_plane, "V")?;
-    let expected_samples = sample_count(expected_width, expected_height, "U/V")?;
-    if u_samples.len() != expected_samples {
-        return Err(DecodeAvifError::PlaneSampleCountMismatch {
-            plane: "U",
-            expected: expected_samples,
-            actual: u_samples.len(),
-        });
-    }
-    if v_samples.len() != expected_samples {
-        return Err(DecodeAvifError::PlaneSampleCountMismatch {
-            plane: "V",
-            expected: expected_samples,
-            actual: v_samples.len(),
-        });
-    }
-
-    let chroma_width =
-        usize::try_from(expected_width).map_err(|_| DecodeAvifError::PlaneSizeOverflow {
-            plane: "U",
-            width: expected_width,
-            height: expected_height,
-        })?;
-    Ok(ChromaPlanesU8::Color {
-        u_samples,
-        v_samples,
-        chroma_width,
-        layout: decoded.layout,
-    })
+    prepare_chroma(decoded, plane_samples_u8)
 }
 
 fn prepare_chroma_u16(decoded: &DecodedAvifImage) -> Result<ChromaPlanesU16<'_>, DecodeAvifError> {
-    if decoded.layout == AvifPixelLayout::Yuv400 {
-        return Ok(ChromaPlanesU16::Monochrome);
-    }
-
-    let (u_plane, v_plane, expected_width, expected_height) = require_chroma_planes(decoded)?;
-    validate_plane_dimensions(u_plane, expected_width, expected_height, "U")?;
-    validate_plane_dimensions(v_plane, expected_width, expected_height, "V")?;
-
-    let u_samples = plane_samples_u16(u_plane, "U")?;
-    let v_samples = plane_samples_u16(v_plane, "V")?;
-    let expected_samples = sample_count(expected_width, expected_height, "U/V")?;
-    if u_samples.len() != expected_samples {
-        return Err(DecodeAvifError::PlaneSampleCountMismatch {
-            plane: "U",
-            expected: expected_samples,
-            actual: u_samples.len(),
-        });
-    }
-    if v_samples.len() != expected_samples {
-        return Err(DecodeAvifError::PlaneSampleCountMismatch {
-            plane: "V",
-            expected: expected_samples,
-            actual: v_samples.len(),
-        });
-    }
-
-    let chroma_width =
-        usize::try_from(expected_width).map_err(|_| DecodeAvifError::PlaneSizeOverflow {
-            plane: "U",
-            width: expected_width,
-            height: expected_height,
-        })?;
-    Ok(ChromaPlanesU16::Color {
-        u_samples,
-        v_samples,
-        chroma_width,
-        layout: decoded.layout,
-    })
+    prepare_chroma(decoded, plane_samples_u16)
 }
 
 fn require_chroma_planes(
