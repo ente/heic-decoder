@@ -7652,11 +7652,31 @@ fn decoded_rgba_layout_from_heic_geometry(
     })
 }
 
+/// Layout-probe result: the advertised layout plus any primary-item payload
+/// extraction the probe had to perform to compute it. Returning the
+/// extraction lets the deferred pixel decode reuse it instead of copying
+/// every payload out of the container a second time.
+#[cfg(feature = "image-integration")]
+pub(crate) struct RgbaLayoutProbe {
+    pub(crate) layout: DecodedRgbaLayout,
+    pub(crate) preextracted_heic: Option<isobmff::HeicPrimaryItemDataWithGrid>,
+}
+
+#[cfg(feature = "image-integration")]
+impl RgbaLayoutProbe {
+    fn without_extraction(layout: DecodedRgbaLayout) -> Self {
+        Self {
+            layout,
+            preextracted_heic: None,
+        }
+    }
+}
+
 #[cfg(feature = "image-integration")]
 fn decode_heif_bytes_to_rgba_layout(
     input: &[u8],
     guardrails: DecodeGuardrails,
-) -> Result<DecodedRgbaLayout, DecodeError> {
+) -> Result<RgbaLayoutProbe, DecodeError> {
     match isobmff::parse_primary_uncompressed_item_properties(input) {
         Ok(properties) => {
             guardrails.enforce_pixel_count(properties.ispe.width, properties.ispe.height)?;
@@ -7670,7 +7690,8 @@ fn decode_heif_bytes_to_rgba_layout(
                 source_bit_depth,
                 &transforms,
                 icc_profile_from_color_properties(&properties.colr),
-            );
+            )
+            .map(RgbaLayoutProbe::without_extraction);
         }
         Err(isobmff::ParsePrimaryUncompressedPropertiesError::UnexpectedPrimaryItemType {
             ..
@@ -7706,30 +7727,31 @@ fn decode_heif_bytes_to_rgba_layout(
             source_bit_depth,
             &transforms,
             icc_profile,
-        );
+        )
+        .map(RgbaLayoutProbe::without_extraction);
     }
 
     let primary_with_grid =
         isobmff::extract_primary_heic_item_data_with_grid(input).map_err(DecodeHeicError::from)?;
 
-    match primary_with_grid {
+    let layout = match &primary_with_grid {
         isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
             guardrails.enforce_pixel_count(
                 grid_data.descriptor.output_width,
                 grid_data.descriptor.output_height,
             )?;
-            let source_bit_depth = heic_grid_source_bit_depth_for_png_conversion(&grid_data)?;
+            let source_bit_depth = heic_grid_source_bit_depth_for_png_conversion(grid_data)?;
             decoded_rgba_layout_from_heic_geometry(
                 grid_data.descriptor.output_width,
                 grid_data.descriptor.output_height,
                 source_bit_depth,
                 &transforms,
                 icc_profile,
-            )
+            )?
         }
         isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
             let (_, metadata, _, _) =
-                decode_primary_heic_stream_and_metadata_from_coded_item_data(input, &item_data)?;
+                decode_primary_heic_stream_and_metadata_from_coded_item_data(input, item_data)?;
             guardrails.enforce_pixel_count(metadata.width, metadata.height)?;
             let source_bit_depth = heic_bit_depth_for_png_conversion_metadata(&metadata)?;
             decoded_rgba_layout_from_heic_geometry(
@@ -7738,9 +7760,13 @@ fn decode_heif_bytes_to_rgba_layout(
                 source_bit_depth,
                 &transforms,
                 icc_profile,
-            )
+            )?
         }
-    }
+    };
+    Ok(RgbaLayoutProbe {
+        layout,
+        preextracted_heic: Some(primary_with_grid),
+    })
 }
 
 #[cfg(feature = "image-integration")]
@@ -8659,6 +8685,7 @@ fn try_decode_uncompressed_heif_to_rgba_output<T: Copy, O: RgbaSampleOutput<T>>(
 fn decode_heif_bytes_to_rgba8_slice(
     input: &[u8],
     guardrails: DecodeGuardrails,
+    preextracted: Option<isobmff::HeicPrimaryItemDataWithGrid>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
     let mut output = SliceRgbaOutput(out);
@@ -8674,6 +8701,7 @@ fn decode_heif_bytes_to_rgba8_slice(
     decode_heif_bytes_to_rgba_slice(
         input,
         guardrails,
+        preextracted,
         out,
         decode_primary_heic_grid_to_rgba8_slice,
         decoded_heic_to_rgba8_slice,
@@ -8684,6 +8712,7 @@ fn decode_heif_bytes_to_rgba8_slice(
 fn decode_heif_bytes_to_rgba16_native_endian_bytes(
     input: &[u8],
     guardrails: DecodeGuardrails,
+    preextracted: Option<isobmff::HeicPrimaryItemDataWithGrid>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
     let mut output = NativeEndianRgba16Output(out);
@@ -8702,6 +8731,7 @@ fn decode_heif_bytes_to_rgba16_native_endian_bytes(
     decode_heif_bytes_to_rgba_slice(
         input,
         guardrails,
+        preextracted,
         out,
         decode_primary_heic_grid_to_rgba16_native_endian_bytes,
         decoded_heic_to_rgba16_native_endian_bytes,
@@ -8728,6 +8758,7 @@ type HeicCodedSliceDecode<T> = fn(
 fn decode_heif_bytes_to_rgba_slice<T>(
     input: &[u8],
     guardrails: DecodeGuardrails,
+    preextracted: Option<isobmff::HeicPrimaryItemDataWithGrid>,
     out: &mut [T],
     decode_grid_slice: HeicGridSliceDecode<T>,
     decode_coded_slice: HeicCodedSliceDecode<T>,
@@ -8736,8 +8767,14 @@ fn decode_heif_bytes_to_rgba_slice<T>(
         .map_err(DecodeHeicError::ParsePrimaryTransforms)?
         .transforms;
     let mut source: Option<&mut dyn RandomAccessSource> = None;
-    let primary_with_grid =
-        isobmff::extract_primary_heic_item_data_with_grid(input).map_err(DecodeHeicError::from)?;
+    // Reuse the extraction the layout probe already performed (`input` is the
+    // same immutable buffer, so re-extracting could only produce the same
+    // payload copies again).
+    let primary_with_grid = match preextracted {
+        Some(primary_with_grid) => primary_with_grid,
+        None => isobmff::extract_primary_heic_item_data_with_grid(input)
+            .map_err(DecodeHeicError::from)?,
+    };
 
     match primary_with_grid {
         isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
@@ -8786,10 +8823,11 @@ fn decode_bytes_to_rgba_layout_with_hint_and_guardrails(
     input: &[u8],
     hint: Option<HeifInputFamily>,
     guardrails: DecodeGuardrails,
-) -> Result<DecodedRgbaLayout, DecodeError> {
+) -> Result<RgbaLayoutProbe, DecodeError> {
     match enforce_and_resolve_input_family(input, hint, &guardrails)? {
         HeifInputFamily::Heif => decode_heif_bytes_to_rgba_layout(input, guardrails),
-        HeifInputFamily::Avif => decode_avif_bytes_to_rgba_layout(input, guardrails),
+        HeifInputFamily::Avif => decode_avif_bytes_to_rgba_layout(input, guardrails)
+            .map(RgbaLayoutProbe::without_extraction),
     }
 }
 
@@ -8798,10 +8836,13 @@ fn decode_bytes_to_rgba8_slice_with_hint_and_guardrails(
     input: &[u8],
     hint: Option<HeifInputFamily>,
     guardrails: DecodeGuardrails,
+    preextracted_heic: Option<isobmff::HeicPrimaryItemDataWithGrid>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
     match enforce_and_resolve_input_family(input, hint, &guardrails)? {
-        HeifInputFamily::Heif => decode_heif_bytes_to_rgba8_slice(input, guardrails, out),
+        HeifInputFamily::Heif => {
+            decode_heif_bytes_to_rgba8_slice(input, guardrails, preextracted_heic, out)
+        }
         HeifInputFamily::Avif => decode_avif_bytes_to_rgba8_slice(input, guardrails, out),
     }
 }
@@ -8811,6 +8852,7 @@ fn decode_bytes_to_rgba16_native_endian_bytes_with_hint_and_guardrails(
     input: &[u8],
     hint: Option<HeifInputFamily>,
     guardrails: DecodeGuardrails,
+    preextracted_heic: Option<isobmff::HeicPrimaryItemDataWithGrid>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
     if !out.len().is_multiple_of(std::mem::size_of::<u16>()) {
@@ -8819,9 +8861,12 @@ fn decode_bytes_to_rgba16_native_endian_bytes_with_hint_and_guardrails(
         ));
     }
     match enforce_and_resolve_input_family(input, hint, &guardrails)? {
-        HeifInputFamily::Heif => {
-            decode_heif_bytes_to_rgba16_native_endian_bytes(input, guardrails, out)
-        }
+        HeifInputFamily::Heif => decode_heif_bytes_to_rgba16_native_endian_bytes(
+            input,
+            guardrails,
+            preextracted_heic,
+            out,
+        ),
         HeifInputFamily::Avif => {
             decode_avif_bytes_to_rgba16_native_endian_bytes(input, guardrails, out)
         }
@@ -13281,7 +13326,8 @@ mod tests {
             None,
             super::DecodeGuardrails::default(),
         )
-        .expect("layout probe must accept uncompressed HEIF");
+        .expect("layout probe must accept uncompressed HEIF")
+        .layout;
         assert_eq!((layout.width, layout.height), (2, 1));
         assert_eq!(layout.source_bit_depth, 8);
         assert_eq!(layout.storage_bit_depth, 8);
@@ -13297,6 +13343,7 @@ mod tests {
             &file,
             None,
             super::DecodeGuardrails::default(),
+            None,
             &mut rgba8,
         )
         .expect("RGBA8 slice decode must support uncompressed HEIF");

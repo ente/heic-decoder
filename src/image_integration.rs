@@ -76,6 +76,10 @@ struct LazyHeifImageDecoder {
     hint: Option<HeifInputFamily>,
     guardrails: DecodeGuardrails,
     layout: DecodedRgbaLayout,
+    // Primary-item payload extraction the layout probe already performed;
+    // `read_image` consumes it instead of copying every payload out of the
+    // container a second time.
+    preextracted_heic: Option<crate::isobmff::HeicPrimaryItemDataWithGrid>,
 }
 
 // Manual impl: a derived Debug would dump the entire encoded input.
@@ -96,13 +100,14 @@ impl LazyHeifImageDecoder {
         input: Vec<u8>,
         hint: Option<HeifInputFamily>,
         guardrails: DecodeGuardrails,
-        layout: DecodedRgbaLayout,
+        probe: crate::RgbaLayoutProbe,
     ) -> Self {
         Self {
             input,
             hint,
             guardrails,
-            layout,
+            layout: probe.layout,
+            preextracted_heic: probe.preextracted_heic,
         }
     }
 
@@ -171,6 +176,7 @@ impl ImageDecoder for LazyHeifImageDecoder {
                 &self.input,
                 self.hint,
                 self.guardrails,
+                self.preextracted_heic,
                 buf,
             )
             .map_err(decode_error_to_image_error),
@@ -178,6 +184,7 @@ impl ImageDecoder for LazyHeifImageDecoder {
                 &self.input,
                 self.hint,
                 self.guardrails,
+                self.preextracted_heic,
                 buf,
             )
             .map_err(decode_error_to_image_error),
@@ -204,11 +211,11 @@ fn decoder_from_seekable_with_hint_and_guardrails<R: Read + Seek>(
     guardrails: DecodeGuardrails,
 ) -> ImageResult<Box<dyn ImageDecoder>> {
     let input = read_seekable_input_to_vec(input_reader, &guardrails)?;
-    let layout =
+    let probe =
         decode_bytes_to_rgba_layout_with_hint_and_guardrails(&input, hint, guardrails.clone())
             .map_err(decode_error_to_image_error)?;
     Ok(Box::new(LazyHeifImageDecoder::from_encoded_input(
-        input, hint, guardrails, layout,
+        input, hint, guardrails, probe,
     )))
 }
 
