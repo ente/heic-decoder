@@ -4006,10 +4006,13 @@ type PrimaryHeicStreamDecodeContext = (
     Option<YCbCrMatrixCoefficients>,
 );
 
-fn decode_primary_heic_stream_and_metadata_from_coded_item_data(
+/// Parse the primary coded item's preflight properties and cross-check the
+/// item id against the extracted payload. Shared by the stream-assembling
+/// decode path and the image-hook layout probe.
+fn parse_and_validate_heic_coded_item_preflight(
     input: &[u8],
     item_data: &isobmff::HeicPrimaryItemData,
-) -> Result<PrimaryHeicStreamDecodeContext, DecodeHeicError> {
+) -> Result<isobmff::HeicPrimaryItemPreflightProperties, DecodeHeicError> {
     let properties = isobmff::parse_primary_heic_item_preflight_properties(input)?;
     if properties.item_id != item_data.item_id {
         return Err(DecodeHeicError::InvalidDecodedFrame {
@@ -4019,6 +4022,14 @@ fn decode_primary_heic_stream_and_metadata_from_coded_item_data(
             ),
         });
     }
+    Ok(properties)
+}
+
+fn decode_primary_heic_stream_and_metadata_from_coded_item_data(
+    input: &[u8],
+    item_data: &isobmff::HeicPrimaryItemData,
+) -> Result<PrimaryHeicStreamDecodeContext, DecodeHeicError> {
+    let properties = parse_and_validate_heic_coded_item_preflight(input, item_data)?;
     let ycbcr_range_override = ycbcr_range_override_from_primary_colr(&properties.colr);
     let ycbcr_matrix_override = ycbcr_matrix_override_from_primary_colr(&properties.colr);
     let stream = assemble_heic_hevc_stream_from_components(&properties.hvcc, &item_data.payload)?;
@@ -7692,8 +7703,18 @@ fn decode_heif_bytes_to_rgba_layout(
             )?
         }
         isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
-            let (_, metadata, _, _) =
-                decode_primary_heic_stream_and_metadata_from_coded_item_data(input, item_data)?;
+            // Same preflight and geometry validations as the decode path,
+            // but read the SPS by walking the hvcC arrays / payload NALs in
+            // place instead of assembling (and dropping) a normalized copy
+            // of the whole coded payload.
+            let properties = parse_and_validate_heic_coded_item_preflight(input, item_data)?;
+            let metadata =
+                decode_hevc_metadata_from_hvcc_or_payload(&properties.hvcc, &item_data.payload)?;
+            validate_decoded_heic_geometry_against_ispe(
+                &metadata,
+                properties.ispe.width,
+                properties.ispe.height,
+            )?;
             guardrails.enforce_pixel_count(metadata.width, metadata.height)?;
             let source_bit_depth = heic_bit_depth_for_png_conversion_metadata(&metadata)?;
             decoded_rgba_layout_from_heic_geometry(
