@@ -181,27 +181,15 @@ impl HeifImageDecoder {
     }
 
     fn storage_color_type(&self) -> ColorType {
-        match self.decoded.storage_bit_depth() {
-            8 => ColorType::Rgba8,
-            16 => ColorType::Rgba16,
-            other => {
-                unreachable!("validated storage bit depth must be 8 or 16, got {other}")
-            }
-        }
+        storage_color_type_from_bit_depth(self.decoded.storage_bit_depth())
     }
 
     fn expected_total_bytes(&self) -> ImageResult<usize> {
-        expected_rgba_byte_count(
+        expected_rgba_total_bytes(
             self.decoded.width,
             self.decoded.height,
             self.decoded.storage_bit_depth(),
         )
-        .ok_or_else(|| {
-            parameter_error(format!(
-                "decoded RGBA buffer size overflow for {}x{} image",
-                self.decoded.width, self.decoded.height
-            ))
-        })
     }
 }
 
@@ -246,12 +234,24 @@ impl ImageDecoder for HeifImageDecoder {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 struct LazyHeifImageDecoder {
     input: Vec<u8>,
     hint: Option<HeifInputFamily>,
     guardrails: DecodeGuardrails,
     layout: DecodedRgbaLayout,
+}
+
+// Manual impl: a derived Debug would dump the entire encoded input.
+impl std::fmt::Debug for LazyHeifImageDecoder {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LazyHeifImageDecoder")
+            .field("input_len", &self.input.len())
+            .field("hint", &self.hint)
+            .field("guardrails", &self.guardrails)
+            .field("layout", &self.layout)
+            .finish()
+    }
 }
 
 impl LazyHeifImageDecoder {
@@ -274,17 +274,11 @@ impl LazyHeifImageDecoder {
     }
 
     fn expected_total_bytes(&self) -> ImageResult<usize> {
-        expected_rgba_byte_count(
+        expected_rgba_total_bytes(
             self.layout.width,
             self.layout.height,
             self.layout.storage_bit_depth,
         )
-        .ok_or_else(|| {
-            parameter_error(format!(
-                "decoded RGBA buffer size overflow for {}x{} image",
-                self.layout.width, self.layout.height
-            ))
-        })
     }
 }
 
@@ -773,6 +767,16 @@ fn expected_rgba_byte_count(width: u32, height: u32, storage_bit_depth: u8) -> O
         _ => return None,
     };
     expected_rgba_sample_count(width, height)?.checked_mul(bytes_per_sample)
+}
+
+/// `expected_rgba_byte_count` with the byte-count overflow mapped to the
+/// decoder adapters' shared parameter error.
+fn expected_rgba_total_bytes(width: u32, height: u32, storage_bit_depth: u8) -> ImageResult<usize> {
+    expected_rgba_byte_count(width, height, storage_bit_depth).ok_or_else(|| {
+        parameter_error(format!(
+            "decoded RGBA buffer size overflow for {width}x{height} image"
+        ))
+    })
 }
 
 fn validate_decoded_rgba_image(decoded: &DecodedRgbaImage) -> ImageResult<()> {

@@ -4212,6 +4212,56 @@ fn decode_primary_heic_grid_to_rgba_image(
         .into());
     }
 
+    let (first_tile, source_bit_depth) = decode_and_validate_heic_grid_first_tile(grid_data)?;
+    let reference = HeicGridTileReference::from_first_tile(&first_tile, &grid_data.colr);
+    // Direct orientation is safe for opaque grids. Alpha and clean aperture
+    // stay on the existing source-coordinate transform path.
+    let (direct_orientation_transform, output_width, output_height) = if auxiliary_alpha.is_none() {
+        heic_grid_rgba_orientation_and_output_dims(descriptor, transforms)?
+    } else {
+        (None, descriptor.output_width, descriptor.output_height)
+    };
+
+    if source_bit_depth <= 8 {
+        finish_heic_grid_rgba_decode(
+            grid_data,
+            transforms,
+            auxiliary_alpha,
+            icc_profile,
+            first_tile,
+            &reference,
+            source_bit_depth,
+            direct_orientation_transform,
+            output_width,
+            output_height,
+            convert_heic_to_rgba8_into,
+            apply_auxiliary_alpha_to_rgba8,
+            DecodedRgbaPixels::U8,
+        )
+    } else {
+        finish_heic_grid_rgba_decode(
+            grid_data,
+            transforms,
+            auxiliary_alpha,
+            icc_profile,
+            first_tile,
+            &reference,
+            source_bit_depth,
+            direct_orientation_transform,
+            output_width,
+            output_height,
+            convert_heic_to_rgba16_into,
+            apply_auxiliary_alpha_to_rgba16,
+            DecodedRgbaPixels::U16,
+        )
+    }
+}
+
+/// Decode and validate the grid's first tile, returning it together with its
+/// PNG-conversion source bit depth.
+fn decode_and_validate_heic_grid_first_tile(
+    grid_data: &isobmff::HeicGridPrimaryItemData,
+) -> Result<(DecodedHeicImage, u8), DecodeHeicError> {
     let first_tile_data =
         grid_data
             .tiles
@@ -4220,93 +4270,76 @@ fn decode_primary_heic_grid_to_rgba_image(
                 detail: "grid tile list cannot be empty".to_string(),
             })?;
     let first_tile = decode_heic_grid_tile_to_image(first_tile_data)?;
-    validate_decoded_heic_grid_first_tile(descriptor, &first_tile)?;
-    let reference = HeicGridTileReference::from_first_tile(&first_tile, &grid_data.colr);
+    validate_decoded_heic_grid_first_tile(&grid_data.descriptor, &first_tile)?;
     let source_bit_depth = heic_bit_depth_for_png_conversion(&first_tile)?;
-    // Direct orientation is safe for opaque grids. Alpha and clean aperture
-    // stay on the existing source-coordinate transform path.
-    let direct_orientation_transform = if auxiliary_alpha.is_none() {
-        rgba_orientation_transform_from_primary_transforms(
-            descriptor.output_width,
-            descriptor.output_height,
-            transforms,
-        )?
-    } else {
-        None
-    };
-    let output_width = direct_orientation_transform
+    Ok((first_tile, source_bit_depth))
+}
+
+/// Resolve the direct orientation transform for a grid RGBA decode together
+/// with the output dimensions it implies (descriptor dimensions when no
+/// direct transform applies).
+fn heic_grid_rgba_orientation_and_output_dims(
+    descriptor: &isobmff::HeicGridDescriptor,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+) -> Result<(Option<RgbaOrientationTransform>, u32, u32), DecodeError> {
+    let orientation_transform = rgba_orientation_transform_from_primary_transforms(
+        descriptor.output_width,
+        descriptor.output_height,
+        transforms,
+    )?;
+    let output_width = orientation_transform
         .as_ref()
         .map_or(descriptor.output_width, |transform| {
             transform.destination_width
         });
-    let output_height = direct_orientation_transform
+    let output_height = orientation_transform
         .as_ref()
         .map_or(descriptor.output_height, |transform| {
             transform.destination_height
         });
+    Ok((orientation_transform, output_width, output_height))
+}
 
-    if source_bit_depth <= 8 {
-        let mut output = vec![0_u8; checked_rgba_sample_count(output_width, output_height)?];
-        paste_heic_grid_tiles_to_rgba(
-            grid_data,
-            first_tile,
-            &mut output,
-            &reference,
-            direct_orientation_transform.as_ref(),
-            convert_heic_to_rgba8_into,
-        )?;
-        if direct_orientation_transform.is_some() {
-            return Ok(DecodedRgbaImage {
-                width: output_width,
-                height: output_height,
-                source_bit_depth,
-                pixels: DecodedRgbaPixels::U8(output),
-                icc_profile,
-            });
-        }
-        if let Some(alpha) = auxiliary_alpha {
-            apply_auxiliary_alpha_to_rgba8(
-                &mut output,
-                descriptor.output_width,
-                descriptor.output_height,
-                alpha,
-            )?;
-        }
-        let (width, height, transformed) = apply_primary_item_transforms_rgba(
-            descriptor.output_width,
-            descriptor.output_height,
-            output,
-            transforms,
-        )?;
-        return Ok(DecodedRgbaImage {
-            width,
-            height,
-            source_bit_depth,
-            pixels: DecodedRgbaPixels::U8(transformed),
-            icc_profile,
-        });
-    }
-
-    let mut output = vec![0_u16; checked_rgba_sample_count(output_width, output_height)?];
+/// Shared 8/16-bit tail of the owned grid RGBA decode: paste every tile,
+/// then either return the directly oriented canvas or run the RGBA-domain
+/// alpha and transform path.
+#[allow(clippy::too_many_arguments)]
+fn finish_heic_grid_rgba_decode<T: Copy + Default>(
+    grid_data: &isobmff::HeicGridPrimaryItemData,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+    auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
+    icc_profile: Option<Vec<u8>>,
+    first_tile: DecodedHeicImage,
+    reference: &HeicGridTileReference,
+    source_bit_depth: u8,
+    direct_orientation_transform: Option<RgbaOrientationTransform>,
+    output_width: u32,
+    output_height: u32,
+    convert_tile: fn(&DecodedHeicImage, &mut Vec<T>) -> Result<(), DecodeHeicError>,
+    apply_alpha: fn(&mut [T], u32, u32, &HeicAuxiliaryAlphaPlane) -> Result<(), DecodeHeicError>,
+    wrap_pixels: fn(Vec<T>) -> DecodedRgbaPixels,
+) -> Result<DecodedRgbaImage, DecodeError> {
+    let descriptor = &grid_data.descriptor;
+    let mut output = vec![T::default(); checked_rgba_sample_count(output_width, output_height)?];
     paste_heic_grid_tiles_to_rgba(
         grid_data,
         first_tile,
         &mut output,
-        &reference,
+        reference,
         direct_orientation_transform.as_ref(),
-        convert_heic_to_rgba16_into,
+        convert_tile,
     )?;
     if direct_orientation_transform.is_some() {
         return Ok(DecodedRgbaImage {
             width: output_width,
             height: output_height,
             source_bit_depth,
-            pixels: DecodedRgbaPixels::U16(output),
+            pixels: wrap_pixels(output),
             icc_profile,
         });
     }
     if let Some(alpha) = auxiliary_alpha {
-        apply_auxiliary_alpha_to_rgba16(
+        apply_alpha(
             &mut output,
             descriptor.output_width,
             descriptor.output_height,
@@ -4323,7 +4356,7 @@ fn decode_primary_heic_grid_to_rgba_image(
         width,
         height,
         source_bit_depth,
-        pixels: DecodedRgbaPixels::U16(transformed),
+        pixels: wrap_pixels(transformed),
         icc_profile,
     })
 }
@@ -4822,6 +4855,32 @@ fn rgba_orientation_transform_from_primary_transforms(
     }))
 }
 
+/// Validate that an RGBA paste buffer holds exactly `width x height` pixels
+/// (4 samples per pixel). `role` is "source" or "destination".
+#[allow(clippy::too_many_arguments)]
+fn validate_rgba_paste_buffer_len(
+    actual_len: usize,
+    width_usize: usize,
+    height_usize: usize,
+    width: u32,
+    height: u32,
+    plane: &'static str,
+    role: &'static str,
+) -> Result<(), DecodeHeicError> {
+    let expected_samples = width_usize
+        .checked_mul(height_usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("{plane} {role} sample count overflow for {width}x{height}"),
+        })?;
+    if actual_len != expected_samples {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("{plane} {role} has {actual_len} samples, expected {expected_samples}"),
+        });
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paste_rgba_tile_with_clip<T: Copy>(
     source: &[T],
@@ -4865,39 +4924,24 @@ fn paste_rgba_tile_with_clip<T: Copy>(
             detail: format!("{plane} y-origin {y_origin} cannot be represented"),
         })?;
 
-    let source_samples = source_width_usize
-        .checked_mul(source_height_usize)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "{plane} source sample count overflow for {source_width}x{source_height}"
-            ),
-        })?;
-    if source.len() != source_samples {
-        return Err(DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "{plane} source has {} samples, expected {source_samples}",
-                source.len()
-            ),
-        });
-    }
-
-    let destination_samples = destination_width_usize
-        .checked_mul(destination_height_usize)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "{plane} destination sample count overflow for {destination_width}x{destination_height}"
-            ),
-        })?;
-    if destination.len() != destination_samples {
-        return Err(DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "{plane} destination has {} samples, expected {destination_samples}",
-                destination.len()
-            ),
-        });
-    }
+    validate_rgba_paste_buffer_len(
+        source.len(),
+        source_width_usize,
+        source_height_usize,
+        source_width,
+        source_height,
+        plane,
+        "source",
+    )?;
+    validate_rgba_paste_buffer_len(
+        destination.len(),
+        destination_width_usize,
+        destination_height_usize,
+        destination_width,
+        destination_height,
+        plane,
+        "destination",
+    )?;
 
     let remaining_width = destination_width_usize - x_origin_usize;
     let copy_width = source_width_usize.min(remaining_width);
@@ -4982,43 +5026,24 @@ fn paste_transformed_rgba_tile_with_clip<T: Copy>(
             detail: format!("{plane} y-origin {y_origin} cannot be represented"),
         })?;
 
-    let source_samples = source_width_usize
-        .checked_mul(source_height_usize)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "{plane} source sample count overflow for {source_width}x{source_height}"
-            ),
-        })?;
-    if source.len() != source_samples {
-        return Err(DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "{plane} source has {} samples, expected {source_samples}",
-                source.len()
-            ),
-        }
-        .into());
-    }
-
-    let destination_samples = orientation_transform
-        .destination_width_usize
-        .checked_mul(orientation_transform.destination_height_usize)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "{plane} destination sample count overflow for {}x{}",
-                orientation_transform.destination_width, orientation_transform.destination_height
-            ),
-        })?;
-    if destination.len() != destination_samples {
-        return Err(DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "{plane} destination has {} samples, expected {destination_samples}",
-                destination.len()
-            ),
-        }
-        .into());
-    }
+    validate_rgba_paste_buffer_len(
+        source.len(),
+        source_width_usize,
+        source_height_usize,
+        source_width,
+        source_height,
+        plane,
+        "source",
+    )?;
+    validate_rgba_paste_buffer_len(
+        destination.len(),
+        orientation_transform.destination_width_usize,
+        orientation_transform.destination_height_usize,
+        orientation_transform.destination_width,
+        orientation_transform.destination_height,
+        plane,
+        "destination",
+    )?;
 
     let remaining_width = orientation_transform.source_width_usize - x_origin_usize;
     let copy_width = source_width_usize.min(remaining_width);
@@ -6978,6 +7003,11 @@ fn heic_grid_source_bit_depth_for_png_conversion(
     heic_bit_depth_for_png_conversion_metadata(&metadata)
 }
 
+/// RGBA storage width (8 or 16 bits per sample) for a HEIC source bit depth.
+fn heic_storage_bit_depth(source_bit_depth: u8) -> u8 {
+    if source_bit_depth <= 8 { 8 } else { 16 }
+}
+
 #[cfg(feature = "image-integration")]
 fn decoded_rgba_layout_from_heic_geometry(
     width: u32,
@@ -6991,7 +7021,7 @@ fn decoded_rgba_layout_from_heic_geometry(
         width,
         height,
         source_bit_depth,
-        storage_bit_depth: if source_bit_depth <= 8 { 8 } else { 16 },
+        storage_bit_depth: heic_storage_bit_depth(source_bit_depth),
         icc_profile,
     })
 }
@@ -7184,38 +7214,16 @@ fn decode_primary_heic_grid_to_rgba_slice<T: Copy + Default>(
     copy_decoded_to_slice: fn(DecodedRgbaImage, &mut [T]) -> Result<(), DecodeError>,
 ) -> Result<(), DecodeError> {
     if auxiliary_alpha.is_none() && grid_transforms_can_write_directly(transforms) {
-        let first_tile_data =
-            grid_data
-                .tiles
-                .first()
-                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                    detail: "grid tile list cannot be empty".to_string(),
-                })?;
-        let first_tile = decode_heic_grid_tile_to_image(first_tile_data)?;
-        validate_decoded_heic_grid_first_tile(&grid_data.descriptor, &first_tile)?;
-        let source_bit_depth = heic_bit_depth_for_png_conversion(&first_tile)?;
-        let source_storage_bit_depth: u8 = if source_bit_depth <= 8 { 8 } else { 16 };
+        let (first_tile, source_bit_depth) = decode_and_validate_heic_grid_first_tile(grid_data)?;
+        let source_storage_bit_depth = heic_storage_bit_depth(source_bit_depth);
         if source_storage_bit_depth != storage_bit_depth {
             return Err(DecodeError::Unsupported(format!(
                 "HEIC grid storage is RGBA{source_storage_bit_depth}, not RGBA{storage_bit_depth}"
             )));
         }
 
-        let direct_orientation_transform = rgba_orientation_transform_from_primary_transforms(
-            grid_data.descriptor.output_width,
-            grid_data.descriptor.output_height,
-            transforms,
-        )?;
-        let output_width = direct_orientation_transform
-            .as_ref()
-            .map_or(grid_data.descriptor.output_width, |transform| {
-                transform.destination_width
-            });
-        let output_height = direct_orientation_transform
-            .as_ref()
-            .map_or(grid_data.descriptor.output_height, |transform| {
-                transform.destination_height
-            });
+        let (direct_orientation_transform, output_width, output_height) =
+            heic_grid_rgba_orientation_and_output_dims(&grid_data.descriptor, transforms)?;
         let expected = checked_rgba_sample_count(output_width, output_height)?;
         if out.len() != expected {
             return Err(DecodeError::TransformGuard(
@@ -7251,60 +7259,59 @@ fn decode_primary_heic_grid_to_rgba_slice<T: Copy + Default>(
 
 #[cfg(feature = "image-integration")]
 fn decoded_heic_to_rgba8_slice(
-    mut decoded: DecodedHeicImage,
+    decoded: DecodedHeicImage,
     transforms: &[isobmff::PrimaryItemTransformProperty],
     auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
-    let mut remaining_transforms = transforms;
-    if auxiliary_alpha.is_none() {
-        (decoded, remaining_transforms) =
-            crop_heic_by_leading_chroma_aligned_clean_apertures(decoded, remaining_transforms)?;
-    }
-
-    let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
-    if source_bit_depth > 8 {
-        return Err(DecodeError::Unsupported(
-            "HEIC storage is RGBA16, not RGBA8".to_string(),
-        ));
-    }
-
-    if remaining_transforms.is_empty() {
-        convert_heic_to_rgba8_slice(&decoded, out)?;
-        if let Some(alpha) = auxiliary_alpha {
-            apply_auxiliary_alpha_to_rgba8(out, decoded.width, decoded.height, alpha)?;
-        }
-        return Ok(());
-    }
-
-    let mut pixels = convert_heic_to_rgba8(&decoded)?;
-    if let Some(alpha) = auxiliary_alpha {
-        apply_auxiliary_alpha_to_rgba8(&mut pixels, decoded.width, decoded.height, alpha)?;
-    }
-    let (width, height, pixels) = apply_primary_item_transforms_rgba(
-        decoded.width,
-        decoded.height,
-        pixels,
-        remaining_transforms,
-    )?;
-    copy_decoded_rgba8_to_slice(
-        DecodedRgbaImage {
-            width,
-            height,
-            source_bit_depth,
-            pixels: DecodedRgbaPixels::U8(pixels),
-            icc_profile: None,
-        },
+    decoded_heic_to_rgba_slice(
+        decoded,
+        transforms,
+        auxiliary_alpha,
         out,
+        8,
+        convert_heic_to_rgba8_slice,
+        convert_heic_to_rgba8,
+        apply_auxiliary_alpha_to_rgba8,
+        copy_decoded_rgba8_to_slice,
+        DecodedRgbaPixels::U8,
     )
 }
 
 #[cfg(feature = "image-integration")]
 fn decoded_heic_to_rgba16_slice(
-    mut decoded: DecodedHeicImage,
+    decoded: DecodedHeicImage,
     transforms: &[isobmff::PrimaryItemTransformProperty],
     auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
     out: &mut [u16],
+) -> Result<(), DecodeError> {
+    decoded_heic_to_rgba_slice(
+        decoded,
+        transforms,
+        auxiliary_alpha,
+        out,
+        16,
+        convert_heic_to_rgba16_slice,
+        convert_heic_to_rgba16,
+        apply_auxiliary_alpha_to_rgba16,
+        copy_decoded_rgba16_to_slice,
+        DecodedRgbaPixels::U16,
+    )
+}
+
+#[cfg(feature = "image-integration")]
+#[allow(clippy::too_many_arguments)]
+fn decoded_heic_to_rgba_slice<T: Copy + Default>(
+    mut decoded: DecodedHeicImage,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+    auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
+    out: &mut [T],
+    storage_bit_depth: u8,
+    convert_slice: fn(&DecodedHeicImage, &mut [T]) -> Result<(), DecodeHeicError>,
+    convert_owned: fn(&DecodedHeicImage) -> Result<Vec<T>, DecodeHeicError>,
+    apply_alpha: fn(&mut [T], u32, u32, &HeicAuxiliaryAlphaPlane) -> Result<(), DecodeHeicError>,
+    copy_decoded_to_slice: fn(DecodedRgbaImage, &mut [T]) -> Result<(), DecodeError>,
+    wrap_pixels: fn(Vec<T>) -> DecodedRgbaPixels,
 ) -> Result<(), DecodeError> {
     let mut remaining_transforms = transforms;
     if auxiliary_alpha.is_none() {
@@ -7313,23 +7320,24 @@ fn decoded_heic_to_rgba16_slice(
     }
 
     let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
-    if source_bit_depth <= 8 {
-        return Err(DecodeError::Unsupported(
-            "HEIC storage is RGBA8, not RGBA16".to_string(),
-        ));
+    let source_storage_bit_depth = heic_storage_bit_depth(source_bit_depth);
+    if source_storage_bit_depth != storage_bit_depth {
+        return Err(DecodeError::Unsupported(format!(
+            "HEIC storage is RGBA{source_storage_bit_depth}, not RGBA{storage_bit_depth}"
+        )));
     }
 
     if remaining_transforms.is_empty() {
-        convert_heic_to_rgba16_slice(&decoded, out)?;
+        convert_slice(&decoded, out)?;
         if let Some(alpha) = auxiliary_alpha {
-            apply_auxiliary_alpha_to_rgba16(out, decoded.width, decoded.height, alpha)?;
+            apply_alpha(out, decoded.width, decoded.height, alpha)?;
         }
         return Ok(());
     }
 
-    let mut pixels = convert_heic_to_rgba16(&decoded)?;
+    let mut pixels = convert_owned(&decoded)?;
     if let Some(alpha) = auxiliary_alpha {
-        apply_auxiliary_alpha_to_rgba16(&mut pixels, decoded.width, decoded.height, alpha)?;
+        apply_alpha(&mut pixels, decoded.width, decoded.height, alpha)?;
     }
     let (width, height, pixels) = apply_primary_item_transforms_rgba(
         decoded.width,
@@ -7337,12 +7345,12 @@ fn decoded_heic_to_rgba16_slice(
         pixels,
         remaining_transforms,
     )?;
-    copy_decoded_rgba16_to_slice(
+    copy_decoded_to_slice(
         DecodedRgbaImage {
             width,
             height,
             source_bit_depth,
-            pixels: DecodedRgbaPixels::U16(pixels),
+            pixels: wrap_pixels(pixels),
             icc_profile: None,
         },
         out,
@@ -7355,40 +7363,13 @@ fn decode_heif_bytes_to_rgba8_slice(
     guardrails: DecodeGuardrails,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
-    reject_uncompressed_heif_on_lazy_adapter_paths(input)?;
-
-    let transforms = isobmff::parse_primary_item_transform_properties(input)
-        .map_err(DecodeHeicError::ParsePrimaryTransforms)?
-        .transforms;
-    let mut source: Option<&mut dyn RandomAccessSource> = None;
-    let primary_with_grid =
-        isobmff::extract_primary_heic_item_data_with_grid(input).map_err(DecodeHeicError::from)?;
-
-    match primary_with_grid {
-        isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
-            let auxiliary_alpha = decode_primary_heic_grid_auxiliary_alpha(
-                input,
-                &mut source,
-                &grid_data,
-                &guardrails,
-            )?;
-            decode_primary_heic_grid_to_rgba8_slice(
-                &grid_data,
-                &transforms,
-                auxiliary_alpha.as_ref(),
-                out,
-            )
-        }
-        isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
-            let (decoded, auxiliary_alpha) = decode_primary_heic_coded_item_with_alpha(
-                input,
-                &mut source,
-                &item_data,
-                &guardrails,
-            )?;
-            decoded_heic_to_rgba8_slice(decoded, &transforms, auxiliary_alpha.as_ref(), out)
-        }
-    }
+    decode_heif_bytes_to_rgba_slice(
+        input,
+        guardrails,
+        out,
+        decode_primary_heic_grid_to_rgba8_slice,
+        decoded_heic_to_rgba8_slice,
+    )
 }
 
 #[cfg(feature = "image-integration")]
@@ -7396,6 +7377,39 @@ fn decode_heif_bytes_to_rgba16_slice(
     input: &[u8],
     guardrails: DecodeGuardrails,
     out: &mut [u16],
+) -> Result<(), DecodeError> {
+    decode_heif_bytes_to_rgba_slice(
+        input,
+        guardrails,
+        out,
+        decode_primary_heic_grid_to_rgba16_slice,
+        decoded_heic_to_rgba16_slice,
+    )
+}
+
+#[cfg(feature = "image-integration")]
+type HeicGridSliceDecode<T> = fn(
+    &isobmff::HeicGridPrimaryItemData,
+    &[isobmff::PrimaryItemTransformProperty],
+    Option<&HeicAuxiliaryAlphaPlane>,
+    &mut [T],
+) -> Result<(), DecodeError>;
+
+#[cfg(feature = "image-integration")]
+type HeicCodedSliceDecode<T> = fn(
+    DecodedHeicImage,
+    &[isobmff::PrimaryItemTransformProperty],
+    Option<&HeicAuxiliaryAlphaPlane>,
+    &mut [T],
+) -> Result<(), DecodeError>;
+
+#[cfg(feature = "image-integration")]
+fn decode_heif_bytes_to_rgba_slice<T>(
+    input: &[u8],
+    guardrails: DecodeGuardrails,
+    out: &mut [T],
+    decode_grid_slice: HeicGridSliceDecode<T>,
+    decode_coded_slice: HeicCodedSliceDecode<T>,
 ) -> Result<(), DecodeError> {
     reject_uncompressed_heif_on_lazy_adapter_paths(input)?;
 
@@ -7414,12 +7428,7 @@ fn decode_heif_bytes_to_rgba16_slice(
                 &grid_data,
                 &guardrails,
             )?;
-            decode_primary_heic_grid_to_rgba16_slice(
-                &grid_data,
-                &transforms,
-                auxiliary_alpha.as_ref(),
-                out,
-            )
+            decode_grid_slice(&grid_data, &transforms, auxiliary_alpha.as_ref(), out)
         }
         isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
             let (decoded, auxiliary_alpha) = decode_primary_heic_coded_item_with_alpha(
@@ -7428,9 +7437,29 @@ fn decode_heif_bytes_to_rgba16_slice(
                 &item_data,
                 &guardrails,
             )?;
-            decoded_heic_to_rgba16_slice(decoded, &transforms, auxiliary_alpha.as_ref(), out)
+            decode_coded_slice(decoded, &transforms, auxiliary_alpha.as_ref(), out)
         }
     }
+}
+
+/// Enforce the input-size guardrail and resolve the input family from the
+/// ftyp brands, falling back to the caller-provided hint.
+fn enforce_and_resolve_input_family(
+    input: &[u8],
+    hint: Option<HeifInputFamily>,
+    guardrails: &DecodeGuardrails,
+) -> Result<HeifInputFamily, DecodeError> {
+    guardrails.enforce_input_bytes(input.len() as u64)?;
+    detect_input_family_from_ftyp(input)
+        .or(hint)
+        .ok_or_else(unknown_input_family_error)
+}
+
+fn unknown_input_family_error() -> DecodeError {
+    DecodeError::Unsupported(
+        "Unsupported HEIF/AVIF file type: could not infer image family from ftyp brands"
+            .to_string(),
+    )
 }
 
 #[cfg(feature = "image-integration")]
@@ -7439,16 +7468,7 @@ fn decode_bytes_to_rgba_layout_with_hint_and_guardrails(
     hint: Option<HeifInputFamily>,
     guardrails: DecodeGuardrails,
 ) -> Result<DecodedRgbaLayout, DecodeError> {
-    guardrails.enforce_input_bytes(input.len() as u64)?;
-    let family = detect_input_family_from_ftyp(input)
-        .or(hint)
-        .ok_or_else(|| {
-            DecodeError::Unsupported(
-                "Unsupported HEIF/AVIF file type: could not infer image family from ftyp brands"
-                    .to_string(),
-            )
-        })?;
-    match family {
+    match enforce_and_resolve_input_family(input, hint, &guardrails)? {
         HeifInputFamily::Heif => decode_heif_bytes_to_rgba_layout(input, guardrails),
         HeifInputFamily::Avif => Err(DecodeError::Unsupported(
             "lazy image adapter does not yet support AVIF preflight".to_string(),
@@ -7463,16 +7483,7 @@ fn decode_bytes_to_rgba8_slice_with_hint_and_guardrails(
     guardrails: DecodeGuardrails,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
-    guardrails.enforce_input_bytes(input.len() as u64)?;
-    let family = detect_input_family_from_ftyp(input)
-        .or(hint)
-        .ok_or_else(|| {
-            DecodeError::Unsupported(
-                "Unsupported HEIF/AVIF file type: could not infer image family from ftyp brands"
-                    .to_string(),
-            )
-        })?;
-    match family {
+    match enforce_and_resolve_input_family(input, hint, &guardrails)? {
         HeifInputFamily::Heif => decode_heif_bytes_to_rgba8_slice(input, guardrails, out),
         // Mirrors the layout probe's AVIF rejection: as long as the probe
         // sends AVIF to the eager decoder, the slice path refuses instead of
@@ -7491,16 +7502,7 @@ fn decode_bytes_to_rgba16_slice_with_hint_and_guardrails(
     guardrails: DecodeGuardrails,
     out: &mut [u16],
 ) -> Result<(), DecodeError> {
-    guardrails.enforce_input_bytes(input.len() as u64)?;
-    let family = detect_input_family_from_ftyp(input)
-        .or(hint)
-        .ok_or_else(|| {
-            DecodeError::Unsupported(
-                "Unsupported HEIF/AVIF file type: could not infer image family from ftyp brands"
-                    .to_string(),
-            )
-        })?;
-    match family {
+    match enforce_and_resolve_input_family(input, hint, &guardrails)? {
         HeifInputFamily::Heif => decode_heif_bytes_to_rgba16_slice(input, guardrails, out),
         // Mirrors the layout probe's AVIF rejection; see the RGBA8 variant.
         HeifInputFamily::Avif => Err(DecodeError::Unsupported(
@@ -7837,16 +7839,7 @@ fn decode_bytes_to_rgba_with_hint_and_guardrails(
     hint: Option<HeifInputFamily>,
     guardrails: DecodeGuardrails,
 ) -> Result<DecodedRgbaImage, DecodeError> {
-    guardrails.enforce_input_bytes(input.len() as u64)?;
-    let family = detect_input_family_from_ftyp(input)
-        .or(hint)
-        .ok_or_else(|| {
-            DecodeError::Unsupported(
-                "Unsupported HEIF/AVIF file type: could not infer image family from ftyp brands"
-                    .to_string(),
-            )
-        })?;
-    match family {
+    match enforce_and_resolve_input_family(input, hint, &guardrails)? {
         HeifInputFamily::Avif => decode_avif_bytes_to_rgba(input, guardrails),
         HeifInputFamily::Heif => decode_heif_bytes_to_rgba(input, guardrails),
     }
@@ -7858,16 +7851,7 @@ fn decode_bytes_to_png_with_hint_and_guardrails(
     output_path: &Path,
     guardrails: DecodeGuardrails,
 ) -> Result<(), DecodeError> {
-    guardrails.enforce_input_bytes(input.len() as u64)?;
-    let family = detect_input_family_from_ftyp(input)
-        .or(hint)
-        .ok_or_else(|| {
-            DecodeError::Unsupported(
-                "Unsupported HEIF/AVIF file type: could not infer image family from ftyp brands"
-                    .to_string(),
-            )
-        })?;
-    match family {
+    match enforce_and_resolve_input_family(input, hint, &guardrails)? {
         HeifInputFamily::Avif => decode_avif_bytes_to_png(input, output_path, guardrails),
         HeifInputFamily::Heif => decode_heif_bytes_to_png(input, output_path, guardrails),
     }
@@ -7914,12 +7898,9 @@ fn decode_source_to_rgba_with_hint_and_guardrails<S: RandomAccessSource>(
         read_selected_top_level_boxes_from_source(source, &[FTYP_BOX_TYPE, META_BOX_TYPE])?;
     let source_family_hint = detect_input_family_from_source_selected_boxes(&selected)?;
     let input = encode_source_selected_top_level_boxes(&selected);
-    let family = source_family_hint.or(hint).ok_or_else(|| {
-        DecodeError::Unsupported(
-            "Unsupported HEIF/AVIF file type: could not infer image family from ftyp brands"
-                .to_string(),
-        )
-    })?;
+    let family = source_family_hint
+        .or(hint)
+        .ok_or_else(unknown_input_family_error)?;
     match family {
         HeifInputFamily::Avif => decode_avif_source_to_rgba(source, &input, guardrails),
         HeifInputFamily::Heif => decode_heif_source_to_rgba(source, &input, guardrails),
