@@ -4922,11 +4922,26 @@ impl RgbaTransformPlan {
         })
     }
 
+    /// True when the plan maps every pixel to itself: no steps were
+    /// recorded, so destination dimensions equal source dimensions by
+    /// construction.
+    fn is_identity(&self) -> bool {
+        self.steps.is_empty()
+    }
+
     fn map_destination_pixel(
         &self,
         destination_x: usize,
         destination_y: usize,
     ) -> Result<(usize, usize), DecodeError> {
+        // Identity fast path: no irot/imir/clap is the common case, and the
+        // hook decode paths call this once per pixel. Callers iterate within
+        // the plan's dimensions, so the coordinate conversions and range
+        // checks below only matter when a step actually remaps coordinates.
+        if self.is_identity() {
+            return Ok((destination_x, destination_y));
+        }
+
         let mut x = u32::try_from(destination_x).map_err(|_| {
             DecodeError::TransformGuard(TransformGuardError::PixelIndexOverflow {
                 stage: "direct transform destination",
@@ -5010,6 +5025,13 @@ impl RgbaTransformPlan {
         source_x: usize,
         source_y: usize,
     ) -> Result<Option<(usize, usize)>, DecodeError> {
+        // Identity fast path, mirroring `map_destination_pixel`: the grid
+        // paste and alpha-seeding loops call this once per pixel and stay
+        // within the plan's source dimensions.
+        if self.is_identity() {
+            return Ok(Some((source_x, source_y)));
+        }
+
         let mut x = u32::try_from(source_x).map_err(|_| {
             DecodeError::TransformGuard(TransformGuardError::PixelIndexOverflow {
                 stage: "direct transform source",
@@ -7985,24 +8007,12 @@ fn paste_heic_grid_tiles_to_transformed_rgba_slice<T: Copy, O: RgbaSampleOutput<
                 else {
                     continue;
                 };
-                let source_pixel = tile_y
-                    .checked_mul(tile_width)
-                    .and_then(|row| row.checked_add(tile_x))
-                    .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                        detail: "grid tile source pixel index overflow".to_string(),
-                    })?;
-                let source_sample = source_pixel.checked_mul(4).ok_or_else(|| {
-                    DecodeHeicError::InvalidDecodedFrame {
-                        detail: "grid tile source sample index overflow".to_string(),
-                    }
-                })?;
-                let destination_sample = destination_y
-                    .checked_mul(destination_width)
-                    .and_then(|row| row.checked_add(destination_x))
-                    .and_then(|pixel| pixel.checked_mul(4))
-                    .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                        detail: "grid tile destination sample index overflow".to_string(),
-                    })?;
+                // In-bounds by construction (`validate_rgba_paste_buffer_len`
+                // proved the tile sample count fits usize, the plan maps into
+                // the validated destination canvas), so plain indexing cannot
+                // overflow — same as the coded HEIC/AVIF per-pixel loops.
+                let source_sample = (tile_y * tile_width + tile_x) * 4;
+                let destination_sample = (destination_y * destination_width + destination_x) * 4;
                 output.write_sample(destination_sample, tile_pixels[source_sample]);
                 output.write_sample(destination_sample + 1, tile_pixels[source_sample + 1]);
                 output.write_sample(destination_sample + 2, tile_pixels[source_sample + 2]);
@@ -8149,18 +8159,11 @@ fn decoded_heic_to_rgba_output<T: Copy, O: RgbaSampleOutput<T>>(
         for destination_x in 0..destination_width {
             let (source_x, source_y) =
                 transform_plan.map_destination_pixel(destination_x, destination_y)?;
-            let source_index = source_y
-                .checked_mul(source_width)
-                .and_then(|row| row.checked_add(source_x))
-                .ok_or({
-                    DecodeError::TransformGuard(TransformGuardError::PixelIndexOverflow {
-                        stage: "HEIC direct transformed source",
-                        x: source_x,
-                        y: source_y,
-                        width: decoded.width,
-                        height: decoded.height,
-                    })
-                })?;
+            // In-bounds by construction (the plan maps into the validated
+            // source dimensions) and the validated sample counts fit usize,
+            // so plain indexing cannot overflow — same as the AVIF and
+            // uncompressed twins of this loop.
+            let source_index = source_y * source_width + source_x;
             let y_sample = i32::from(decoded.y_plane.samples[source_index]);
             let (cb_sample, cr_sample) = match &chroma {
                 HeicChromaPlanes::Monochrome => (chroma_midpoint, chroma_midpoint),
@@ -8187,19 +8190,7 @@ fn decoded_heic_to_rgba_output<T: Copy, O: RgbaSampleOutput<T>>(
             let alpha = auxiliary_alpha.map_or(opaque_alpha, |alpha| {
                 scale_sample(alpha.samples[source_index], alpha.bit_depth)
             });
-            let destination_index = destination_y
-                .checked_mul(destination_width)
-                .and_then(|row| row.checked_add(destination_x))
-                .and_then(|pixel| pixel.checked_mul(4))
-                .ok_or({
-                    DecodeError::TransformGuard(TransformGuardError::PixelIndexOverflow {
-                        stage: "HEIC direct transformed destination",
-                        x: destination_x,
-                        y: destination_y,
-                        width: transform_plan.destination_width,
-                        height: transform_plan.destination_height,
-                    })
-                })?;
+            let destination_index = (destination_y * destination_width + destination_x) * 4;
             out.write_sample(destination_index, scale_sample(red, source_bit_depth));
             out.write_sample(destination_index + 1, scale_sample(green, source_bit_depth));
             out.write_sample(destination_index + 2, scale_sample(blue, source_bit_depth));
