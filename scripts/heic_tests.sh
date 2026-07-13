@@ -1220,6 +1220,7 @@ EOF
   local failures=()
 
   local input_file rel_path id ref_png rust_png ref_raw rust_raw ref_actual rust_actual validator_log
+  local validator_reason rust_reason ref_dim rust_dim
   for input_file in "${files[@]}"; do
     total=$((total + 1))
     rel_path="$(display_path "$input_file")"
@@ -1234,7 +1235,7 @@ EOF
     if "$LIBHEIF_DEC_BIN" --quiet "$input_file" "$ref_png" >/dev/null 2>"$validator_log"; then
       :
     else
-      local validator_reason expected_kind
+      local expected_kind
       validator_reason="$(failure_reason_from_log "$validator_log")"
       if expected_kind="$(expected_validator_failure_kind "$input_file" "$validator_reason")"; then
         local rust_log rust_status rust_category rust_reason
@@ -1283,6 +1284,21 @@ EOF
       echo "FAIL $rel_path (validator output file not found)" >> "$report_file"
       continue
     fi
+    if [[ ! -s "$ref_actual" ]]; then
+      failed=$((failed + 1))
+      validator_reason="$(failure_reason_from_log "$validator_log")"
+      failures+=("$rel_path :: validator produced empty output: ${validator_reason:-no stderr}")
+      echo "FAIL $rel_path (validator produced empty output: ${validator_reason:-no stderr})" >> "$report_file"
+      continue
+    fi
+    ref_dim="$(image_dim "$ref_actual" 2>>"$validator_log" || true)"
+    if [[ -z "$ref_dim" ]]; then
+      failed=$((failed + 1))
+      validator_reason="$(failure_reason_from_log "$validator_log")"
+      failures+=("$rel_path :: validator produced unreadable output: ${validator_reason:-no stderr}")
+      echo "FAIL $rel_path (validator produced unreadable output: ${validator_reason:-no stderr})" >> "$report_file"
+      continue
+    fi
 
     case "${input_file##*.}" in
       heif|HEIF) comparable_heif=$((comparable_heif + 1)) ;;
@@ -1321,11 +1337,23 @@ EOF
       echo "FAIL $rel_path (rust output file not found)" >> "$report_file"
       continue
     fi
+    if [[ ! -s "$rust_actual" ]]; then
+      failed=$((failed + 1))
+      rust_reason="$(failure_reason_from_log "$rust_log")"
+      failures+=("$rel_path :: rust decoder produced empty output: ${rust_reason:-no stderr}")
+      echo "FAIL $rel_path (rust decoder produced empty output: ${rust_reason:-no stderr})" >> "$report_file"
+      continue
+    fi
 
-    local ref_dim rust_dim
-    ref_dim="$(image_dim "$ref_actual" || true)"
-    rust_dim="$(image_dim "$rust_actual" || true)"
-    if [[ -z "$ref_dim" || -z "$rust_dim" || "$ref_dim" != "$rust_dim" ]]; then
+    rust_dim="$(image_dim "$rust_actual" 2>>"$rust_log" || true)"
+    if [[ -z "$rust_dim" ]]; then
+      failed=$((failed + 1))
+      rust_reason="$(failure_reason_from_log "$rust_log")"
+      failures+=("$rel_path :: rust decoder produced unreadable output: ${rust_reason:-no stderr}")
+      echo "FAIL $rel_path (rust decoder produced unreadable output: ${rust_reason:-no stderr})" >> "$report_file"
+      continue
+    fi
+    if [[ "$ref_dim" != "$rust_dim" ]]; then
       failed=$((failed + 1))
       failures+=("$rel_path :: dimension mismatch ref=$ref_dim rust=$rust_dim")
       echo "FAIL $rel_path (dimension mismatch ref=$ref_dim rust=$rust_dim)" >> "$report_file"

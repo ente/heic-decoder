@@ -49,6 +49,10 @@ jobs:
             # the expected-failure allowlists match against all come from this
             # checkout; bump the pin deliberately.
             LIBHEIF_PIN: 78638f4fe417e49f2b129f42ae691a4954560bbd
+            # Ubuntu 24.04's libpng 1.6.43 aborts writes for legacy ICC
+            # profiles in two pinned HEIC fixtures. Newer libpng reports those
+            # profile issues without leaving heif-dec's oracle PNG empty.
+            LIBPNG_PIN: 3061454d980de7d53608f594194cfac722721d2a
             # HEIC fixture corpus (media/heic/v1/files); bump to pick up
             # fixtures added upstream.
             ENTE_FIXTURES_PIN: 13c7cf83717140be20b32e6fbb178d5f15ea09ea
@@ -66,7 +70,27 @@ jobs:
                   sudo apt-get update
                   sudo apt-get install -y cmake pkg-config ffmpeg \
                       libde265-dev libx265-dev libaom-dev libdav1d-dev \
-                      libopenjp2-7-dev libjpeg-dev libpng-dev libbrotli-dev zlib1g-dev
+                      libopenjp2-7-dev libjpeg-dev libbrotli-dev zlib1g-dev
+
+            - name: Build pinned libpng for validator output
+              run: |
+                  git init --quiet .heic-test-assets/libpng
+                  git -C .heic-test-assets/libpng remote add origin https://github.com/pnggroup/libpng.git
+                  git -C .heic-test-assets/libpng fetch --quiet --depth 1 origin "$LIBPNG_PIN"
+                  git -C .heic-test-assets/libpng checkout --quiet FETCH_HEAD
+
+                  prefix="$PWD/.heic-test-assets/libpng-install"
+                  cmake -S .heic-test-assets/libpng -B .heic-test-assets/libpng-build \
+                      -DCMAKE_BUILD_TYPE=Release \
+                      -DCMAKE_INSTALL_PREFIX="$prefix" \
+                      -DPNG_SHARED=OFF \
+                      -DPNG_STATIC=ON \
+                      -DPNG_TESTS=OFF \
+                      -DPNG_TOOLS=OFF
+                  cmake --build .heic-test-assets/libpng-build --parallel
+                  cmake --install .heic-test-assets/libpng-build
+
+                  echo "LIBHEIF_CMAKE_ARGS=-DPNG_PNG_INCLUDE_DIR=$prefix/include -DPNG_LIBRARY=$prefix/lib/libpng16.a" >> "$GITHUB_ENV"
 
             - name: Fetch pinned libheif (validator source and corpus)
               run: |

@@ -29,9 +29,9 @@ into this repository.
 CI runs this on every pull request (`.github/workflows/tests.yml`): a `lint`
 job (`cargo fmt --check`, clippy, `cargo test`) and a `verify` job that
 performs the full default-corpus correctness pass, including stress-corpus
-generation. The workflow pins the Rust toolchain plus the libheif and ente
-test-fixtures commits it fetches; bump those pins in the workflow to move the
-CI toolchain, validator, or corpus forward deliberately.
+generation. The workflow pins the Rust toolchain plus the libpng, libheif, and
+ente test-fixtures commits it fetches; bump those pins in the workflow to move
+the CI toolchain, validator, or corpus forward deliberately.
 
 - pixel-for-pixel PNG comparison against an external `heif-dec` validator
 - pixel-for-pixel comparison of the `image` crate integration hook output
