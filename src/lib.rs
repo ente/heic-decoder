@@ -4221,23 +4221,7 @@ fn create_decoded_heic_grid_output(
     descriptor: &isobmff::HeicGridDescriptor,
     first_tile: &DecodedHeicImage,
 ) -> Result<DecodedHeicImage, DecodeHeicError> {
-    let tile_width = first_tile.width;
-    let tile_height = first_tile.height;
-    if tile_width == 0 || tile_height == 0 {
-        return Err(DecodeHeicError::InvalidDecodedFrame {
-            detail: format!("grid tile geometry must be non-zero, got {tile_width}x{tile_height}"),
-        });
-    }
-
-    // Mirrors libheif's floor-division coverage guard: each tile must be at
-    // least as large as output_width/columns and output_height/rows.
-    if tile_width < descriptor.output_width / u32::from(descriptor.columns)
-        || tile_height < descriptor.output_height / u32::from(descriptor.rows)
-    {
-        return Err(DecodeHeicError::InvalidDecodedFrame {
-            detail: "grid tiles do not cover the whole output image".to_string(),
-        });
-    }
+    validate_decoded_heic_grid_first_tile(descriptor, first_tile)?;
 
     let mut output = DecodedHeicImage {
         width: descriptor.output_width,
@@ -4500,11 +4484,25 @@ fn validate_decoded_heic_grid_first_tile(
         });
     }
 
+    // Mirrors libheif's floor-division coverage guard: the floor is
+    // deliberate, so this only rejects grossly undersized tiles, not every
+    // under-covering grid. Tiles at least floor(output / grid) wide/tall can
+    // still fall short of the canvas by up to `columns - 1` / `rows - 1`
+    // pixels at the right/bottom edges; libheif accepts such files and
+    // renders the uncovered strip as the converted zero-YUV gap color, which
+    // `heic_grid_tiles_cover_descriptor` detects and the gap-fill seeding
+    // reproduces.
     if tile_width < descriptor.output_width / u32::from(descriptor.columns)
         || tile_height < descriptor.output_height / u32::from(descriptor.rows)
     {
         return Err(DecodeHeicError::InvalidDecodedFrame {
-            detail: "grid tiles do not cover the whole output image".to_string(),
+            detail: format!(
+                "grid tile {tile_width}x{tile_height} is too small for a {}x{} grid with output {}x{}",
+                descriptor.columns,
+                descriptor.rows,
+                descriptor.output_width,
+                descriptor.output_height
+            ),
         });
     }
 
@@ -4913,9 +4911,11 @@ impl RgbaTransformPlan {
                     current_height = crop.height;
                 }
                 isobmff::PrimaryItemTransformProperty::Rotation(rotation) => {
+                    if is_identity_rotation(rotation.rotation_ccw_degrees) {
+                        continue;
+                    }
                     let rotation_ccw_degrees = rotation.rotation_ccw_degrees % 360;
                     match rotation_ccw_degrees {
-                        0 => continue,
                         90 | 180 | 270 => {}
                         _ => {
                             return Err(DecodeError::TransformGuard(
@@ -5317,10 +5317,10 @@ fn rgba_orientation_transform_from_primary_transforms(
         match *transform {
             isobmff::PrimaryItemTransformProperty::CleanAperture(_) => return Ok(None),
             isobmff::PrimaryItemTransformProperty::Rotation(rotation) => {
-                let rotation_ccw_degrees = rotation.rotation_ccw_degrees % 360;
-                if rotation_ccw_degrees == 0 {
+                if is_identity_rotation(rotation.rotation_ccw_degrees) {
                     continue;
                 }
+                let rotation_ccw_degrees = rotation.rotation_ccw_degrees % 360;
                 match rotation_ccw_degrees {
                     90 | 180 | 270 => {}
                     _ => {
@@ -5756,7 +5756,7 @@ fn apply_heic_grid_tile_transforms(
             // A 0-degree rotation is a no-op; some muxers write the property
             // redundantly.
             isobmff::PrimaryItemTransformProperty::Rotation(rotation)
-                if rotation.rotation_ccw_degrees == 0 => {}
+                if is_identity_rotation(rotation.rotation_ccw_degrees) => {}
             // Per-tile rotation/mirror would require plane-level transforms
             // before pasting (libheif applies them); silently skipping them
             // scrambles tile content, so reject loudly until implemented.
@@ -6736,12 +6736,20 @@ pub fn exif_orientation_hint_from_path(
     })
 }
 
+/// Whether an `irot` angle is a no-op rotation. The parser only produces
+/// 0/90/180/270, so only 0 matches in practice; the multiple-of-360 check
+/// keeps this robust should the domain ever widen. Some muxers write the
+/// property redundantly with angle 0.
+fn is_identity_rotation(rotation_ccw_degrees: u16) -> bool {
+    rotation_ccw_degrees.is_multiple_of(360)
+}
+
 fn transforms_include_orientation(transforms: &[isobmff::PrimaryItemTransformProperty]) -> bool {
     transforms.iter().any(|transform| {
         matches!(
             transform,
             isobmff::PrimaryItemTransformProperty::Rotation(rotation)
-                if rotation.rotation_ccw_degrees % 360 != 0
+                if !is_identity_rotation(rotation.rotation_ccw_degrees)
         ) || matches!(transform, isobmff::PrimaryItemTransformProperty::Mirror(_))
     })
 }
@@ -10116,7 +10124,7 @@ fn apply_primary_item_transforms_rgba<T: Copy + Default>(
                 current_pixels = next_pixels;
             }
             isobmff::PrimaryItemTransformProperty::Rotation(rotation) => {
-                if rotation.rotation_ccw_degrees % 360 == 0 {
+                if is_identity_rotation(rotation.rotation_ccw_degrees) {
                     continue;
                 }
                 let (next_width, next_height, next_pixels) = rotate_rgba_ccw(
