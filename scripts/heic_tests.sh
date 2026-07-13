@@ -479,6 +479,74 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 RS
 
+  cat > "$HELPER_DIR/src/bin/heif-image-hook-check.rs" <<'RS'
+use heic_decoder::image_integration::register_image_decoder_hooks;
+use heic_decoder::{DecodedRgbaPixels, decode_path_to_rgba};
+use image::{DynamicImage, ImageDecoder, ImageReader};
+use std::error::Error;
+use std::path::Path;
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 2 {
+        return Err("Usage: heif-image-hook-check <input.heic|.heif|.avif>".into());
+    }
+
+    let input = Path::new(&args[1]);
+    let direct = decode_path_to_rgba(input)?;
+
+    let _ = register_image_decoder_hooks();
+    let mut decoder = ImageReader::open(input)?.into_decoder()?;
+    let icc_profile = decoder.icc_profile()?;
+    if icc_profile != direct.icc_profile {
+        return Err("image hook ICC profile differs from direct decode".into());
+    }
+
+    let decoded = DynamicImage::from_decoder(decoder)?;
+    if decoded.width() != direct.width || decoded.height() != direct.height {
+        return Err(format!(
+            "image hook dimensions {}x{} differ from direct decode {}x{}",
+            decoded.width(),
+            decoded.height(),
+            direct.width,
+            direct.height
+        )
+        .into());
+    }
+
+    match (&direct.pixels, decoded) {
+        (DecodedRgbaPixels::U8(expected), DynamicImage::ImageRgba8(actual))
+            if expected == actual.as_raw() => {}
+        (DecodedRgbaPixels::U16(expected), DynamicImage::ImageRgba16(actual))
+            if expected == actual.as_raw() => {}
+        (DecodedRgbaPixels::U8(expected), DynamicImage::ImageRgba8(actual)) => {
+            return Err(format!(
+                "image hook RGBA8 pixel mismatch: direct_samples={} hook_samples={}",
+                expected.len(),
+                actual.as_raw().len()
+            )
+            .into());
+        }
+        (DecodedRgbaPixels::U16(expected), DynamicImage::ImageRgba16(actual)) => {
+            return Err(format!(
+                "image hook RGBA16 pixel mismatch: direct_samples={} hook_samples={}",
+                expected.len(),
+                actual.as_raw().len()
+            )
+            .into());
+        }
+        (DecodedRgbaPixels::U8(_), other) => {
+            return Err(format!("image hook color mismatch: expected RGBA8, got {:?}", other.color()).into());
+        }
+        (DecodedRgbaPixels::U16(_), other) => {
+            return Err(format!("image hook color mismatch: expected RGBA16, got {:?}", other.color()).into());
+        }
+    }
+
+    Ok(())
+}
+RS
+
   cat > "$HELPER_DIR/src/bin/heif-stream-concurrency-bench.rs" <<'RS'
 use heic_decoder::{DecodedRgbaImage, DecodedRgbaPixels, decode_path_to_rgba, decode_read_to_rgba};
 use std::error::Error;
@@ -789,6 +857,10 @@ decode_with_helper() {
   "$HELPER_BIN_DIR/heif-decode" --orientation preserve "$1" "$2"
 }
 
+check_with_image_hook_helper() {
+  "$HELPER_BIN_DIR/heif-image-hook-check" "$1"
+}
+
 failure_reason_from_log() {
   tr '\n' ' ' < "$1" | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//'
 }
@@ -980,6 +1052,7 @@ png_to_rgba() {
 # Prints a failure description and returns 1 on mismatch.
 compare_png_icc() {
   local ref_png="$1" rust_png="$2" prefix="$3"
+  local ref_label="${4:-validator}" rust_label="${5:-rust}"
   local ref_icc="$prefix.ref.icc" rust_icc="$prefix.rust.icc"
   local ref_status=0 rust_status=0
   "$HELPER_BIN_DIR/heif-png-icc" "$ref_png" "$ref_icc" 2>/dev/null || ref_status=$?
@@ -997,14 +1070,14 @@ compare_png_icc() {
     return 0
   fi
   if [[ "$rust_status" -eq 3 ]]; then
-    echo "icc profile missing: validator PNG embeds one, rust PNG has none"
+    echo "icc profile missing: $ref_label PNG embeds one, $rust_label PNG has none"
     return 1
   fi
   if ! cmp -s "$ref_icc" "$rust_icc"; then
     local ref_hash rust_hash
     ref_hash="$(shasum -a 256 "$ref_icc" | awk '{print $1}')"
     rust_hash="$(shasum -a 256 "$rust_icc" | awk '{print $1}')"
-    echo "icc profile mismatch ref=$ref_hash rust=$rust_hash"
+    echo "icc profile mismatch $ref_label=$ref_hash $rust_label=$rust_hash"
     return 1
   fi
   return 0
@@ -1140,12 +1213,14 @@ EOF
 
   echo "mode=$mode files=${#files[@]}" > "$report_file"
   local total=0 skipped=0 passed=0 failed=0
+  local image_hook_passed=0
   local expected_validator_failed=0 expected_validator_rust_decoded=0 expected_validator_rust_errors=0
   local expected_rust_failed=0
   local comparable_heif=0 comparable_heic=0 comparable_avif=0
   local failures=()
 
   local input_file rel_path id ref_png rust_png ref_raw rust_raw ref_actual rust_actual validator_log
+  local validator_reason rust_reason ref_dim rust_dim
   for input_file in "${files[@]}"; do
     total=$((total + 1))
     rel_path="$(display_path "$input_file")"
@@ -1160,7 +1235,7 @@ EOF
     if "$LIBHEIF_DEC_BIN" --quiet "$input_file" "$ref_png" >/dev/null 2>"$validator_log"; then
       :
     else
-      local validator_reason expected_kind
+      local expected_kind
       validator_reason="$(failure_reason_from_log "$validator_log")"
       if expected_kind="$(expected_validator_failure_kind "$input_file" "$validator_reason")"; then
         local rust_log rust_status rust_category rust_reason
@@ -1209,6 +1284,21 @@ EOF
       echo "FAIL $rel_path (validator output file not found)" >> "$report_file"
       continue
     fi
+    if [[ ! -s "$ref_actual" ]]; then
+      failed=$((failed + 1))
+      validator_reason="$(failure_reason_from_log "$validator_log")"
+      failures+=("$rel_path :: validator produced empty output: ${validator_reason:-no stderr}")
+      echo "FAIL $rel_path (validator produced empty output: ${validator_reason:-no stderr})" >> "$report_file"
+      continue
+    fi
+    ref_dim="$(image_dim "$ref_actual" 2>>"$validator_log" || true)"
+    if [[ -z "$ref_dim" ]]; then
+      failed=$((failed + 1))
+      validator_reason="$(failure_reason_from_log "$validator_log")"
+      failures+=("$rel_path :: validator produced unreadable output: ${validator_reason:-no stderr}")
+      echo "FAIL $rel_path (validator produced unreadable output: ${validator_reason:-no stderr})" >> "$report_file"
+      continue
+    fi
 
     case "${input_file##*.}" in
       heif|HEIF) comparable_heif=$((comparable_heif + 1)) ;;
@@ -1247,11 +1337,23 @@ EOF
       echo "FAIL $rel_path (rust output file not found)" >> "$report_file"
       continue
     fi
+    if [[ ! -s "$rust_actual" ]]; then
+      failed=$((failed + 1))
+      rust_reason="$(failure_reason_from_log "$rust_log")"
+      failures+=("$rel_path :: rust decoder produced empty output: ${rust_reason:-no stderr}")
+      echo "FAIL $rel_path (rust decoder produced empty output: ${rust_reason:-no stderr})" >> "$report_file"
+      continue
+    fi
 
-    local ref_dim rust_dim
-    ref_dim="$(image_dim "$ref_actual" || true)"
-    rust_dim="$(image_dim "$rust_actual" || true)"
-    if [[ -z "$ref_dim" || -z "$rust_dim" || "$ref_dim" != "$rust_dim" ]]; then
+    rust_dim="$(image_dim "$rust_actual" 2>>"$rust_log" || true)"
+    if [[ -z "$rust_dim" ]]; then
+      failed=$((failed + 1))
+      rust_reason="$(failure_reason_from_log "$rust_log")"
+      failures+=("$rel_path :: rust decoder produced unreadable output: ${rust_reason:-no stderr}")
+      echo "FAIL $rel_path (rust decoder produced unreadable output: ${rust_reason:-no stderr})" >> "$report_file"
+      continue
+    fi
+    if [[ "$ref_dim" != "$rust_dim" ]]; then
       failed=$((failed + 1))
       failures+=("$rel_path :: dimension mismatch ref=$ref_dim rust=$rust_dim")
       echo "FAIL $rel_path (dimension mismatch ref=$ref_dim rust=$rust_dim)" >> "$report_file"
@@ -1274,8 +1376,31 @@ EOF
     if cmp -s "$ref_raw" "$rust_raw"; then
       local icc_failure
       if icc_failure="$(compare_png_icc "$ref_actual" "$rust_actual" "$tmp_dir/$id")"; then
-        passed=$((passed + 1))
-        echo "PASS $rel_path" >> "$report_file"
+        # Deliberately run for EVERY passing file even though it re-decodes
+        # the file twice more (direct + hook): the image-crate hook is a
+        # separate decode path (lazy adapter, caller-buffer slices) whose
+        # parity with the direct decode is a hard correctness requirement,
+        # so it gets the same per-file coverage as the validator comparison.
+        # Do not sample or gate this to save CI time.
+        local hook_log hook_status
+        hook_log="$tmp_dir/$id.image-hook.check.stderr.log"
+        if check_with_image_hook_helper "$input_file" >/dev/null 2>"$hook_log"; then
+          hook_status=0
+        else
+          hook_status=$?
+        fi
+
+        if [[ "$hook_status" -ne 0 ]]; then
+          local hook_reason
+          hook_reason="$(failure_reason_from_log "$hook_log")"
+          failed=$((failed + 1))
+          failures+=("$rel_path :: image hook check failed status=$hook_status: ${hook_reason:-no stderr}")
+          echo "FAIL $rel_path (image hook check failed status=$hook_status)" >> "$report_file"
+        else
+          image_hook_passed=$((image_hook_passed + 1))
+          passed=$((passed + 1))
+          echo "PASS $rel_path (direct+image-hook)" >> "$report_file"
+        fi
       else
         failed=$((failed + 1))
         failures+=("$rel_path :: $icc_failure")
@@ -1296,7 +1421,7 @@ EOF
   done
 
   [[ "$keep_artifacts" -eq 1 ]] || rm -rf "$tmp_dir"
-  log verify "Summary: total=$total skipped=$skipped expected_validator_fail=$expected_validator_failed expected_validator_rust_decoded=$expected_validator_rust_decoded expected_validator_rust_errors=$expected_validator_rust_errors expected_rust_fail=$expected_rust_failed passed=$passed failed=$failed"
+  log verify "Summary: total=$total skipped=$skipped expected_validator_fail=$expected_validator_failed expected_validator_rust_decoded=$expected_validator_rust_decoded expected_validator_rust_errors=$expected_validator_rust_errors expected_rust_fail=$expected_rust_failed passed=$passed image_hook_passed=$image_hook_passed failed=$failed"
   log verify "Report: $report_file"
 
   if [[ "$failed" -gt 0 ]]; then

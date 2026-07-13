@@ -242,6 +242,14 @@ fn orientation_to_apply(path: &Path) -> Result<Option<u8>, heic_decoder::DecodeE
 
 Requires `image-integration` feature.
 
+Hook decodes buffer the entire encoded input in memory before decoding; in
+exchange, pixels decode straight into the buffer `image` hands over, without
+an additional full-frame owned RGBA allocation. Codec-native planes and a
+single grid-tile scratch buffer may still be allocated.
+`register_image_decoder_hooks()` caps the encoded input buffer at
+`DEFAULT_HOOK_MAX_INPUT_BYTES` (128 MiB); register with explicit guardrails
+to choose a different `max_input_bytes` bound (or `None` for unbounded).
+
 ### 1) Register hooks once at startup
 
 ```rust
@@ -279,15 +287,15 @@ let img = if let Some(orientation) = hint.orientation_to_apply() {
 };
 ```
 
-### 3) Direct adapter usage (optional)
-
-`HeifImageDecoder` constructors:
-
-- `from_bytes[_with_guardrails]`
-- `from_read[_with_guardrails]`
-- `from_bufread[_with_guardrails]`
-- `from_seekable[_with_guardrails]`
-- `from_path[_with_guardrails]`
+The registered hook decoder also exposes the primary item's EXIF block through
+the standard `ImageDecoder::exif_metadata`/`ImageDecoder::orientation` methods,
+so generic `image` code (`decoder.orientation()` +
+`DynamicImage::apply_orientation`) works without crate-specific helpers. EXIF
+orientation stays unapplied in the pixels; applying it remains the caller's
+choice. When the primary item carries `irot`/`imir` container transforms —
+which decode does bake into the pixels — `orientation()` reports
+`NoTransforms` (matching `ExifOrientationHint::should_apply_exif_orientation`)
+so callers do not rotate twice; `exif_metadata` still returns the full block.
 
 ## Conversion Helpers (image module)
 
