@@ -282,4 +282,34 @@ The final Rayon implementation passed the full differential verifier: 272
 files classified, 219 exact validator comparisons, 219 exact image-hook
 comparisons, and zero failures.
 
-Results for the remaining improvements will be added as they land.
+### Direct RGB8 output
+
+The decoder now exposes owned `decode_*_to_rgb8` APIs for coded HEIC/HEIF.
+They share the existing YCbCr conversion, crop, orientation, grid validation,
+and deterministic tile scheduling logic, but write three channels directly.
+The existing RGBA APIs and `image` hook remain unchanged. Calling RGB8 is an
+explicit request to discard auxiliary alpha. For high-bit-depth input, the
+conversion uses the same `(sample + 128) / 257` reduction as `image`'s final
+RGBA16-to-RGB8 conversion.
+
+The direct output was compared byte-for-byte with the existing image hook
+followed by `DynamicImage::into_rgb8`. All 57 coded HEIC/HEIF files that this
+decoder accepted from the 269-file local HEIF corpus matched exactly. This set
+included the six Ente fixtures and 45 generated stress images covering 8-,
+10-, and 12-bit decode paths. Unit tests also exercise transformed 8-bit and
+10-bit synthetic images.
+
+Alternating five-run release measurements included both decode and the final
+RGB conversion:
+
+| Fixture | RGBA then RGB median | Direct RGB median | Latency reduction | RGBA then RGB median peak RSS | Direct RGB median peak RSS | RSS reduction |
+|---|---:|---:|---:|---:|---:|---:|
+| 55.9 MP grid panorama | 0.55 s | 0.45 s | 18.2% | 449,150,976 B | 218,677,248 B | 51.3% |
+| Ordinary 8.6 MP HEIC | 0.12 s | 0.11 s | 8.3% | 101,695,488 B | 50,872,320 B | 50.0% |
+
+The timing resolution is coarse for the ordinary image, but the panorama
+result is stable across all five pairs. The much larger and consistent RSS
+reduction is the primary result: the decoder no longer keeps the final RGBA
+allocation alive while `image` allocates the replacement RGB buffer.
+
+Results for the NEON improvement will be added when it lands.
