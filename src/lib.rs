@@ -8606,6 +8606,41 @@ fn decoded_heic_to_rgba8_slice(
     auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
+    // The common coded-image case needs no coordinate remap or alpha
+    // composition. Route it through the shared contiguous converter so its
+    // architecture-specific 4:2:0 kernel can write the caller's buffer
+    // directly. Non-empty transform sequences still take the exact generic
+    // mapping path, including identity-valued properties and their guards.
+    if transforms.is_empty() && auxiliary_alpha.is_none() {
+        let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
+        if heic_storage_bit_depth(source_bit_depth) != 8 {
+            return Err(DecodeError::Unsupported(format!(
+                "HEIC storage is RGBA{}, not RGBA8",
+                heic_storage_bit_depth(source_bit_depth)
+            )));
+        }
+        RgbaTransformPlan::from_primary_transforms(decoded.width, decoded.height, transforms)?;
+        let expected = checked_rgba_sample_count(decoded.width, decoded.height)?;
+        if out.len() != expected {
+            return Err(DecodeError::TransformGuard(
+                TransformGuardError::RgbaSampleCountMismatch {
+                    stage: "HEIC direct transformed image adapter output",
+                    actual: out.len(),
+                    expected,
+                    width: decoded.width,
+                    height: decoded.height,
+                },
+            ));
+        }
+        return convert_heic_to_interleaved_rgb8_slice::<4>(
+            &decoded,
+            out,
+            scale_sample_to_u8,
+            "RGBA8",
+        )
+        .map_err(DecodeError::from);
+    }
+
     let mut output = SliceRgbaOutput(out);
     decoded_heic_to_rgba_output(
         decoded,
@@ -11786,6 +11821,33 @@ fn convert_heic_to_interleaved_rgb8_slice<const CHANNELS: usize>(
     );
     // 8-bit grayscale: libheif's Op_mono_to_RGB24_32 copies Y verbatim.
     let mono_verbatim = matches!(chroma, HeicChromaPlanes::Monochrome) && bit_depth == 8;
+
+    if let (
+        HeicChromaPlanes::Color {
+            u_samples,
+            v_samples,
+            chroma_width,
+            layout: HeicPixelLayout::Yuv420,
+        },
+        PreparedYcbcrTransform::MatrixFull { coeffs, .. },
+    ) = (&chroma, converter.transform)
+    {
+        heic_decoder::hevc::color_convert::convert_420_8bit_to_interleaved(
+            &decoded.y_plane.samples,
+            u_samples,
+            v_samples,
+            width,
+            height,
+            *chroma_width,
+            coeffs.r_cr_fp8,
+            coeffs.g_cb_fp8,
+            coeffs.g_cr_fp8,
+            coeffs.b_cb_fp8,
+            CHANNELS,
+            out,
+        );
+        return Ok(());
+    }
 
     for y in 0..height {
         let row_start = y * width;
