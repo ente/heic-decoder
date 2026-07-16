@@ -328,7 +328,7 @@ pub fn decode_residual(
 
     // Track coded_sub_block_flag for prevCsbf calculation
     // Max sub-block grid is 8x8 for 32x32 TU
-    let mut coded_sb_flags = [[false; 8]; 8];
+    let mut coded_sb_flags = 0u64;
 
     // Track whether the previously-processed subblock had any greater1_flag == 1
     // This is used for ctx_set derivation per H.265 section 9.3.4.2.6
@@ -342,14 +342,15 @@ pub fn decode_residual(
         // Calculate neighbor flags BEFORE decoding coded_sub_block_flag
         // These are used for both coded_sub_block_flag and sig_coeff_flag contexts
         // Per H.265: bit 0 = right neighbor coded, bit 1 = below neighbor coded
+        let sb_bit = sb_y as usize * 8 + sb_x as usize;
         let csbf_neighbors = {
             let right_coded = if (sb_x as usize + 1) < sb_width {
-                coded_sb_flags[sb_y as usize][sb_x as usize + 1]
+                coded_sb_flags & (1 << (sb_bit + 1)) != 0
             } else {
                 false
             };
             let below_coded = if (sb_y as usize + 1) < sb_width {
-                coded_sb_flags[sb_y as usize + 1][sb_x as usize]
+                coded_sb_flags & (1 << (sb_bit + 8)) != 0
             } else {
                 false
             };
@@ -370,7 +371,7 @@ pub fn decode_residual(
 
         // Track coded sub-block flag
         if sb_coded {
-            coded_sb_flags[sb_y as usize][sb_x as usize] = true;
+            coded_sb_flags |= 1 << sb_bit;
         }
 
         // prevCsbf for sig_coeff_flag context
@@ -390,8 +391,7 @@ pub fn decode_residual(
         };
 
         let mut coeff_values = [0i16; 16];
-        let mut coeff_flags = [false; 16];
-        let mut num_coeffs = 0u8;
+        let mut coeff_flags = 0u16;
         let mut can_infer_dc = infer_sb_dc_sig;
 
         // Determine the last position to check
@@ -399,9 +399,8 @@ pub fn decode_residual(
         // For other sub-blocks: start from position 15
         let last_coeff = if sb_idx == last_sb_idx {
             // Set the known last significant coefficient (no need to decode sig_coeff_flag)
-            coeff_flags[start_pos as usize] = true;
+            coeff_flags |= 1 << start_pos;
             coeff_values[start_pos as usize] = 1;
-            num_coeffs = 1;
             can_infer_dc = false; // Can't infer DC if we have other coeffs
             // Then check positions from start_pos-1 down to 1
             start_pos.saturating_sub(1)
@@ -436,9 +435,8 @@ pub fn decode_residual(
                 );
             }
             if sig {
-                coeff_flags[n as usize] = true;
+                coeff_flags |= 1 << n;
                 coeff_values[n as usize] = 1;
-                num_coeffs += 1;
                 can_infer_dc = false; // Found a coefficient, can't infer DC
             }
         }
@@ -448,9 +446,8 @@ pub fn decode_residual(
         // DC is inferred to be significant (otherwise the sub-block would be all zeros)
         if start_pos > 0 {
             if can_infer_dc {
-                coeff_flags[0] = true;
+                coeff_flags |= 1;
                 coeff_values[0] = 1;
-                num_coeffs += 1;
                 if rc_trace {
                     rc_eprintln!("{rcp}_SIG n=0 DC_INFERRED");
                 }
@@ -480,13 +477,13 @@ pub fn decode_residual(
                     );
                 }
                 if sig {
-                    coeff_flags[0] = true;
+                    coeff_flags |= 1;
                     coeff_values[0] = 1;
-                    num_coeffs += 1;
                 }
             }
         }
 
+        let num_coeffs = coeff_flags.count_ones() as u8;
         if num_coeffs == 0 {
             continue;
         }
@@ -517,21 +514,20 @@ pub fn decode_residual(
 
         // Decode greater-1 flags (up to 8)
         let mut first_g1_idx: Option<u8> = None;
-        let mut g1_positions = [false; 16]; // Track which positions have g1=1
         let max_g1 = (num_coeffs as usize).min(8);
         let mut g1_count = 0;
 
         // Track which coefficients need remaining level decoding
-        let mut needs_remaining = [false; 16];
+        let mut needs_remaining = 0u16;
 
-        for n in (0..=start_pos).rev() {
-            if !coeff_flags[n as usize] {
-                continue;
-            }
+        let mut significant = coeff_flags;
+        while significant != 0 {
+            let n = (u16::BITS - 1 - significant.leading_zeros()) as u8;
+            significant &= !(1 << n);
 
             if g1_count >= max_g1 {
                 // Beyond first 8: base=1, always needs remaining for values > 1
-                needs_remaining[n as usize] = true;
+                needs_remaining |= 1 << n;
                 continue;
             }
 
@@ -570,13 +566,12 @@ pub fn decode_residual(
 
             if g1 {
                 coeff_values[n as usize] = 2;
-                g1_positions[n as usize] = true;
                 this_subblock_had_gt1 = true; // Track for next subblock's ctx_set
                 if first_g1_idx.is_none() {
                     first_g1_idx = Some(n);
                 } else {
                     // Non-first g1=1: base=2, needs remaining for values > 2
-                    needs_remaining[n as usize] = true;
+                    needs_remaining |= 1 << n;
                 }
             }
             g1_count += 1;
@@ -599,23 +594,14 @@ pub fn decode_residual(
             }
             if g2 {
                 coeff_values[g1_idx as usize] = 3;
-                needs_remaining[g1_idx as usize] = true;
+                needs_remaining |= 1 << g1_idx;
             }
         }
 
-        // Find first and last significant positions in this sub-block
-        let mut first_sig_pos = None;
-        let mut last_sig_pos = None;
-        for n in 0..=start_pos {
-            if coeff_flags[n as usize] {
-                if first_sig_pos.is_none() {
-                    first_sig_pos = Some(n);
-                }
-                last_sig_pos = Some(n);
-            }
-        }
-        let first_sig_pos = first_sig_pos.unwrap_or(0);
-        let last_sig_pos = last_sig_pos.unwrap_or(start_pos);
+        // The flags are non-zero here, so bit scans directly recover the
+        // first and last significant positions in scan order.
+        let first_sig_pos = coeff_flags.trailing_zeros() as u8;
+        let last_sig_pos = (u16::BITS - 1 - coeff_flags.leading_zeros()) as u8;
 
         // Determine if sign is hidden for this sub-block
         // Per H.265 9.3.4.3: sign is hidden if:
@@ -630,16 +616,6 @@ pub fn decode_residual(
         // Following libde265's approach: decode signs in coefficient order (high scan pos to low)
         // The LAST coefficient (at first_sig_pos) has its sign hidden when sign_hidden=true
         //
-        // Build list of significant positions in reverse scan order (high to low)
-        let mut sig_positions = [0u8; 16];
-        let mut n_sig = 0usize;
-        for n in (0..=start_pos).rev() {
-            if coeff_flags[n as usize] {
-                sig_positions[n_sig] = n;
-                n_sig += 1;
-            }
-        }
-
         // Decode signs following libde265 order:
         // - Decode signs for coefficients 0 to n_sig-2 (high scan pos to low)
         // - For coefficient at n_sig-1 (lowest scan pos, first in scan order):
@@ -648,25 +624,32 @@ pub fn decode_residual(
         //
         // This matches the H.265 spec and libde265: the FIRST coefficient in
         // scanning order (lowest scan position) has its sign hidden.
-        let mut coeff_signs = [0u8; 16];
-        for (i, sign) in coeff_signs[..n_sig.saturating_sub(1)]
-            .iter_mut()
-            .enumerate()
-        {
-            *sign = cabac.decode_bypass()?;
-            let _ = i;
-        }
-        if n_sig > 0 && !sign_hidden {
-            coeff_signs[n_sig - 1] = cabac.decode_bypass()?;
+        let mut coeff_signs = 0u16;
+        let mut significant = coeff_flags;
+        while significant != 0 {
+            let n = (u16::BITS - 1 - significant.leading_zeros()) as u8;
+            significant &= !(1 << n);
+            if (n != first_sig_pos || !sign_hidden) && cabac.decode_bypass()? != 0 {
+                coeff_signs |= 1 << n;
+            }
         }
         if rc_trace {
             let (range, _, _) = cabac.get_state_extended();
             let (byte_pos, _, _) = cabac.get_position();
+            let mut signs = [0u8; 16];
+            let mut significant = coeff_flags;
+            let mut count = 0;
+            while significant != 0 {
+                let n = (u16::BITS - 1 - significant.leading_zeros()) as u8;
+                significant &= !(1 << n);
+                signs[count] = u8::from(coeff_signs & (1 << n) != 0);
+                count += 1;
+            }
             rc_eprintln!(
                 "{rcp}_SIGNS n_sig={} hidden={} signs={:?} range={} byte={}",
-                n_sig,
+                num_coeffs,
                 sign_hidden,
-                &coeff_signs[..n_sig],
+                &signs[..num_coeffs as usize],
                 range,
                 byte_pos
             );
@@ -677,62 +660,65 @@ pub fn decode_residual(
         let mut rice_param = 0u8;
 
         // Decode remaining levels for coefficients that need it
-        for n in (0..=start_pos).rev() {
-            if coeff_flags[n as usize] && needs_remaining[n as usize] {
-                let base = coeff_values[n as usize];
-                let (remaining, new_rice) =
-                    decode_coeff_abs_level_remaining(cabac, rice_param, base)?;
-                if rc_trace {
-                    let (range, _, _) = cabac.get_state_extended();
-                    let (byte_pos, _, _) = cabac.get_position();
-                    rc_eprintln!(
-                        "{rcp}_REM n={} base={} rice={} rem={} final={} range={} byte={}",
-                        n,
-                        base,
-                        rice_param,
-                        remaining,
-                        base + remaining,
-                        range,
-                        byte_pos
-                    );
-                }
-                rice_param = new_rice;
-                coeff_values[n as usize] = base + remaining;
+        let mut remaining_flags = needs_remaining;
+        while remaining_flags != 0 {
+            let n = (u16::BITS - 1 - remaining_flags.leading_zeros()) as u8;
+            remaining_flags &= !(1 << n);
+            let base = coeff_values[n as usize];
+            let (remaining, new_rice) = decode_coeff_abs_level_remaining(cabac, rice_param, base)?;
+            if rc_trace {
+                let (range, _, _) = cabac.get_state_extended();
+                let (byte_pos, _, _) = cabac.get_position();
+                rc_eprintln!(
+                    "{rcp}_REM n={} base={} rice={} rem={} final={} range={} byte={}",
+                    n,
+                    base,
+                    rice_param,
+                    remaining,
+                    base + remaining,
+                    range,
+                    byte_pos
+                );
             }
+            rice_param = new_rice;
+            coeff_values[n as usize] = base + remaining;
         }
 
         // Apply signs and compute sum for parity inference
         // At this point coeff_values[] are all positive (absolute values)
         let mut sum_abs_level = 0i32;
 
-        for (i, &pos) in sig_positions[..n_sig].iter().enumerate() {
-            let pos = pos as usize;
-            if coeff_signs[i] != 0 {
-                coeff_values[pos] = -coeff_values[pos];
+        let mut significant = coeff_flags;
+        while significant != 0 {
+            let pos = (u16::BITS - 1 - significant.leading_zeros()) as u8;
+            significant &= !(1 << pos);
+            if coeff_signs & (1 << pos) != 0 {
+                coeff_values[pos as usize] = -coeff_values[pos as usize];
             }
-            sum_abs_level += coeff_values[pos] as i32;
+            sum_abs_level += coeff_values[pos as usize] as i32;
 
-            // Infer hidden sign at the last coefficient (first in scan order)
-            // Per H.265: if sum of signed coefficients is odd, flip the hidden sign
-            if i == n_sig - 1 && sign_hidden && (sum_abs_level & 1) != 0 {
-                coeff_values[pos] = -coeff_values[pos];
+            // Infer the hidden sign at the first coefficient in scan order.
+            if pos == first_sig_pos && sign_hidden && (sum_abs_level & 1) != 0 {
+                coeff_values[pos as usize] = -coeff_values[pos as usize];
             }
         }
 
         // Store coefficients in buffer
-        for (n, &(px, py)) in scan_pos.iter().enumerate() {
-            if coeff_flags[n] {
-                let x = sb_x as usize * 4 + px as usize;
-                let y = sb_y as usize * 4 + py as usize;
+        let mut significant = coeff_flags;
+        while significant != 0 {
+            let n = significant.trailing_zeros() as usize;
+            significant &= significant - 1;
+            let (px, py) = scan_pos[n];
+            let x = sb_x as usize * 4 + px as usize;
+            let y = sb_y as usize * 4 + py as usize;
 
-                buffer.set(x, y, coeff_values[n]);
+            buffer.set(x, y, coeff_values[n]);
 
-                // Track large coefficients (indicates CABAC desync)
-                #[cfg(feature = "decoder-tracing")]
-                if coeff_values[n].abs() > 500 {
-                    let (byte_pos, _, _) = cabac.get_position();
-                    debug::track_large_coeff(byte_pos);
-                }
+            // Track large coefficients (indicates CABAC desync)
+            #[cfg(feature = "decoder-tracing")]
+            if coeff_values[n].abs() > 500 {
+                let (byte_pos, _, _) = cabac.get_position();
+                debug::track_large_coeff(byte_pos);
             }
         }
 
