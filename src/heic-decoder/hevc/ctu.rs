@@ -8,10 +8,11 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+#[cfg(feature = "decoder-tracing")]
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// Set to true to enable verbose debug tracing to stderr
-const DEBUG_TRACE: bool = false;
+/// Verbose decoder tracing is available only in explicitly opted-in builds.
+const DEBUG_TRACE: bool = cfg!(feature = "decoder-tracing");
 
 /// Debug print macro gated behind DEBUG_TRACE const
 macro_rules! debug_trace {
@@ -43,11 +44,14 @@ use archmage::incant;
 type Result<T> = core::result::Result<T, HevcError>;
 
 /// Global SE counter for syntax element tracing
+#[cfg(feature = "decoder-tracing")]
 pub static SE_COUNTER: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "decoder-tracing")]
 pub const SE_TRACE_LIMIT: u32 = 0;
 
 /// Log a syntax element decode for differential testing.
-/// Set SE_TRACE_LIMIT > 0 to enable tracing.
+/// Increase `SE_TRACE_LIMIT` to include syntax-element details in tracing.
+#[cfg(feature = "decoder-tracing")]
 #[allow(clippy::absurd_extreme_comparisons)]
 fn se_trace(name: &str, val: i64, cabac: &CabacDecoder) {
     let num = SE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -64,6 +68,10 @@ fn se_trace(name: &str, val: i64, cabac: &CabacDecoder) {
     }
     let _ = (name, val, cabac);
 }
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[inline(always)]
+fn se_trace(_name: &str, _val: i64, _cabac: &CabacDecoder) {}
 
 /// Chroma QP mapping table (H.265 Table 8-10)
 /// Maps qPi (0-57) to QpC for 8-bit video
@@ -287,7 +295,7 @@ impl<'a> SliceContext<'a> {
 
     /// Decode all CTUs in the slice
     pub fn decode_slice(&mut self, frame: &mut DecodedFrame) -> Result<()> {
-        // Initialize CABAC tracker for debugging
+        #[cfg(feature = "decoder-tracing")]
         debug::init_tracker();
 
         let ctb_size = self.sps.ctb_size();
@@ -322,22 +330,23 @@ impl<'a> SliceContext<'a> {
             let x_ctb = self.ctb_x * ctb_size;
             let y_ctb = self.ctb_y * ctb_size;
 
-            // Track CTU position for debugging
-            let (byte_pos, _, _) = self.cabac.get_position();
-            debug::track_ctu_start(ctu_count, byte_pos);
+            #[cfg(feature = "decoder-tracing")]
+            {
+                let (byte_pos, _, _) = self.cabac.get_position();
+                debug::track_ctu_start(ctu_count, byte_pos);
 
-            // DEBUG: Print CTU state periodically
-            if ctu_count.is_multiple_of(50) || ctu_count <= 3 {
-                let (range, offset) = self.cabac.get_state();
-                debug_trace!(
-                    "DEBUG: CTU {} byte={} cabac=({},{}) x={} y={}",
-                    ctu_count,
-                    byte_pos,
-                    range,
-                    offset,
-                    self.ctb_x,
-                    self.ctb_y
-                );
+                if ctu_count.is_multiple_of(50) || ctu_count <= 3 {
+                    let (range, offset) = self.cabac.get_state();
+                    debug_trace!(
+                        "DEBUG: CTU {} byte={} cabac=({},{}) x={} y={}",
+                        ctu_count,
+                        byte_pos,
+                        range,
+                        offset,
+                        self.ctb_x,
+                        self.ctb_y
+                    );
+                }
             }
             // Enable debug for CTU 1 (where first large coefficient occurs)
             self.debug_ctu = ctu_count == 1;
@@ -396,6 +405,7 @@ impl<'a> SliceContext<'a> {
             }
         }
 
+        #[cfg(feature = "decoder-tracing")]
         if DEBUG_TRACE {
             debug::print_tracker_summary();
         }
@@ -802,6 +812,7 @@ impl<'a> SliceContext<'a> {
             // At minimum size, can be 2Nx2N or NxN
             let pm = self.decode_part_mode(pred_mode, log2_cb_size)?;
             // Debug: log part_mode for first CTU (and count NxN)
+            #[cfg(feature = "decoder-tracing")]
             if pm == PartMode::PartNxN {
                 static NXN_COUNT: core::sync::atomic::AtomicU32 =
                     core::sync::atomic::AtomicU32::new(0);

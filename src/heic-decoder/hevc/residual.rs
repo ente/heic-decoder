@@ -197,6 +197,7 @@ impl CoeffBuffer {
 
 /// Decode residual coefficients for a transform unit
 /// Debug counter to identify specific TU calls
+#[cfg(feature = "decoder-tracing")]
 pub static DEBUG_RESIDUAL_COUNTER: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
@@ -213,10 +214,11 @@ pub fn decode_residual(
     _x0: u32,
     _y0: u32,
 ) -> Result<(CoeffBuffer, bool)> {
+    #[cfg(feature = "decoder-tracing")]
     DEBUG_RESIDUAL_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
     // SE trace for differential testing against libde265
-    #[cfg(feature = "std")]
+    #[cfg(feature = "decoder-tracing")]
     {
         let se_num = crate::heic_decoder::hevc::ctu::SE_COUNTER
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -726,6 +728,7 @@ pub fn decode_residual(
                 buffer.set(x, y, coeff_values[n]);
 
                 // Track large coefficients (indicates CABAC desync)
+                #[cfg(feature = "decoder-tracing")]
                 if coeff_values[n].abs() > 500 {
                     let (byte_pos, _, _) = cabac.get_position();
                     debug::track_large_coeff(byte_pos);

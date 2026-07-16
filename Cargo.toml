@@ -9,6 +9,7 @@ repository = "https://github.com/ente-io/heic-decoder"
 
 [features]
 default = ["std"]
+decoder-tracing = ["std"]
 image-integration = ["dep:image"]
 std = ["archmage/std"]
 

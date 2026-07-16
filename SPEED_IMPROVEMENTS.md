@@ -222,6 +222,35 @@ large grids, and malformed-input fallback behavior.
 
 ## Implementation results
 
-This section will be updated with isolated A/B measurements and commit hashes
-as the four improvements land.
+### Production diagnostics
 
+Normal builds no longer contain syntax-element, residual, or NxN atomic
+counters, CABAC-position collection, per-CTU mutex/vector tracking, or
+large-coefficient tracking. The diagnostics remain available through the
+opt-in `decoder-tracing` feature.
+
+The repository's full decode benchmark was run before and after with 12 files
+and five release runs per file. Raw summed Rust averages moved from 19.408 s to
+18.816 s (3.1% lower), but the external validator moved from 19.942 s to
+19.220 s (3.6% lower) during the same sequential runs. The normalized
+Rust/validator ratio therefore changed from 0.973x to 0.979x, showing that the
+raw improvement was ambient machine variation rather than a defensible patch
+effect.
+
+A tighter alternating comparison used independently built pre-change and
+post-change release binaries:
+
+| Fixture | Pre-change median | Post-change median | Difference |
+|---|---:|---:|---:|
+| 55.9 MP grid panorama | 9.31 s | 9.29 s | -0.2% |
+| Ordinary 8.6 MP HEIC | 1.65 s | 1.67 s | +1.2% |
+
+The corresponding averages were 9.392 s versus 9.334 s for the panorama and
+1.658 s versus 1.670 s for the ordinary image. These differences are within
+run-to-run noise. Both binaries produced identical output SHA-256 hashes.
+
+Conclusion: compiling diagnostics out is worthwhile production cleanup and
+removes global synchronization and unused allocations, but it did not produce
+a measurable end-to-end speedup on this Mac benchmark.
+
+Results for the remaining improvements will be added as they land.
