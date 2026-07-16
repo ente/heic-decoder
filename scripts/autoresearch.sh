@@ -470,7 +470,20 @@ check_no_native_links() {
     tail -n 80 "$error_log" >&2 || true
     return 1
   fi
-  if ! linked="$(jq -r '.packages[] | select(.links != null) | "\(.name) \(.version) links=\(.links)"' "$metadata")"; then
+  # rayon-core deliberately uses `links = "rayon-core"` without linking any
+  # native code; its no-op build script only makes Cargo enforce one runtime
+  # instance. Keep that exact crates.io package as the sole audited exception.
+  # Any other package declaring `links` remains forbidden.
+  if ! linked="$(jq -r '
+      .packages[]
+      | select(.links != null)
+      | select(
+          .name != "rayon-core"
+          or .links != "rayon-core"
+          or .source != "registry+https://github.com/rust-lang/crates.io-index"
+        )
+      | "\(.name) \(.version) links=\(.links)"
+    ' "$metadata")"; then
     log gate "Could not inspect Cargo metadata for native linkage." >&2
     return 1
   fi

@@ -88,7 +88,8 @@ For each candidate the controller:
 
 1. rejects changes outside `src/**/*.rs`, `Cargo.toml`, and `Cargo.lock`;
 2. runs diff checks, `cargo fmt --check`, and the Rust test suite;
-3. rejects dependency graphs containing native `links` packages;
+3. rejects dependency graphs containing native `links` packages (with a narrow
+   exception for crates.io `rayon-core`, whose marker does not link native code);
 4. builds a fresh candidate benchmark executable in trusted external state;
 5. compares it against the saved champion with multiple interleaved samples on
    six large real-camera inputs;
