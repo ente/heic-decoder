@@ -4,11 +4,15 @@
 //! - 4x4 Inverse DST (for intra 4x4 luma)
 //! - 4x4, 8x8, 16x16, 32x32 Inverse DCT
 //!
-//! The 8x8 and 16x16 IDCTs dispatch to AVX2 SIMD via `incant!` when available.
+//! The 8x8, 16x16, and 32x32 IDCTs dispatch to AVX2 when available. Flat and
+//! scaling-list dequantization also use exact NEON kernels on AArch64.
 
 // Transform and inverse quantization for HEVC
+#[cfg(target_arch = "aarch64")]
+use super::transform_simd::{dequantize_neon, dequantize_scaled_neon};
 use super::transform_simd::{
-    dequantize_scalar, idct8_scalar, idct16_scalar, idct32_scalar, idst4_scalar,
+    dequantize_scalar, dequantize_scaled_scalar, idct8_scalar, idct16_scalar, idct32_scalar,
+    idst4_scalar,
 };
 #[cfg(target_arch = "x86_64")]
 use super::transform_simd::{dequantize_v3, idct8_v3, idct16_v3, idct32_v3, idst4_v3};
@@ -669,7 +673,7 @@ pub fn dequantize(coeffs: &mut [i16], params: DequantParams) {
     let add = if shift > 0 { 1 << (shift - 1) } else { 0 };
 
     if shift >= 0 && combined_scale <= 32767 {
-        incant!(dequantize(coeffs, combined_scale, shift, add), [v3]);
+        incant!(dequantize(coeffs, combined_scale, shift, add), [v3, neon]);
     } else if shift >= 0 {
         // Large scale (high QP at high bit depth): coef * scale overflows
         // i32, evaluate in i64 (mirrors libde265's int64 fallback).
@@ -702,14 +706,19 @@ pub fn dequantize_scaled(coeffs: &mut [i16], params: DequantParams, scaling_matr
     let add = if bd_shift > 0 { 1 << (bd_shift - 1) } else { 0 };
 
     if bd_shift >= 0 {
-        for (i, coef) in coeffs.iter_mut().enumerate() {
-            let m = scaling_matrix.get(i).copied().unwrap_or(16) as i64;
-            // i64: m (up to 255) * levelScale (72) << qp_per overflows i32
-            // already at moderate QPs (libde265 uses int64 here too).
-            let value =
-                (*coef as i64 * m * level_scale as i64 * (1i64 << qp_per) + add as i64) >> bd_shift;
-            *coef = value.clamp(-32768, 32767) as i16;
-        }
+        // i64: m (up to 255) * levelScale (72) << qp_per overflows i32
+        // already at moderate QPs (libde265 uses int64 here too).
+        let combined_scale = level_scale * (1 << qp_per);
+        incant!(
+            dequantize_scaled(
+                coeffs,
+                scaling_matrix,
+                combined_scale,
+                bd_shift,
+                i64::from(add)
+            ),
+            [neon]
+        );
     } else {
         let neg_shift = -bd_shift;
         for (i, coef) in coeffs.iter_mut().enumerate() {

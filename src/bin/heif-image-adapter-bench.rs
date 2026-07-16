@@ -1,5 +1,5 @@
 use heic_decoder::image_integration::register_image_decoder_hooks_with_guardrails;
-use heic_decoder::{DecodeGuardrails, DecodedRgbaPixels, decode_path_to_rgba};
+use heic_decoder::{DecodeGuardrails, DecodedRgbaPixels, decode_path_to_rgb8, decode_path_to_rgba};
 use image::{DynamicImage, ImageDecoder, ImageReader, Limits};
 use std::env;
 use std::error::Error;
@@ -9,7 +9,10 @@ use std::path::Path;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DecodeMode {
     Direct,
+    Rgb,
     Adapter,
+    AdapterRgb,
+    VerifyRgb,
 }
 
 #[derive(Debug)]
@@ -24,7 +27,7 @@ impl Display for CliError {
 impl Error for CliError {}
 
 fn usage() -> &'static str {
-    "Usage: heif-image-adapter-bench <direct|adapter> <input.heic|.heif|.avif>"
+    "Usage: heif-image-adapter-bench <direct|rgb|adapter|adapter-rgb|verify-rgb> <input.heic|.heif|.avif>"
 }
 
 fn parse_args() -> Result<(DecodeMode, String), CliError> {
@@ -35,7 +38,10 @@ fn parse_args() -> Result<(DecodeMode, String), CliError> {
 
     let mode = match args[1].as_str() {
         "direct" => DecodeMode::Direct,
+        "rgb" => DecodeMode::Rgb,
         "adapter" => DecodeMode::Adapter,
+        "adapter-rgb" => DecodeMode::AdapterRgb,
+        "verify-rgb" => DecodeMode::VerifyRgb,
         other => return Err(CliError(format!("Unsupported mode '{other}'. {}", usage()))),
     };
 
@@ -74,7 +80,7 @@ fn bench_direct(input_path: &Path) -> Result<u64, Box<dyn Error>> {
     Ok(((decoded.width as u64) << 32) ^ (decoded.height as u64) ^ checksum)
 }
 
-fn bench_adapter(input_path: &Path) -> Result<u64, Box<dyn Error>> {
+fn decode_adapter(input_path: &Path) -> Result<DynamicImage, Box<dyn Error>> {
     let _ = register_image_decoder_hooks_with_guardrails(DecodeGuardrails {
         max_input_bytes: Some(128 * 1024 * 1024),
         max_pixels: Some(256_000_000),
@@ -89,7 +95,11 @@ fn bench_adapter(input_path: &Path) -> Result<u64, Box<dyn Error>> {
     let mut limits = Limits::default();
     limits.reserve(decoder.total_bytes())?;
     decoder.set_limits(limits)?;
-    let decoded = DynamicImage::from_decoder(decoder)?;
+    Ok(DynamicImage::from_decoder(decoder)?)
+}
+
+fn bench_adapter(input_path: &Path) -> Result<u64, Box<dyn Error>> {
+    let decoded = decode_adapter(input_path)?;
     let (width, height) = (decoded.width(), decoded.height());
     let checksum = match decoded {
         DynamicImage::ImageRgba8(buffer) => small_checksum(buffer.as_raw()),
@@ -105,13 +115,48 @@ fn bench_adapter(input_path: &Path) -> Result<u64, Box<dyn Error>> {
     Ok(((width as u64) << 32) ^ (height as u64) ^ checksum)
 }
 
+fn bench_rgb(input_path: &Path) -> Result<u64, Box<dyn Error>> {
+    let decoded = decode_path_to_rgb8(input_path)?;
+    Ok(((decoded.width as u64) << 32) ^ (decoded.height as u64) ^ small_checksum(&decoded.pixels))
+}
+
+fn decode_adapter_rgb(input_path: &Path) -> Result<image::RgbImage, Box<dyn Error>> {
+    Ok(decode_adapter(input_path)?.into_rgb8())
+}
+
+fn bench_adapter_rgb(input_path: &Path) -> Result<u64, Box<dyn Error>> {
+    let decoded = decode_adapter_rgb(input_path)?;
+    Ok(((decoded.width() as u64) << 32)
+        ^ (decoded.height() as u64)
+        ^ small_checksum(decoded.as_raw()))
+}
+
+fn verify_rgb(input_path: &Path) -> Result<u64, Box<dyn Error>> {
+    let direct = decode_path_to_rgb8(input_path)?;
+    let adapter = decode_adapter_rgb(input_path)?;
+    if direct.width != adapter.width()
+        || direct.height != adapter.height()
+        || direct.pixels != *adapter.as_raw()
+    {
+        return Err(Box::new(CliError(format!(
+            "Direct RGB8 output does not match adapter RGB8 output for {}",
+            input_path.display()
+        ))));
+    }
+
+    Ok(((direct.width as u64) << 32) ^ (direct.height as u64) ^ small_checksum(&direct.pixels))
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let (mode, input_path) = parse_args()?;
     let input_path = Path::new(&input_path);
 
     let checksum = match mode {
         DecodeMode::Direct => bench_direct(input_path)?,
+        DecodeMode::Rgb => bench_rgb(input_path)?,
         DecodeMode::Adapter => bench_adapter(input_path)?,
+        DecodeMode::AdapterRgb => bench_adapter_rgb(input_path)?,
+        DecodeMode::VerifyRgb => verify_rgb(input_path)?,
     };
 
     println!("{checksum}");

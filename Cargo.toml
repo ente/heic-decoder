@@ -8,8 +8,10 @@ license-file = "LICENSE"
 repository = "https://github.com/ente-io/heic-decoder"
 
 [features]
-default = ["std"]
+default = ["std", "parallel-grid"]
+decoder-tracing = ["std"]
 image-integration = ["dep:image"]
+parallel-grid = ["std", "dep:rayon"]
 std = ["archmage/std"]
 
 [[bin]]
@@ -28,6 +30,7 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 libc = "0.2"
 moxcms = "0.8.1"
 png = "0.18"
+rayon = { version = "1.10", optional = true }
 rav1d = { git = "https://github.com/ente-io/rav1d.git", branch = "arm32_stable", default-features = false, features = [
     "bitdepth_8",
     "bitdepth_16",

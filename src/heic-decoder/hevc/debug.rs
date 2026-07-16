@@ -255,17 +255,17 @@ impl CabacTracker {
 }
 
 /// Global tracker instance
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "decoder-tracing"))]
 static TRACKER: std::sync::Mutex<Option<CabacTracker>> = std::sync::Mutex::new(None);
 
 /// Initialize global tracker
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "decoder-tracing"))]
 pub fn init_tracker() {
     *TRACKER.lock().unwrap() = Some(CabacTracker::new());
 }
 
 /// Record CTU start in global tracker
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "decoder-tracing"))]
 pub fn track_ctu_start(ctu_idx: u32, byte_pos: usize) {
     if let Some(tracker) = TRACKER.lock().unwrap().as_mut() {
         tracker.record_ctu_start(ctu_idx, byte_pos);
@@ -273,7 +273,7 @@ pub fn track_ctu_start(ctu_idx: u32, byte_pos: usize) {
 }
 
 /// Record large coefficient in global tracker
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "decoder-tracing"))]
 pub fn track_large_coeff(byte_pos: usize) {
     if let Some(tracker) = TRACKER.lock().unwrap().as_mut() {
         tracker.record_large_coeff(byte_pos);
@@ -281,24 +281,28 @@ pub fn track_large_coeff(byte_pos: usize) {
 }
 
 /// Print tracker summary
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "decoder-tracing"))]
 pub fn print_tracker_summary() {
     if let Some(tracker) = TRACKER.lock().unwrap().as_ref() {
         tracker.print_summary();
     }
 }
 
-/// No-op stubs for no_std
-#[cfg(not(feature = "std"))]
+/// No-op stubs when decoder tracing is disabled.
+#[cfg(not(all(feature = "std", feature = "decoder-tracing")))]
+#[inline(always)]
 pub fn init_tracker() {}
-/// No-op stub for no_std
-#[cfg(not(feature = "std"))]
+/// No-op stub when decoder tracing is disabled.
+#[cfg(not(all(feature = "std", feature = "decoder-tracing")))]
+#[inline(always)]
 pub fn track_ctu_start(_ctu_idx: u32, _byte_pos: usize) {}
-/// No-op stub for no_std
-#[cfg(not(feature = "std"))]
+/// No-op stub when decoder tracing is disabled.
+#[cfg(not(all(feature = "std", feature = "decoder-tracing")))]
+#[inline(always)]
 pub fn track_large_coeff(_byte_pos: usize) {}
-/// No-op stub for no_std
-#[cfg(not(feature = "std"))]
+/// No-op stub when decoder tracing is disabled.
+#[cfg(not(all(feature = "std", feature = "decoder-tracing")))]
+#[inline(always)]
 pub fn print_tracker_summary() {}
 
 #[cfg(test)]

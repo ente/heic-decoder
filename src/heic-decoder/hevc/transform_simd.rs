@@ -6,6 +6,18 @@
 
 use archmage::prelude::*;
 
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::{
+    vaddq_s32, vaddq_s64, vcombine_s16, vcombine_s32, vdup_n_s32, vdupq_n_s16, vdupq_n_s32,
+    vdupq_n_s64, vget_high_s16, vget_high_s32, vget_low_s16, vget_low_s32, vmaxq_s16, vminq_s16,
+    vmovl_s16, vmull_s32, vmulq_n_s32, vqaddq_s16, vqmovn_s32, vqmovn_s64, vreinterpretq_s16_u16,
+    vreinterpretq_u16_s16, vshlq_s32, vshlq_s64,
+};
+#[cfg(target_arch = "aarch64")]
+use safe_unaligned_simd::aarch64::{
+    vld1_s16, vld1q_s16, vld1q_s32, vld1q_u16, vst1_s16, vst1q_s16, vst1q_u16,
+};
+
 #[cfg(target_arch = "x86_64")]
 use safe_unaligned_simd::x86_64::{
     _mm_loadu_si128, _mm_storeu_si128, _mm256_loadu_si256, _mm256_storeu_si256,
@@ -1349,6 +1361,55 @@ pub(crate) fn add_residual_block_v3(
     }
 }
 
+/// AArch64 NEON residual add. When prediction samples fit signed i16, signed
+/// saturating addition followed by the codec-range clamp is equivalent to the
+/// scalar i32 calculation even when the mathematical sum exceeds i16. Wider
+/// non-profile inputs retain the scalar path.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+#[arcane]
+pub(crate) fn add_residual_block_neon(
+    _token: NeonToken,
+    plane: &mut [u16],
+    stride: usize,
+    x0: usize,
+    y0: usize,
+    residual: &[i16],
+    size: usize,
+    max_val: i32,
+) {
+    if max_val > i32::from(i16::MAX) {
+        add_residual_block_scalar(ScalarToken, plane, stride, x0, y0, residual, size, max_val);
+        return;
+    }
+
+    let zero = vdupq_n_s16(0);
+    let max_v = vdupq_n_s16(max_val as i16);
+
+    for py in 0..size {
+        let row_start = (y0 + py) * stride + x0;
+        let row = &mut plane[row_start..row_start + size];
+        let res_row = &residual[py * size..(py + 1) * size];
+        let chunks = size / 8;
+        for chunk in 0..chunks {
+            let offset = chunk * 8;
+            let prediction = vld1q_u16((&row[offset..offset + 8]).try_into().unwrap());
+            let residual = vld1q_s16((&res_row[offset..offset + 8]).try_into().unwrap());
+            let sum = vqaddq_s16(vreinterpretq_s16_u16(prediction), residual);
+            let clamped = vminq_s16(vmaxq_s16(sum, zero), max_v);
+            vst1q_u16(
+                (&mut row[offset..offset + 8]).try_into().unwrap(),
+                vreinterpretq_u16_s16(clamped),
+            );
+        }
+        for i in (chunks * 8)..size {
+            let prediction = i32::from(row[i]);
+            let residual = i32::from(res_row[i]);
+            row[i] = (prediction + residual).clamp(0, max_val) as u16;
+        }
+    }
+}
+
 /// Scalar fallback for residual block add
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn add_residual_block_scalar(
@@ -1430,6 +1491,38 @@ pub(crate) fn dequantize_v3(
     }
 }
 
+/// AArch64 NEON flat dequantization, four coefficients at a time. Widening to
+/// i32 before multiplication preserves the scalar overflow and rounding
+/// behavior, and the saturating narrow implements the final codec clamp.
+#[cfg(target_arch = "aarch64")]
+#[arcane]
+pub(crate) fn dequantize_neon(
+    _token: NeonToken,
+    coeffs: &mut [i16],
+    combined_scale: i32,
+    shift: i32,
+    add: i32,
+) {
+    let shift_v = vdupq_n_s32(-shift);
+    let add_v = vdupq_n_s32(add);
+    let chunks = coeffs.len() / 4;
+    for chunk in 0..chunks {
+        let offset = chunk * 4;
+        let source = vld1_s16((&coeffs[offset..offset + 4]).try_into().unwrap());
+        let product = vmulq_n_s32(vmovl_s16(source), combined_scale);
+        let shifted = vshlq_s32(vaddq_s32(product, add_v), shift_v);
+        vst1_s16(
+            (&mut coeffs[offset..offset + 4]).try_into().unwrap(),
+            vqmovn_s32(shifted),
+        );
+    }
+
+    for coefficient in coeffs.iter_mut().skip(chunks * 4) {
+        let value = (i32::from(*coefficient) * combined_scale + add) >> shift;
+        *coefficient = value.clamp(-32768, 32767) as i16;
+    }
+}
+
 /// Scalar fallback for dequantize
 pub(crate) fn dequantize_scalar(
     _token: ScalarToken,
@@ -1441,5 +1534,183 @@ pub(crate) fn dequantize_scalar(
     for coef in coeffs.iter_mut() {
         let value = (*coef as i32 * combined_scale + add) >> shift;
         *coef = value.clamp(-32768, 32767) as i16;
+    }
+}
+
+/// AArch64 NEON scaling-list dequantization. The coefficient×matrix product
+/// fits i32; widening multiplication by the QP scale then preserves the
+/// scalar path's required i64 range before exact rounding and saturation.
+#[cfg(target_arch = "aarch64")]
+#[arcane]
+pub(crate) fn dequantize_scaled_neon(
+    _token: NeonToken,
+    coeffs: &mut [i16],
+    scaling_matrix: &[u8],
+    combined_scale: i32,
+    shift: i32,
+    add: i64,
+) {
+    let chunks = coeffs.len().min(scaling_matrix.len()) / 4;
+    let scale_v = vdup_n_s32(combined_scale);
+    let add_v = vdupq_n_s64(add);
+    let shift_v = vdupq_n_s64(i64::from(-shift));
+
+    for chunk in 0..chunks {
+        let offset = chunk * 4;
+        let coefficients = vmovl_s16(vld1_s16((&coeffs[offset..offset + 4]).try_into().unwrap()));
+        let matrix_values = [
+            i32::from(scaling_matrix[offset]),
+            i32::from(scaling_matrix[offset + 1]),
+            i32::from(scaling_matrix[offset + 2]),
+            i32::from(scaling_matrix[offset + 3]),
+        ];
+        let coefficient_matrix =
+            core::arch::aarch64::vmulq_s32(coefficients, vld1q_s32(&matrix_values));
+        let product_low = vmull_s32(vget_low_s32(coefficient_matrix), scale_v);
+        let product_high = vmull_s32(vget_high_s32(coefficient_matrix), scale_v);
+        let rounded_low = vshlq_s64(vaddq_s64(product_low, add_v), shift_v);
+        let rounded_high = vshlq_s64(vaddq_s64(product_high, add_v), shift_v);
+        let narrowed = vcombine_s32(vqmovn_s64(rounded_low), vqmovn_s64(rounded_high));
+        vst1_s16(
+            (&mut coeffs[offset..offset + 4]).try_into().unwrap(),
+            vqmovn_s32(narrowed),
+        );
+    }
+
+    for (index, coefficient) in coeffs.iter_mut().enumerate().skip(chunks * 4) {
+        let matrix = i64::from(scaling_matrix.get(index).copied().unwrap_or(16));
+        let value = (i64::from(*coefficient) * matrix * i64::from(combined_scale) + add) >> shift;
+        *coefficient = value.clamp(-32768, 32767) as i16;
+    }
+}
+
+pub(crate) fn dequantize_scaled_scalar(
+    _token: ScalarToken,
+    coeffs: &mut [i16],
+    scaling_matrix: &[u8],
+    combined_scale: i32,
+    shift: i32,
+    add: i64,
+) {
+    for (index, coefficient) in coeffs.iter_mut().enumerate() {
+        let matrix = i64::from(scaling_matrix.get(index).copied().unwrap_or(16));
+        let value = (i64::from(*coefficient) * matrix * i64::from(combined_scale) + add) >> shift;
+        *coefficient = value.clamp(-32768, 32767) as i16;
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod neon_tests {
+    use super::*;
+
+    fn next_random(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 32) as u32
+    }
+
+    #[test]
+    fn neon_residual_add_matches_scalar_for_all_block_sizes_and_bit_depths() {
+        let neon = NeonToken::summon().expect("AArch64 must provide NEON");
+        let mut state = 0x4f1b_d38a_9207_c6e5;
+        for size in [4_usize, 8, 16, 32] {
+            for bit_depth in [8_u8, 10, 12, 14, 16] {
+                let stride = size + 5;
+                let rows = size + 2;
+                let max_value = (1_i32 << bit_depth) - 1;
+                let mut scalar_plane = (0..stride * rows)
+                    .map(|_| (next_random(&mut state) % (max_value as u32 + 1)) as u16)
+                    .collect::<Vec<_>>();
+                let mut neon_plane = scalar_plane.clone();
+                let mut residual = (0..size * size)
+                    .map(|_| next_random(&mut state) as i16)
+                    .collect::<Vec<_>>();
+                residual[0] = i16::MIN;
+                let last_residual = residual.len() - 1;
+                residual[last_residual] = i16::MAX;
+
+                add_residual_block_scalar(
+                    ScalarToken,
+                    &mut scalar_plane,
+                    stride,
+                    3,
+                    1,
+                    &residual,
+                    size,
+                    max_value,
+                );
+                add_residual_block_neon(
+                    neon,
+                    &mut neon_plane,
+                    stride,
+                    3,
+                    1,
+                    &residual,
+                    size,
+                    max_value,
+                );
+                assert_eq!(neon_plane, scalar_plane, "size={size}, depth={bit_depth}");
+            }
+        }
+    }
+
+    #[test]
+    fn neon_flat_dequantization_matches_scalar_with_unaligned_tails() {
+        let neon = NeonToken::summon().expect("AArch64 must provide NEON");
+        let mut state = 0x8675_309d_4e21_bacf;
+        for length in [1_usize, 4, 7, 16, 63, 256, 1023] {
+            for (combined_scale, shift) in [(40, 0), (720, 3), (18_432, 8), (32_767, 10)] {
+                let mut scalar = (0..length)
+                    .map(|_| next_random(&mut state) as i16)
+                    .collect::<Vec<_>>();
+                let mut simd = scalar.clone();
+                let add = if shift == 0 { 0 } else { 1 << (shift - 1) };
+                dequantize_scalar(ScalarToken, &mut scalar, combined_scale, shift, add);
+                dequantize_neon(neon, &mut simd, combined_scale, shift, add);
+                assert_eq!(
+                    simd, scalar,
+                    "length={length}, scale={combined_scale}, shift={shift}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn neon_scaling_list_dequantization_matches_i64_scalar() {
+        let neon = NeonToken::summon().expect("AArch64 must provide NEON");
+        let mut state = 0xa913_57fc_d204_68be;
+        for (length, matrix_length) in [(4_usize, 4_usize), (7, 5), (64, 64), (255, 255)] {
+            for (combined_scale, shift) in [(40, 3), (720, 7), (18_432, 14)] {
+                let mut scalar = (0..length)
+                    .map(|_| next_random(&mut state) as i16)
+                    .collect::<Vec<_>>();
+                let mut simd = scalar.clone();
+                let scaling_matrix = (0..matrix_length)
+                    .map(|_| next_random(&mut state) as u8)
+                    .collect::<Vec<_>>();
+                let add = 1_i64 << (shift - 1);
+                dequantize_scaled_scalar(
+                    ScalarToken,
+                    &mut scalar,
+                    &scaling_matrix,
+                    combined_scale,
+                    shift,
+                    add,
+                );
+                dequantize_scaled_neon(
+                    neon,
+                    &mut simd,
+                    &scaling_matrix,
+                    combined_scale,
+                    shift,
+                    add,
+                );
+                assert_eq!(
+                    simd, scalar,
+                    "length={length}, scale={combined_scale}, shift={shift}"
+                );
+            }
+        }
     }
 }

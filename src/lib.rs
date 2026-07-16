@@ -30,6 +30,8 @@ use rav1d::{
     Dav1dResult, Rav1dError, dav1d_close, dav1d_data_create, dav1d_data_unref,
     dav1d_default_settings, dav1d_get_picture, dav1d_open, dav1d_picture_unref, dav1d_send_data,
 };
+#[cfg(feature = "parallel-grid")]
+use rayon::prelude::*;
 use scuffle_h265::NALUnitType;
 use source::{
     FileSource, RandomAccessSource, SourceReadError, TempFileSpoolOptions, TempFileSpoolSource,
@@ -41,6 +43,8 @@ use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{BufRead, BufWriter, Read};
 use std::mem::MaybeUninit;
+#[cfg(feature = "parallel-grid")]
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 
@@ -607,6 +611,20 @@ pub struct DecodedRgbaImage {
     pub height: u32,
     pub source_bit_depth: u8,
     pub pixels: DecodedRgbaPixels,
+    pub icc_profile: Option<Vec<u8>>,
+}
+
+/// Decoded RGB8 image buffer for consumers that intentionally discard alpha.
+///
+/// Pixels are byte-for-byte equivalent to converting this decoder's final
+/// RGBA output through `image::DynamicImage::into_rgb8`, but the RGB path does
+/// not allocate or write an unused alpha channel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodedRgbImage {
+    pub width: u32,
+    pub height: u32,
+    pub source_bit_depth: u8,
+    pub pixels: Vec<u8>,
     pub icc_profile: Option<Vec<u8>>,
 }
 
@@ -4160,45 +4178,285 @@ fn decode_primary_heic_grid_to_image(
         });
     }
 
-    let mut output = None;
-    let mut tile_width = 0;
-    let mut tile_height = 0;
+    let first_tile = decode_heic_grid_tile_to_image(&grid_data.tiles[0])?;
+    let tile_width = first_tile.width;
+    let tile_height = first_tile.height;
+    let mut output = create_decoded_heic_grid_output(descriptor, &first_tile)?;
 
-    for row in 0..rows {
-        for column in 0..columns {
-            let tile_index = row
-                .checked_mul(columns)
-                .and_then(|idx| idx.checked_add(column))
-                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                    detail: format!("grid tile index overflow at row={row}, column={column}"),
-                })?;
-            let tile = decode_heic_grid_tile_to_image(&grid_data.tiles[tile_index])?;
+    for_each_decoded_heic_grid_tile(grid_data, first_tile, |tile_index, tile| {
+        let row = tile_index / columns;
+        let column = tile_index % columns;
+        paste_decoded_heic_grid_tile(
+            &tile,
+            &mut output,
+            tile_width,
+            tile_height,
+            row,
+            column,
+            tile_index,
+        )
+    })?;
 
-            if tile_index == 0 {
-                tile_width = tile.width;
-                tile_height = tile.height;
-                output = Some(create_decoded_heic_grid_output(descriptor, &tile)?);
-            }
+    Ok(output)
+}
 
-            paste_decoded_heic_grid_tile(
-                &tile,
-                output
-                    .as_mut()
-                    .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                        detail: "grid output was not initialized".to_string(),
-                    })?,
-                tile_width,
-                tile_height,
-                row,
-                column,
-                tile_index,
-            )?;
+#[cfg(feature = "parallel-grid")]
+const MAX_GRID_TILE_DECODE_THREADS: usize = 8;
+#[cfg(feature = "parallel-grid")]
+const GRID_TILE_DECODE_MEMORY_BUDGET: u64 = 64 * 1024 * 1024;
+
+#[cfg(feature = "parallel-grid")]
+#[derive(Default)]
+struct HeicGridTileStreamMemoryEstimate {
+    normalized_stream_bytes: u64,
+    rbsp_bytes: u64,
+    emulation_prevention_position_bytes: u64,
+    nal_count: u64,
+}
+
+#[cfg(feature = "parallel-grid")]
+impl HeicGridTileStreamMemoryEstimate {
+    fn add_nal(&mut self, nal_unit: &[u8]) -> Result<(), DecodeHeicError> {
+        let nal_size =
+            u32::try_from(nal_unit.len()).map_err(|_| DecodeHeicError::NalUnitTooLarge {
+                nal_size: nal_unit.len(),
+            })?;
+        self.normalized_stream_bytes = self
+            .normalized_stream_bytes
+            .saturating_add(u64::from(nal_size))
+            .saturating_add(4);
+        self.nal_count = self.nal_count.saturating_add(1);
+
+        let Some(rbsp) = nal_unit.get(2..) else {
+            return Ok(());
+        };
+        self.rbsp_bytes = self.rbsp_bytes.saturating_add(rbsp.len() as u64);
+
+        let removed_bytes = count_hevc_emulation_prevention_bytes(rbsp);
+        if removed_bytes > 0 {
+            // `skipped_byte_positions` grows from an empty Vec<u32>. Twice
+            // the populated size plus four elements covers its amortized
+            // growth, including the initial small allocation.
+            let position_capacity = removed_bytes.saturating_mul(2).saturating_add(4);
+            self.emulation_prevention_position_bytes = self
+                .emulation_prevention_position_bytes
+                .saturating_add(position_capacity.saturating_mul(size_of::<u32>() as u64));
         }
+        Ok(())
     }
 
-    output.ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-        detail: "grid tile list cannot be empty".to_string(),
-    })
+    fn estimated_decoder_bytes(&self) -> u64 {
+        // Stream assembly appends to a growing Vec, so allow up to twice its
+        // populated length. Each parsed NAL then owns an RBSP Vec whose
+        // requested capacity equals the transmitted payload length.
+        let stream_and_rbsp_bytes = self
+            .normalized_stream_bytes
+            .saturating_mul(2)
+            .saturating_add(self.rbsp_bytes);
+        let backend_nal_metadata_bytes = conservative_vec_storage_bytes(
+            self.nal_count,
+            size_of::<heic_decoder::hevc::bitstream::NalUnit<'static>>(),
+        );
+        let length_prefixed_nal_metadata_bytes = conservative_vec_storage_bytes(
+            self.nal_count,
+            size_of::<LengthPrefixedHevcNalUnit<'static>>(),
+        );
+
+        stream_and_rbsp_bytes
+            .saturating_add(self.emulation_prevention_position_bytes)
+            .saturating_add(backend_nal_metadata_bytes)
+            .saturating_add(length_prefixed_nal_metadata_bytes)
+    }
+}
+
+#[cfg(feature = "parallel-grid")]
+fn conservative_vec_storage_bytes(element_count: u64, element_size: usize) -> u64 {
+    if element_count == 0 {
+        return 0;
+    }
+    element_count
+        .saturating_mul(2)
+        .saturating_add(4)
+        .saturating_mul(element_size as u64)
+}
+
+#[cfg(feature = "parallel-grid")]
+fn count_hevc_emulation_prevention_bytes(bytes: &[u8]) -> u64 {
+    let mut count = 0_u64;
+    let mut cursor = 0_usize;
+    while cursor < bytes.len() {
+        if cursor + 2 < bytes.len()
+            && bytes[cursor] == 0
+            && bytes[cursor + 1] == 0
+            && bytes[cursor + 2] == 3
+        {
+            count = count.saturating_add(1);
+            cursor += 3;
+        } else {
+            cursor += 1;
+        }
+    }
+    count
+}
+
+#[cfg(feature = "parallel-grid")]
+fn estimate_heic_grid_sps_decode_bytes(
+    sps: &heic_decoder::hevc::params::Sps,
+) -> Result<u64, DecodeHeicError> {
+    let _ = hevc_metadata_from_sps(sps)?;
+    let allocation_layout = heic_layout_from_sps_chroma_array_type(sps.chroma_format_idc)?;
+    let working_bytes_per_pixel = match allocation_layout {
+        HeicPixelLayout::Yuv400 => 4_u64,
+        HeicPixelLayout::Yuv420 => 6,
+        HeicPixelLayout::Yuv422 => 8,
+        HeicPixelLayout::Yuv444 => 12,
+    };
+    Ok(u64::from(sps.pic_width_in_luma_samples)
+        .saturating_mul(u64::from(sps.pic_height_in_luma_samples))
+        .saturating_mul(working_bytes_per_pixel))
+}
+
+/// Estimate the normalized decoder stream plus retained YUV output and decoder
+/// working storage for one tile. Raw SPS geometry is deliberately used here:
+/// a tile-level clean aperture may make the final tile small, but the decoder
+/// must still materialize the uncropped frame first.
+#[cfg(feature = "parallel-grid")]
+fn estimate_heic_grid_tile_decode_bytes(
+    tile: &isobmff::HeicGridTileItemData,
+) -> Result<u64, DecodeHeicError> {
+    // The backend currently retains the last SPS it parses. Use the largest
+    // allocation advertised by any SPS instead: this remains safe for files
+    // carrying unused or in-stream replacement parameter sets and avoids
+    // coupling the memory bound to the backend's SPS-selection details.
+    let mut decoded_bytes = None::<u64>;
+    let mut stream_memory = HeicGridTileStreamMemoryEstimate::default();
+    walk_hevc_nals_from_hvcc_or_payload(&tile.hvcc, &tile.payload, |offset, nal_unit| {
+        stream_memory.add_nal(nal_unit)?;
+        let unit = LengthPrefixedHevcNalUnit {
+            offset,
+            bytes: nal_unit,
+        };
+        if unit.nal_unit_type() == Some(NALUnitType::SpsNut) {
+            let sps = hevc_sps_from_nal(nal_unit, offset)?;
+            let candidate_bytes = estimate_heic_grid_sps_decode_bytes(&sps)?;
+            decoded_bytes = Some(decoded_bytes.unwrap_or_default().max(candidate_bytes));
+        }
+        Ok(false)
+    })?;
+
+    let decoded_bytes = decoded_bytes.ok_or(DecodeHeicError::MissingSpsNalUnit)?;
+    Ok(decoded_bytes
+        .saturating_add(stream_memory.estimated_decoder_bytes())
+        .max(1))
+}
+
+/// Choose a conservative number of simultaneously decoded tiles from each
+/// tile's own preflight estimate. An estimate failure stops the parallel
+/// window before that tile so normal row-major decoding still selects the
+/// user-visible error.
+#[cfg(feature = "parallel-grid")]
+fn heic_grid_tile_decode_window_from_estimates(
+    estimates: impl IntoIterator<Item = Option<u64>>,
+    available_threads: usize,
+) -> usize {
+    let available_threads = available_threads.max(1);
+    let mut window = 0_usize;
+    let mut estimated_bytes = 0_u64;
+    for tile_bytes in estimates.into_iter().take(available_threads) {
+        let Some(tile_bytes) = tile_bytes else {
+            break;
+        };
+        let next_estimated_bytes = estimated_bytes.saturating_add(tile_bytes.max(1));
+        if window > 0 && next_estimated_bytes > GRID_TILE_DECODE_MEMORY_BUDGET {
+            break;
+        }
+        window += 1;
+        estimated_bytes = next_estimated_bytes;
+        if estimated_bytes >= GRID_TILE_DECODE_MEMORY_BUDGET {
+            break;
+        }
+    }
+    window.max(1)
+}
+
+/// Choose a conservative number of simultaneously decoded tiles. Large,
+/// malformed, or unusual tiles stay sequential instead of inheriting the
+/// first grid tile's geometry and multiplying peak memory.
+#[cfg(feature = "parallel-grid")]
+fn heic_grid_tile_decode_window(remaining_tiles: &[isobmff::HeicGridTileItemData]) -> usize {
+    if remaining_tiles.len() <= 1 || cfg!(feature = "decoder-tracing") {
+        return 1;
+    }
+
+    let available_threads = rayon::current_num_threads()
+        .min(MAX_GRID_TILE_DECODE_THREADS)
+        .min(remaining_tiles.len());
+    heic_grid_tile_decode_window_from_estimates(
+        remaining_tiles
+            .iter()
+            .map(|tile| estimate_heic_grid_tile_decode_bytes(tile).ok()),
+        available_threads,
+    )
+}
+
+/// Decode grid tiles in bounded batches, but deliver them to the caller in
+/// row-major order. Keeping validation and paste work on the caller thread
+/// preserves deterministic errors and output while independent HEVC payloads
+/// use the available cores.
+fn for_each_decoded_heic_grid_tile<E>(
+    grid_data: &isobmff::HeicGridPrimaryItemData,
+    first_tile: DecodedHeicImage,
+    mut consume: impl FnMut(usize, DecodedHeicImage) -> Result<(), E>,
+) -> Result<(), E>
+where
+    E: From<DecodeHeicError>,
+{
+    let remaining_tiles = &grid_data.tiles[1..];
+
+    consume(0, first_tile)?;
+
+    if remaining_tiles.is_empty() {
+        return Ok(());
+    }
+
+    #[cfg(feature = "parallel-grid")]
+    {
+        let mut next_tile_index = 1_usize;
+        while next_tile_index < grid_data.tiles.len() {
+            let undecoded_tiles = &grid_data.tiles[next_tile_index..];
+            let window = heic_grid_tile_decode_window(undecoded_tiles);
+            if window > 1 {
+                let decoded = undecoded_tiles[..window]
+                    .par_iter()
+                    .map(decode_heic_grid_tile_to_image)
+                    .collect::<Vec<_>>();
+
+                for (offset, tile) in decoded.into_iter().enumerate() {
+                    consume(next_tile_index + offset, tile.map_err(E::from)?)?;
+                }
+                next_tile_index += window;
+            } else {
+                consume(
+                    next_tile_index,
+                    decode_heic_grid_tile_to_image(&grid_data.tiles[next_tile_index])
+                        .map_err(E::from)?,
+                )?;
+                next_tile_index += 1;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "parallel-grid"))]
+    {
+        for (offset, tile) in remaining_tiles.iter().enumerate() {
+            consume(
+                offset + 1,
+                decode_heic_grid_tile_to_image(tile).map_err(E::from)?,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 fn decode_heic_grid_tile_to_image(
@@ -4319,6 +4577,143 @@ fn decode_primary_heic_grid_to_rgba_image(
             DecodedRgbaPixels::U16,
         )
     }
+}
+
+fn decode_primary_heic_grid_to_rgb8_image(
+    grid_data: &isobmff::HeicGridPrimaryItemData,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+    icc_profile: Option<Vec<u8>>,
+) -> Result<DecodedRgbImage, DecodeError> {
+    validate_heic_grid_descriptor_and_tile_count(grid_data)?;
+    let (first_tile, source_bit_depth) = decode_and_validate_heic_grid_first_tile(grid_data)?;
+    let reference = HeicGridTileReference::from_first_tile(&first_tile, &grid_data.colr);
+    let transform_plan = RgbaTransformPlan::from_primary_transforms(
+        grid_data.descriptor.output_width,
+        grid_data.descriptor.output_height,
+        transforms,
+    )?;
+    let destination_width = usize::try_from(transform_plan.destination_width).map_err(|_| {
+        DecodeHeicError::InvalidDecodedFrame {
+            detail: "transformed RGB grid width cannot be represented".to_string(),
+        }
+    })?;
+    let source_width = usize::try_from(grid_data.descriptor.output_width).map_err(|_| {
+        DecodeHeicError::InvalidDecodedFrame {
+            detail: "RGB grid source width cannot be represented".to_string(),
+        }
+    })?;
+    let source_height = usize::try_from(grid_data.descriptor.output_height).map_err(|_| {
+        DecodeHeicError::InvalidDecodedFrame {
+            detail: "RGB grid source height cannot be represented".to_string(),
+        }
+    })?;
+    let mut output = vec![
+        0_u8;
+        checked_interleaved_sample_count(
+            transform_plan.destination_width,
+            transform_plan.destination_height,
+            3,
+        )?
+    ];
+
+    if !heic_grid_tiles_cover_descriptor(&grid_data.descriptor, &reference) {
+        let gap_pixel = heic_grid_gap_rgb8_pixel(&reference)?;
+        for pixel in output.chunks_exact_mut(3) {
+            pixel.copy_from_slice(&gap_pixel);
+        }
+    }
+
+    let columns = usize::from(grid_data.descriptor.columns);
+    let mut tile_pixels = Vec::new();
+    for_each_decoded_heic_grid_tile(
+        grid_data,
+        first_tile,
+        |tile_index, mut tile| -> Result<(), DecodeError> {
+            validate_decoded_heic_grid_tile_reference(&tile, &reference, tile_index)?;
+            tile.ycbcr_range = reference.conversion_ycbcr_range;
+            tile.ycbcr_matrix = reference.conversion_ycbcr_matrix;
+            convert_heic_to_rgb8_into(&tile, &mut tile_pixels)?;
+
+            let tile_width =
+                usize::try_from(tile.width).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+                    detail: format!("RGB grid tile width {} cannot be represented", tile.width),
+                })?;
+            let tile_height =
+                usize::try_from(tile.height).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+                    detail: format!("RGB grid tile height {} cannot be represented", tile.height),
+                })?;
+            let expected_tile_samples = tile_width
+                .checked_mul(tile_height)
+                .and_then(|pixels| pixels.checked_mul(3))
+                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                    detail: "RGB grid tile sample count overflow".to_string(),
+                })?;
+            if tile_pixels.len() != expected_tile_samples {
+                return Err(DecodeHeicError::InvalidDecodedFrame {
+                    detail: format!(
+                        "RGB grid tile has {} samples, expected {expected_tile_samples}",
+                        tile_pixels.len()
+                    ),
+                }
+                .into());
+            }
+
+            let row = tile_index / columns;
+            let column = tile_index % columns;
+            let (x_origin, y_origin) =
+                heic_grid_tile_origin(reference.tile_width, reference.tile_height, row, column)?;
+            validate_heic_grid_tile_origin_alignment(reference.layout, x_origin, y_origin)?;
+            let x_origin =
+                usize::try_from(x_origin).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+                    detail: "RGB grid tile x-origin cannot be represented".to_string(),
+                })?;
+            let y_origin =
+                usize::try_from(y_origin).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+                    detail: "RGB grid tile y-origin cannot be represented".to_string(),
+                })?;
+
+            for tile_y in 0..tile_height {
+                let source_y = y_origin.checked_add(tile_y).ok_or_else(|| {
+                    DecodeHeicError::InvalidDecodedFrame {
+                        detail: "RGB grid tile y-coordinate overflow".to_string(),
+                    }
+                })?;
+                if source_y >= source_height {
+                    break;
+                }
+                for tile_x in 0..tile_width {
+                    let source_x = x_origin.checked_add(tile_x).ok_or_else(|| {
+                        DecodeHeicError::InvalidDecodedFrame {
+                            detail: "RGB grid tile x-coordinate overflow".to_string(),
+                        }
+                    })?;
+                    if source_x >= source_width {
+                        break;
+                    }
+                    let Some((destination_x, destination_y)) =
+                        transform_plan.map_source_pixel(source_x, source_y)?
+                    else {
+                        continue;
+                    };
+                    let source_sample = (tile_y * tile_width + tile_x) * 3;
+                    let destination_sample =
+                        (destination_y * destination_width + destination_x) * 3;
+                    output[destination_sample..destination_sample + 3]
+                        .copy_from_slice(&tile_pixels[source_sample..source_sample + 3]);
+                }
+            }
+
+            Ok(())
+        },
+    )?;
+
+    Ok(DecodedRgbImage {
+        width: transform_plan.destination_width,
+        height: transform_plan.destination_height,
+        source_bit_depth,
+        pixels: output,
+        icc_profile,
+    })
 }
 
 fn validate_heic_grid_descriptor_and_tile_count(
@@ -4584,6 +4979,17 @@ fn heic_grid_gap_rgba_pixel<T: Copy>(
     reference: &HeicGridTileReference,
     convert_tile: fn(&DecodedHeicImage, &mut Vec<T>) -> Result<(), DecodeHeicError>,
 ) -> Result<[T; 4], DecodeHeicError> {
+    heic_grid_gap_pixel(reference, convert_tile)
+}
+
+fn heic_grid_gap_rgb8_pixel(reference: &HeicGridTileReference) -> Result<[u8; 3], DecodeHeicError> {
+    heic_grid_gap_pixel(reference, convert_heic_to_rgb8_into)
+}
+
+fn heic_grid_gap_pixel<T: Copy, const CHANNELS: usize>(
+    reference: &HeicGridTileReference,
+    convert_tile: fn(&DecodedHeicImage, &mut Vec<T>) -> Result<(), DecodeHeicError>,
+) -> Result<[T; CHANNELS], DecodeHeicError> {
     let zero_plane = HeicPlane {
         width: 1,
         height: 1,
@@ -4608,10 +5014,10 @@ fn heic_grid_gap_rgba_pixel<T: Copy>(
     };
     let mut pixel = Vec::new();
     convert_tile(&zero_image, &mut pixel)?;
-    <[T; 4]>::try_from(pixel.as_slice()).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+    <[T; CHANNELS]>::try_from(pixel.as_slice()).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
         detail: format!(
-            "grid gap pixel conversion produced {} samples, expected 4",
-            pixel.len()
+            "grid gap pixel conversion produced {} samples, expected {CHANNELS}",
+            pixel.len(),
         ),
     })
 }
@@ -4667,18 +5073,8 @@ fn for_each_heic_grid_tile_rgba<T: Copy>(
     mut paste: impl FnMut(&DecodedHeicImage, &[T], u32, u32) -> Result<(), DecodeError>,
 ) -> Result<(), DecodeError> {
     let columns = usize::from(grid_data.descriptor.columns);
-    let mut first_tile = Some(first_tile);
     let mut tile_pixels = Vec::new();
-    for tile_index in 0..grid_data.tiles.len() {
-        let mut tile = if tile_index == 0 {
-            first_tile
-                .take()
-                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                    detail: "first grid tile was already consumed".to_string(),
-                })?
-        } else {
-            decode_heic_grid_tile_to_image(&grid_data.tiles[tile_index])?
-        };
+    for_each_decoded_heic_grid_tile(grid_data, first_tile, |tile_index, mut tile| {
         validate_decoded_heic_grid_tile_reference(&tile, reference, tile_index)?;
         tile.ycbcr_range = reference.conversion_ycbcr_range;
         tile.ycbcr_matrix = reference.conversion_ycbcr_matrix;
@@ -4689,9 +5085,8 @@ fn for_each_heic_grid_tile_rgba<T: Copy>(
             heic_grid_tile_origin(reference.tile_width, reference.tile_height, row, column)?;
         validate_heic_grid_tile_origin_alignment(reference.layout, x_origin, y_origin)?;
         paste(&tile, &tile_pixels, x_origin, y_origin)?;
-    }
-
-    Ok(())
+        Ok(())
+    })
 }
 
 fn paste_heic_grid_tiles_to_rgba<T: Copy>(
@@ -4822,7 +5217,6 @@ struct RgbaOrientationTransform {
 /// transform) makes clean-aperture clipping explicit and preserves the exact
 /// transform order used by `apply_primary_item_transforms_rgba`.
 #[derive(Clone, Debug)]
-#[cfg(feature = "image-integration")]
 struct RgbaTransformPlan {
     source_width: u32,
     source_height: u32,
@@ -4832,7 +5226,6 @@ struct RgbaTransformPlan {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[cfg(feature = "image-integration")]
 enum ResolvedRgbaTransformStep {
     CleanAperture {
         left: u32,
@@ -4852,7 +5245,6 @@ enum ResolvedRgbaTransformStep {
     },
 }
 
-#[cfg(feature = "image-integration")]
 impl RgbaTransformPlan {
     fn from_primary_transforms(
         width: u32,
@@ -6467,13 +6859,25 @@ fn hevc_metadata_from_sps_nal(
     nal_bytes: &[u8],
     nal_offset: usize,
 ) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
-    let sps = heic_decoder::hevc::bitstream::parse_single_nal(nal_bytes)
+    let sps = hevc_sps_from_nal(nal_bytes, nal_offset)?;
+    hevc_metadata_from_sps(&sps)
+}
+
+fn hevc_sps_from_nal(
+    nal_bytes: &[u8],
+    nal_offset: usize,
+) -> Result<heic_decoder::hevc::params::Sps, DecodeHeicError> {
+    heic_decoder::hevc::bitstream::parse_single_nal(nal_bytes)
         .and_then(|nal| heic_decoder::hevc::params::parse_sps(&nal.payload))
         .map_err(|err| DecodeHeicError::SpsParseFailed {
             offset: nal_offset,
             detail: err.to_string(),
-        })?;
+        })
+}
 
+fn hevc_metadata_from_sps(
+    sps: &heic_decoder::hevc::params::Sps,
+) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
     let (sub_width_c, sub_height_c) = match sps.chroma_format_idc {
         1 => (2u32, 2u32),
         2 => (2, 1),
@@ -6514,14 +6918,14 @@ fn hevc_metadata_from_sps_nal(
     })
 }
 
-/// SPS-derived metadata from the hvcC parameter-set arrays alone, or `None`
+/// Parse the SPS from the hvcC parameter-set arrays alone, or return `None`
 /// when the arrays carry no SPS (`hev1` items may keep parameter sets only
 /// in-stream). Selection matches the assembled-stream scan: first NAL whose
 /// own header says SPS, in hvcC array order.
 #[cfg(feature = "image-integration")]
-fn hevc_metadata_from_hvcc_nal_arrays(
+fn hevc_sps_from_hvcc_nal_arrays(
     hvcc: &isobmff::HevcDecoderConfigurationBox,
-) -> Result<Option<DecodedHeicImageMetadata>, DecodeHeicError> {
+) -> Result<Option<heic_decoder::hevc::params::Sps>, DecodeHeicError> {
     for nal_array in &hvcc.nal_arrays {
         for nal_unit in &nal_array.nal_units {
             let unit = LengthPrefixedHevcNalUnit {
@@ -6531,40 +6935,79 @@ fn hevc_metadata_from_hvcc_nal_arrays(
             if unit.nal_unit_type() != Some(NALUnitType::SpsNut) {
                 continue;
             }
-            return hevc_metadata_from_sps_nal(nal_unit, 0).map(Some);
+            return hevc_sps_from_nal(nal_unit, 0).map(Some);
         }
     }
     Ok(None)
 }
 
-/// SPS-derived metadata without assembling a decoder stream: prefer the hvcC
-/// parameter-set arrays, then scan the item payload's length-prefixed NAL
-/// units in place. This visits NAL units in the same order as assembling the
-/// stream and scanning it, but copies no payload bytes — the layout probe
-/// runs this once per image-hook decode.
-#[cfg(feature = "image-integration")]
-fn decode_hevc_metadata_from_hvcc_or_payload(
+/// Visit hvcC and in-stream NAL units in the same order used to assemble the
+/// decoder stream. Returning `true` stops the walk after the current unit.
+#[cfg(feature = "parallel-grid")]
+fn walk_hevc_nals_from_hvcc_or_payload(
     hvcc: &isobmff::HevcDecoderConfigurationBox,
     payload: &[u8],
-) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
+    mut visit: impl FnMut(usize, &[u8]) -> Result<bool, DecodeHeicError>,
+) -> Result<(), DecodeHeicError> {
     let nal_length_size = hvcc.nal_length_size;
     if !(1..=4).contains(&nal_length_size) {
         return Err(DecodeHeicError::InvalidNalLengthSize { nal_length_size });
     }
-    if let Some(metadata) = hevc_metadata_from_hvcc_nal_arrays(hvcc)? {
-        return Ok(metadata);
+    for nal_array in &hvcc.nal_arrays {
+        for nal_unit in &nal_array.nal_units {
+            if visit(0, nal_unit)? {
+                return Ok(());
+            }
+        }
+    }
+    walk_length_prefixed_payload_nals(payload, usize::from(nal_length_size), visit)
+}
+
+#[cfg(feature = "image-integration")]
+fn hevc_metadata_from_hvcc_nal_arrays(
+    hvcc: &isobmff::HevcDecoderConfigurationBox,
+) -> Result<Option<DecodedHeicImageMetadata>, DecodeHeicError> {
+    hevc_sps_from_hvcc_nal_arrays(hvcc)?
+        .map(|sps| hevc_metadata_from_sps(&sps))
+        .transpose()
+}
+
+/// Parse the SPS without assembling a decoder stream: prefer the hvcC
+/// parameter-set arrays, then scan the item payload's length-prefixed NAL
+/// units in place. This visits NAL units in the same order as assembling the
+/// stream and scanning it, but copies no payload bytes.
+#[cfg(feature = "image-integration")]
+fn decode_hevc_sps_from_hvcc_or_payload(
+    hvcc: &isobmff::HevcDecoderConfigurationBox,
+    payload: &[u8],
+) -> Result<heic_decoder::hevc::params::Sps, DecodeHeicError> {
+    let nal_length_size = hvcc.nal_length_size;
+    if !(1..=4).contains(&nal_length_size) {
+        return Err(DecodeHeicError::InvalidNalLengthSize { nal_length_size });
+    }
+    if let Some(sps) = hevc_sps_from_hvcc_nal_arrays(hvcc)? {
+        return Ok(sps);
     }
 
-    let mut metadata = None;
+    let mut sps = None;
     walk_length_prefixed_payload_nals(payload, usize::from(nal_length_size), |offset, nal| {
         let unit = LengthPrefixedHevcNalUnit { offset, bytes: nal };
         if unit.nal_unit_type() != Some(NALUnitType::SpsNut) {
             return Ok(false);
         }
-        metadata = Some(hevc_metadata_from_sps_nal(nal, offset)?);
+        sps = Some(hevc_sps_from_nal(nal, offset)?);
         Ok(true)
     })?;
-    metadata.ok_or(DecodeHeicError::MissingSpsNalUnit)
+    sps.ok_or(DecodeHeicError::MissingSpsNalUnit)
+}
+
+#[cfg(feature = "image-integration")]
+fn decode_hevc_metadata_from_hvcc_or_payload(
+    hvcc: &isobmff::HevcDecoderConfigurationBox,
+    payload: &[u8],
+) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
+    let sps = decode_hevc_sps_from_hvcc_or_payload(hvcc, payload)?;
+    hevc_metadata_from_sps(&sps)
 }
 
 fn heic_layout_from_sps_chroma_array_type(
@@ -7513,6 +7956,73 @@ fn decode_heif_source_to_rgba<S: RandomAccessSource>(
         &transforms,
         icc_profile,
     )
+}
+
+fn decode_heif_bytes_to_rgb8(
+    input: &[u8],
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbImage, DecodeError> {
+    let transforms = isobmff::parse_primary_item_transform_properties(input)
+        .map_err(DecodeHeicError::ParsePrimaryTransforms)?
+        .transforms;
+    let icc_profile = primary_icc_profile_from_heic(input);
+    let mut source: Option<&mut dyn RandomAccessSource> = None;
+    decode_primary_heic_to_rgb8_from_resolved_input(
+        input,
+        &mut source,
+        guardrails,
+        &transforms,
+        icc_profile,
+    )
+}
+
+fn decode_heif_source_to_rgb8<S: RandomAccessSource>(
+    source: &mut S,
+    input: &[u8],
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbImage, DecodeError> {
+    let transforms = isobmff::parse_primary_item_transform_properties(input)
+        .map_err(DecodeHeicError::ParsePrimaryTransforms)?
+        .transforms;
+    let icc_profile = primary_icc_profile_from_heic(input);
+    let mut source: Option<&mut dyn RandomAccessSource> = Some(source);
+    decode_primary_heic_to_rgb8_from_resolved_input(
+        input,
+        &mut source,
+        guardrails,
+        &transforms,
+        icc_profile,
+    )
+}
+
+fn decode_primary_heic_to_rgb8_from_resolved_input(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+    guardrails: DecodeGuardrails,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+    icc_profile: Option<Vec<u8>>,
+) -> Result<DecodedRgbImage, DecodeError> {
+    let primary_with_grid = if let Some(source) = source.as_mut() {
+        isobmff::extract_primary_heic_item_data_with_grid_from_source(source, input)
+            .map_err(DecodeHeicError::from)?
+    } else {
+        isobmff::extract_primary_heic_item_data_with_grid(input).map_err(DecodeHeicError::from)?
+    };
+
+    match primary_with_grid {
+        isobmff::HeicPrimaryItemDataWithGrid::Grid(grid_data) => {
+            guardrails.enforce_pixel_count(
+                grid_data.descriptor.output_width,
+                grid_data.descriptor.output_height,
+            )?;
+            decode_primary_heic_grid_to_rgb8_image(&grid_data, transforms, icc_profile)
+        }
+        isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
+            let decoded = decode_primary_heic_coded_item_to_image(input, &item_data)?;
+            guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
+            decoded_heic_to_rgb8_image(decoded, transforms, icc_profile)
+        }
+    }
 }
 
 fn decode_primary_heic_to_rgba_from_resolved_input(
@@ -9093,6 +9603,19 @@ fn decode_bytes_to_rgba_with_hint_and_guardrails(
     }
 }
 
+fn decode_bytes_to_rgb8_with_hint_and_guardrails(
+    input: &[u8],
+    hint: Option<HeifInputFamily>,
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbImage, DecodeError> {
+    match enforce_and_resolve_input_family(input, hint, &guardrails)? {
+        HeifInputFamily::Heif => decode_heif_bytes_to_rgb8(input, guardrails),
+        HeifInputFamily::Avif => Err(DecodeError::Unsupported(
+            "direct RGB8 output currently supports coded HEIC/HEIF inputs".to_string(),
+        )),
+    }
+}
+
 fn decode_bytes_to_png_with_hint_and_guardrails(
     input: &[u8],
     hint: Option<HeifInputFamily>,
@@ -9155,6 +9678,27 @@ fn decode_source_to_rgba_with_hint_and_guardrails<S: RandomAccessSource>(
     }
 }
 
+fn decode_source_to_rgb8_with_hint_and_guardrails<S: RandomAccessSource>(
+    source: &mut S,
+    hint: Option<HeifInputFamily>,
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbImage, DecodeError> {
+    guardrails.enforce_input_bytes(source.len())?;
+    let selected =
+        read_selected_top_level_boxes_from_source(source, &[FTYP_BOX_TYPE, META_BOX_TYPE])?;
+    let source_family_hint = detect_input_family_from_source_selected_boxes(&selected)?;
+    let input = encode_source_selected_top_level_boxes(&selected);
+    match source_family_hint
+        .or(hint)
+        .ok_or_else(unknown_input_family_error)?
+    {
+        HeifInputFamily::Heif => decode_heif_source_to_rgb8(source, &input, guardrails),
+        HeifInputFamily::Avif => Err(DecodeError::Unsupported(
+            "direct RGB8 output currently supports coded HEIC/HEIF inputs".to_string(),
+        )),
+    }
+}
+
 fn decode_source_to_png_with_hint_and_guardrails<S: RandomAccessSource>(
     source: &mut S,
     hint: Option<HeifInputFamily>,
@@ -9203,6 +9747,20 @@ pub fn decode_bytes_to_rgba_with_guardrails(
 /// Decode a HEIF/HEIC/AVIF image from bytes into an owned RGBA buffer.
 pub fn decode_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeError> {
     decode_bytes_to_rgba_with_guardrails(input, DecodeGuardrails::default())
+}
+
+/// Decode coded HEIC/HEIF bytes directly into RGB8, intentionally discarding
+/// auxiliary alpha without allocating an intermediate RGBA buffer.
+pub fn decode_bytes_to_rgb8_with_guardrails(
+    input: &[u8],
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbImage, DecodeError> {
+    decode_bytes_to_rgb8_with_hint_and_guardrails(input, Some(HeifInputFamily::Heif), guardrails)
+}
+
+/// Decode coded HEIC/HEIF bytes directly into an owned RGB8 buffer.
+pub fn decode_bytes_to_rgb8(input: &[u8]) -> Result<DecodedRgbImage, DecodeError> {
+    decode_bytes_to_rgb8_with_guardrails(input, DecodeGuardrails::default())
 }
 
 /// Decode a `Read` source with configurable guardrails into an owned RGBA buffer.
@@ -9255,6 +9813,31 @@ pub fn decode_path_to_rgba_with_guardrails(
 /// Decode a HEIF/HEIC/AVIF image from `input_path` into an owned RGBA buffer.
 pub fn decode_path_to_rgba(input_path: &Path) -> Result<DecodedRgbaImage, DecodeError> {
     decode_path_to_rgba_with_guardrails(input_path, DecodeGuardrails::default())
+}
+
+/// Decode a coded HEIC/HEIF path directly into RGB8 with configurable
+/// guardrails, intentionally discarding auxiliary alpha.
+pub fn decode_path_to_rgb8_with_guardrails(
+    input_path: &Path,
+    guardrails: DecodeGuardrails,
+) -> Result<DecodedRgbImage, DecodeError> {
+    if !input_path.exists() {
+        return Err(DecodeError::Unsupported(format!(
+            "Input file does not exist: {}",
+            input_path.display()
+        )));
+    }
+    let mut source = FileSource::open(input_path).map_err(decode_error_from_source_read_error)?;
+    decode_source_to_rgb8_with_hint_and_guardrails(
+        &mut source,
+        extension_family_hint(input_path),
+        guardrails,
+    )
+}
+
+/// Decode a coded HEIC/HEIF path directly into an owned RGB8 buffer.
+pub fn decode_path_to_rgb8(input_path: &Path) -> Result<DecodedRgbImage, DecodeError> {
+    decode_path_to_rgb8_with_guardrails(input_path, DecodeGuardrails::default())
 }
 
 /// Backward-compatible alias for [`decode_path_to_rgba`].
@@ -9863,6 +10446,83 @@ fn decoded_heic_to_rgba_image(
     })
 }
 
+fn decoded_heic_to_rgb8_image(
+    mut decoded: DecodedHeicImage,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+    icc_profile: Option<Vec<u8>>,
+) -> Result<DecodedRgbImage, DecodeError> {
+    let (cropped, remaining_transforms) =
+        crop_heic_by_leading_chroma_aligned_clean_apertures(decoded, transforms)?;
+    decoded = cropped;
+    let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
+    let pixels = convert_heic_to_rgb8(&decoded)?;
+    let (width, height, pixels) = apply_primary_item_transforms_rgb8(
+        decoded.width,
+        decoded.height,
+        pixels,
+        remaining_transforms,
+    )?;
+    Ok(DecodedRgbImage {
+        width,
+        height,
+        source_bit_depth,
+        pixels,
+        icc_profile,
+    })
+}
+
+fn apply_primary_item_transforms_rgb8(
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+) -> Result<(u32, u32, Vec<u8>), DecodeError> {
+    let expected = checked_interleaved_sample_count(width, height, 3)?;
+    if pixels.len() != expected {
+        return Err(DecodeError::Unsupported(format!(
+            "RGB8 transform input has {} samples, expected {expected}",
+            pixels.len()
+        )));
+    }
+
+    let plan = RgbaTransformPlan::from_primary_transforms(width, height, transforms)?;
+    if plan.is_identity() {
+        return Ok((width, height, pixels));
+    }
+
+    let source_width = usize::try_from(width).map_err(|_| {
+        DecodeError::Unsupported(format!("RGB8 source width cannot be represented ({width})"))
+    })?;
+    let destination_width = usize::try_from(plan.destination_width).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "RGB8 destination width cannot be represented ({})",
+            plan.destination_width
+        ))
+    })?;
+    let destination_height = usize::try_from(plan.destination_height).map_err(|_| {
+        DecodeError::Unsupported(format!(
+            "RGB8 destination height cannot be represented ({})",
+            plan.destination_height
+        ))
+    })?;
+    let mut transformed =
+        vec![
+            0_u8;
+            checked_interleaved_sample_count(plan.destination_width, plan.destination_height, 3,)?
+        ];
+    for destination_y in 0..destination_height {
+        for destination_x in 0..destination_width {
+            let (source_x, source_y) = plan.map_destination_pixel(destination_x, destination_y)?;
+            let source_sample = (source_y * source_width + source_x) * 3;
+            let destination_sample = (destination_y * destination_width + destination_x) * 3;
+            transformed[destination_sample..destination_sample + 3]
+                .copy_from_slice(&pixels[source_sample..source_sample + 3]);
+        }
+    }
+
+    Ok((plan.destination_width, plan.destination_height, transformed))
+}
+
 fn decoded_uncompressed_to_rgba_image(
     decoded: DecodedUncompressedImage,
     transforms: &[isobmff::PrimaryItemTransformProperty],
@@ -10152,10 +10812,18 @@ fn apply_primary_item_transforms_rgba<T: Copy + Default>(
 }
 
 fn checked_rgba_sample_count(width: u32, height: u32) -> Result<usize, DecodeError> {
+    checked_interleaved_sample_count(width, height, 4)
+}
+
+fn checked_interleaved_sample_count(
+    width: u32,
+    height: u32,
+    channels: u64,
+) -> Result<usize, DecodeError> {
     let pixel_count = u64::from(width).checked_mul(u64::from(height)).ok_or({
         DecodeError::TransformGuard(TransformGuardError::PixelCountOverflow { width, height })
     })?;
-    let sample_count = pixel_count.checked_mul(4).ok_or({
+    let sample_count = pixel_count.checked_mul(channels).ok_or({
         DecodeError::TransformGuard(TransformGuardError::SampleCountOverflow { width, height })
     })?;
     usize::try_from(sample_count).map_err(|_| {
@@ -11018,25 +11686,56 @@ fn convert_heic_to_rgba8_into(
 ) -> Result<(), DecodeHeicError> {
     let output_len = checked_heic_rgba_output_len(decoded)?;
     out.resize(output_len, 0);
-    convert_heic_to_rgba8_slice(decoded, out)
+    convert_heic_to_interleaved_rgb8_slice::<4>(decoded, out, scale_sample_to_u8, "RGBA8")
+}
+
+fn convert_heic_to_rgb8(decoded: &DecodedHeicImage) -> Result<Vec<u8>, DecodeHeicError> {
+    let mut out = Vec::new();
+    convert_heic_to_rgb8_into(decoded, &mut out)?;
+    Ok(out)
+}
+
+fn convert_heic_to_rgb8_into(
+    decoded: &DecodedHeicImage,
+    out: &mut Vec<u8>,
+) -> Result<(), DecodeHeicError> {
+    let output_len = checked_heic_interleaved_output_len(decoded, 3, "RGB")?;
+    out.resize(output_len, 0);
+    convert_heic_to_interleaved_rgb8_slice::<3>(
+        decoded,
+        out,
+        scale_heic_sample_to_image_rgb8,
+        "RGB8",
+    )
 }
 
 fn checked_heic_rgba_output_len(decoded: &DecodedHeicImage) -> Result<usize, DecodeHeicError> {
+    checked_heic_interleaved_output_len(decoded, 4, "RGBA")
+}
+
+fn checked_heic_interleaved_output_len(
+    decoded: &DecodedHeicImage,
+    channels: usize,
+    label: &str,
+) -> Result<usize, DecodeHeicError> {
     let expected_y_samples = heic_sample_count(decoded.width, decoded.height, "Y")?;
     expected_y_samples
-        .checked_mul(4)
+        .checked_mul(channels)
         .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
             detail: format!(
-                "RGBA output sample count overflow for {}x{}",
+                "{label} output sample count overflow for {}x{}",
                 decoded.width, decoded.height
             ),
         })
 }
 
-fn convert_heic_to_rgba8_slice(
+fn convert_heic_to_interleaved_rgb8_slice<const CHANNELS: usize>(
     decoded: &DecodedHeicImage,
     out: &mut [u8],
+    scale_sample: fn(u16, u8) -> u8,
+    output_label: &str,
 ) -> Result<(), DecodeHeicError> {
+    debug_assert!(matches!(CHANNELS, 3 | 4));
     let ycbcr_transform =
         ycbcr_transform_from_matrix(decoded.ycbcr_matrix).map_err(|matrix_coefficients| {
             DecodeHeicError::UnsupportedMatrixCoefficients {
@@ -11065,19 +11764,11 @@ fn convert_heic_to_rgba8_slice(
         usize::try_from(decoded.height).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
             detail: format!("HEIC height does not fit in usize ({})", decoded.height),
         })?;
-    let output_len =
-        expected_y_samples
-            .checked_mul(4)
-            .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                detail: format!(
-                    "RGBA output sample count overflow for {}x{}",
-                    decoded.width, decoded.height
-                ),
-            })?;
+    let output_len = checked_heic_interleaved_output_len(decoded, CHANNELS, output_label)?;
     if out.len() != output_len {
         return Err(DecodeHeicError::InvalidDecodedFrame {
             detail: format!(
-                "RGBA8 output has {} samples, expected {output_len}",
+                "{output_label} output has {} samples, expected {output_len}",
                 out.len()
             ),
         });
@@ -11098,7 +11789,7 @@ fn convert_heic_to_rgba8_slice(
 
     for y in 0..height {
         let row_start = y * width;
-        let out_row_start = row_start * 4;
+        let out_row_start = row_start * CHANNELS;
 
         for x in 0..width {
             let y_index = row_start + x;
@@ -11128,11 +11819,13 @@ fn convert_heic_to_rgba8_slice(
             } else {
                 converter.convert(y_sample, cb_sample, cr_sample)
             };
-            let out_index = out_row_start + (x * 4);
-            out[out_index] = scale_sample_to_u8(r, bit_depth);
-            out[out_index + 1] = scale_sample_to_u8(g, bit_depth);
-            out[out_index + 2] = scale_sample_to_u8(b, bit_depth);
-            out[out_index + 3] = u8::MAX;
+            let out_index = out_row_start + (x * CHANNELS);
+            out[out_index] = scale_sample(r, bit_depth);
+            out[out_index + 1] = scale_sample(g, bit_depth);
+            out[out_index + 2] = scale_sample(b, bit_depth);
+            if CHANNELS == 4 {
+                out[out_index + 3] = u8::MAX;
+            }
         }
     }
 
@@ -11903,6 +12596,17 @@ fn scale_sample_to_u16(sample: u16, bit_depth: u8) -> u16 {
         as u16
 }
 
+/// Match `image`'s RGBA16-to-RGB8 conversion for high-bit-depth HEIC while
+/// avoiding the intermediate RGBA16 allocation. Eight-bit inputs retain their
+/// existing direct scaling path.
+fn scale_heic_sample_to_image_rgb8(sample: u16, bit_depth: u8) -> u8 {
+    if bit_depth <= 8 {
+        return scale_sample_to_u8(sample, bit_depth);
+    }
+
+    ((u32::from(scale_sample_to_u16(sample, bit_depth)) + 128) / 257) as u8
+}
+
 #[derive(Default)]
 struct DecoderContextGuard(Option<Dav1dContext>);
 
@@ -12461,7 +13165,169 @@ mod tests {
         assert_eq!(direct, transformed);
     }
 
-    #[cfg(feature = "image-integration")]
+    #[cfg(feature = "parallel-grid")]
+    #[test]
+    fn grid_parallel_window_uses_each_candidate_tile_estimate() {
+        const MIB: u64 = 1024 * 1024;
+
+        assert_eq!(
+            super::heic_grid_tile_decode_window_from_estimates(
+                [Some(4 * MIB), Some(80 * MIB), Some(4 * MIB)],
+                8,
+            ),
+            1,
+            "a later oversized tile must not inherit the first candidate's small estimate"
+        );
+        assert_eq!(
+            super::heic_grid_tile_decode_window_from_estimates(
+                [Some(32 * MIB), Some(32 * MIB), Some(MIB)],
+                8,
+            ),
+            2,
+            "a window may fill the memory budget exactly"
+        );
+        assert_eq!(
+            super::heic_grid_tile_decode_window_from_estimates(
+                [Some(4 * MIB), None, Some(4 * MIB)],
+                8,
+            ),
+            1,
+            "a tile whose metadata cannot be preflighted must stay outside the parallel window"
+        );
+        assert_eq!(
+            super::heic_grid_tile_decode_window_from_estimates(
+                core::iter::repeat_n(Some(MIB), 16),
+                8,
+            ),
+            8,
+            "the thread cap must remain effective for small tiles"
+        );
+    }
+
+    #[cfg(feature = "parallel-grid")]
+    #[test]
+    fn grid_parallel_estimate_uses_coded_sps_geometry_and_both_stream_copies() {
+        use super::isobmff::{HeicGridTileItemData, HevcNalArray};
+
+        // x265 SPS for a 126x126 visible 4:2:0 image whose coded frame is
+        // 128x128. The decoder allocates the coded geometry before applying
+        // the two-pixel SPS conformance window.
+        let sps_nal = vec![
+            0x42, 0x01, 0x01, 0x03, 0x70, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x03, 0x00, 0x1e, 0xa0, 0x10, 0x20, 0x20, 0x75, 0x59, 0x65, 0x66, 0x92, 0x4c,
+            0xae, 0x01, 0x00, 0x00, 0x03, 0x03, 0xe8, 0x00, 0x00, 0x03, 0x03, 0xe8, 0x08,
+        ];
+        let tile = HeicGridTileItemData {
+            item_id: 1,
+            construction_method: 0,
+            hvcc: test_hvcc(
+                vec![HevcNalArray {
+                    array_completeness: true,
+                    nal_unit_type: 33,
+                    nal_units: vec![sps_nal.clone()],
+                }],
+                4,
+            ),
+            colr: Default::default(),
+            transforms: Vec::new(),
+            payload: Vec::new(),
+        };
+
+        let sps = super::hevc_sps_from_nal(&sps_nal, 0).expect("SPS should parse");
+        let metadata = super::hevc_metadata_from_sps(&sps).expect("SPS metadata should parse");
+        assert_eq!((metadata.width, metadata.height), (126, 126));
+
+        let decoded_bytes = super::estimate_heic_grid_sps_decode_bytes(&sps)
+            .expect("SPS allocation estimate should parse");
+        let mut stream_memory = super::HeicGridTileStreamMemoryEstimate::default();
+        stream_memory
+            .add_nal(&sps_nal)
+            .expect("SPS stream estimate should fit");
+        assert_eq!(
+            super::estimate_heic_grid_tile_decode_bytes(&tile).expect("tile estimate should parse"),
+            decoded_bytes + stream_memory.estimated_decoder_bytes(),
+        );
+        assert_eq!(decoded_bytes, 128 * 128 * 6);
+    }
+
+    #[cfg(feature = "parallel-grid")]
+    #[test]
+    fn grid_parallel_estimate_uses_largest_sps_across_hvcc_and_payload() {
+        use super::isobmff::{HeicGridTileItemData, HevcNalArray};
+
+        let small_sps = vec![
+            0x42, 0x01, 0x01, 0x03, 0x70, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x03, 0x00, 0x1e, 0xa0, 0x20, 0x81, 0x05, 0x96, 0xea, 0xae, 0x9a, 0xe6, 0xe0,
+            0x21, 0xa0, 0xc0, 0x80, 0x00, 0x00, 0x0c, 0x80, 0x00, 0x00, 0x03, 0x00, 0x84,
+        ];
+        let large_sps = vec![
+            0x42, 0x01, 0x01, 0x03, 0x70, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x03, 0x00, 0x78, 0xa0, 0x07, 0xd2, 0x00, 0x53, 0x9f, 0x59, 0x6e, 0xa4, 0x92,
+            0x9a, 0xe6, 0xe0, 0x21, 0xa0, 0xc0, 0x80, 0x00, 0x00, 0x0c, 0x80, 0x00, 0x00, 0x03,
+            0x00, 0x84,
+        ];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(large_sps.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&large_sps);
+        let tile = HeicGridTileItemData {
+            item_id: 1,
+            construction_method: 0,
+            hvcc: test_hvcc(
+                vec![HevcNalArray {
+                    array_completeness: true,
+                    nal_unit_type: 33,
+                    nal_units: vec![small_sps.clone()],
+                }],
+                4,
+            ),
+            colr: Default::default(),
+            transforms: Vec::new(),
+            payload,
+        };
+
+        let small = super::hevc_sps_from_nal(&small_sps, 0).expect("small SPS should parse");
+        let large = super::hevc_sps_from_nal(&large_sps, 0).expect("large SPS should parse");
+        let small_bytes = super::estimate_heic_grid_sps_decode_bytes(&small)
+            .expect("small SPS estimate should parse");
+        let large_bytes = super::estimate_heic_grid_sps_decode_bytes(&large)
+            .expect("large SPS estimate should parse");
+        assert!(large_bytes > small_bytes);
+
+        let mut stream_memory = super::HeicGridTileStreamMemoryEstimate::default();
+        stream_memory
+            .add_nal(&small_sps)
+            .expect("small SPS stream estimate should fit");
+        stream_memory
+            .add_nal(&large_sps)
+            .expect("large SPS stream estimate should fit");
+        assert_eq!(
+            super::estimate_heic_grid_tile_decode_bytes(&tile).expect("tile estimate should parse"),
+            large_bytes + stream_memory.estimated_decoder_bytes(),
+        );
+    }
+
+    #[cfg(feature = "parallel-grid")]
+    #[test]
+    fn grid_parallel_stream_estimate_counts_epb_positions_and_nal_metadata() {
+        let nal = [
+            0x4e, 0x01, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x01, 0x00, 0x00, 0x03, 0x02,
+        ];
+        let mut stream_memory = super::HeicGridTileStreamMemoryEstimate::default();
+        stream_memory
+            .add_nal(&nal)
+            .expect("NAL stream estimate should fit");
+
+        assert_eq!(stream_memory.normalized_stream_bytes, nal.len() as u64 + 4);
+        assert_eq!(stream_memory.rbsp_bytes, nal.len() as u64 - 2);
+        assert_eq!(stream_memory.emulation_prevention_position_bytes, 40);
+        assert!(
+            stream_memory.estimated_decoder_bytes()
+                > stream_memory.normalized_stream_bytes * 2 + stream_memory.rbsp_bytes,
+            "parsed-NAL metadata and EPB positions must add memory beyond the stream and RBSP copies"
+        );
+    }
+
+    #[cfg(any(feature = "image-integration", feature = "parallel-grid"))]
     fn test_hvcc(
         nal_arrays: Vec<super::isobmff::HevcNalArray>,
         nal_length_size: u8,
@@ -12769,6 +13635,76 @@ mod tests {
             super::convert_heic_to_rgba8(image).expect("full-frame conversion should succeed");
         super::apply_primary_item_transforms_rgba(image.width, image.height, pixels, transforms)
             .expect("reference RGBA transform should succeed")
+    }
+
+    fn rgba8_to_rgb8(pixels: &[u8]) -> Vec<u8> {
+        pixels
+            .chunks_exact(4)
+            .flat_map(|pixel| pixel[..3].iter().copied())
+            .collect()
+    }
+
+    #[test]
+    fn direct_rgb8_matches_final_rgba8_output_with_transforms() {
+        let image = synthetic_yuv_image(super::HeicPixelLayout::Yuv420);
+        let transforms = [
+            isobmff::PrimaryItemTransformProperty::CleanAperture(synthetic_clean_aperture(-1, -1)),
+            isobmff::PrimaryItemTransformProperty::Mirror(isobmff::ImageMirrorProperty {
+                direction: isobmff::ImageMirrorDirection::Horizontal,
+            }),
+            isobmff::PrimaryItemTransformProperty::Rotation(isobmff::ImageRotationProperty {
+                rotation_ccw_degrees: 90,
+            }),
+        ];
+        let rgba = super::decoded_heic_to_rgba_image(image.clone(), &transforms, None, None)
+            .expect("RGBA decode should succeed");
+        let direct = super::decoded_heic_to_rgb8_image(image, &transforms, None)
+            .expect("direct RGB8 decode should succeed");
+        let super::DecodedRgbaPixels::U8(rgba_pixels) = rgba.pixels else {
+            panic!("eight-bit input should produce RGBA8");
+        };
+
+        assert_eq!((direct.width, direct.height), (rgba.width, rgba.height));
+        assert_eq!(direct.pixels, rgba8_to_rgb8(&rgba_pixels));
+    }
+
+    #[test]
+    fn direct_rgb8_matches_rgba16_to_rgb8_rounding() {
+        let mut image = synthetic_yuv_image(super::HeicPixelLayout::Yuv444);
+        image.bit_depth_luma = 10;
+        image.bit_depth_chroma = 10;
+        for sample in &mut image.y_plane.samples {
+            *sample *= 4;
+        }
+        for sample in image.u_plane.as_mut().expect("U plane").samples.iter_mut() {
+            *sample *= 4;
+        }
+        for sample in image.v_plane.as_mut().expect("V plane").samples.iter_mut() {
+            *sample *= 4;
+        }
+        let transforms = [isobmff::PrimaryItemTransformProperty::Rotation(
+            isobmff::ImageRotationProperty {
+                rotation_ccw_degrees: 270,
+            },
+        )];
+        let rgba = super::decoded_heic_to_rgba_image(image.clone(), &transforms, None, None)
+            .expect("RGBA16 decode should succeed");
+        let direct = super::decoded_heic_to_rgb8_image(image, &transforms, None)
+            .expect("direct RGB8 decode should succeed");
+        let super::DecodedRgbaPixels::U16(rgba_pixels) = rgba.pixels else {
+            panic!("ten-bit input should produce RGBA16");
+        };
+        let expected: Vec<u8> = rgba_pixels
+            .chunks_exact(4)
+            .flat_map(|pixel| {
+                pixel[..3]
+                    .iter()
+                    .map(|sample| ((u32::from(*sample) + 128) / 257) as u8)
+            })
+            .collect();
+
+        assert_eq!((direct.width, direct.height), (rgba.width, rgba.height));
+        assert_eq!(direct.pixels, expected);
     }
 
     #[test]
