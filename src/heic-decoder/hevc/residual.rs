@@ -124,6 +124,31 @@ pub static SCAN_ORDER_4X4_VERT: [(u8, u8); 16] = [
     (3, 3),
 ];
 
+/// Raster position (`y * 4 + x`) for each position in the three 4x4 scans.
+/// Residual significance decoding uses this compact form on every CABAC bin;
+/// keep the coordinate-pair tables above for callers that need coordinates.
+const SCAN_RASTER_4X4: [[u8; 16]; 3] = [
+    [0, 4, 1, 8, 5, 2, 12, 9, 6, 3, 13, 10, 7, 14, 11, 15],
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15],
+];
+
+const fn invert_4x4_scans(scans: [[u8; 16]; 3]) -> [[u8; 16]; 3] {
+    let mut inverse = [[0u8; 16]; 3];
+    let mut scan_idx = 0;
+    while scan_idx < scans.len() {
+        let mut pos = 0;
+        while pos < scans[scan_idx].len() {
+            inverse[scan_idx][scans[scan_idx][pos] as usize] = pos as u8;
+            pos += 1;
+        }
+        scan_idx += 1;
+    }
+    inverse
+}
+
+const INVERSE_SCAN_4X4: [[u8; 16]; 3] = invert_4x4_scans(SCAN_RASTER_4X4);
+
 /// Get scan order table for 4x4 sub-blocks
 pub fn get_scan_4x4(order: ScanOrder) -> &'static [(u8, u8); 16] {
     match order {
@@ -233,25 +258,30 @@ pub fn decode_residual(
 
     // Get scan tables
     let scan_sub = get_scan_sub_block(log2_size, scan_order);
-    let scan_pos = get_scan_4x4(scan_order);
-
     // Convert ScanOrder to scan_idx for context derivation
     let scan_idx = match scan_order {
         ScanOrder::Diagonal => 0,
         ScanOrder::Horizontal => 1,
         ScanOrder::Vertical => 2,
     };
+    let scan_raster = &SCAN_RASTER_4X4[scan_idx];
+    let inverse_scan = &INVERSE_SCAN_4X4[scan_idx];
 
     // Find last sub-block
     let sb_width = (size / 4) as usize;
     let last_sb_x = last_x / 4;
     let last_sb_y = last_y / 4;
-    let last_sb_idx = find_scan_pos(scan_sub, last_sb_x, last_sb_y, sb_width as u32);
+    let last_sb_idx = sub_block_scan_pos(
+        last_sb_x,
+        last_sb_y,
+        sb_width as u32,
+        scan_order == ScanOrder::Horizontal,
+    );
 
     // Find last position within sub-block
     let local_x = (last_x % 4) as u8;
     let local_y = (last_y % 4) as u8;
-    let last_pos_in_sb = find_scan_pos_4x4(scan_pos, local_x, local_y);
+    let last_pos_in_sb = inverse_scan[(local_y * 4 + local_x) as usize];
 
     if rc_trace {
         rc_eprintln!(
@@ -365,14 +395,19 @@ pub fn decode_residual(
             }
             base
         };
+        let sig_ctx_local = if log2_size == 2 {
+            &CTX_IDX_MAP_4X4
+        } else {
+            &SIG_CTX_LOCAL[prev_csbf as usize]
+        };
 
         // Determine the last position to check
         // For last sub-block: start from last_pos_in_sb (the known last significant coeff)
         // For other sub-blocks: start from position 15
         let last_coeff = if sb_idx == last_sb_idx {
             // Set the known last significant coefficient (no need to decode sig_coeff_flag)
-            let (px, py) = scan_pos[start_pos as usize];
-            let dst_idx = sb_offset + py as usize * size + px as usize;
+            let raster_pos = scan_raster[start_pos as usize] as usize;
+            let dst_idx = sb_offset + (raster_pos >> 2) * size + (raster_pos & 3);
             coeffs[dst_idx] = 1;
             touched_coeffs[num_nonzero] = dst_idx as u16;
             num_nonzero += 1;
@@ -389,17 +424,14 @@ pub fn decode_residual(
         // Decode significant_coeff_flags for positions last_coeff down to 1
         // (DC at position 0 is handled separately for inference)
         for n in (1..=last_coeff).rev() {
-            let (x_in_sb, y_in_sb) = scan_pos[n as usize];
-            let raster_pos = y_in_sb as usize * 4 + x_in_sb as usize;
-            let ctx_idx = if log2_size == 2 {
-                sig_ctx_base + CTX_IDX_MAP_4X4[raster_pos] as usize
-            } else {
-                sig_ctx_base + SIG_CTX_LOCAL[prev_csbf as usize][raster_pos] as usize
-            };
+            let raster_pos = scan_raster[n as usize] as usize;
+            let ctx_idx = sig_ctx_base + sig_ctx_local[raster_pos] as usize;
             let sig = cabac.decode_bin(&mut ctx[ctx_idx]) != 0;
             if rc_trace {
                 let (range, _, _) = cabac.get_state_extended();
                 let (byte_pos, _, _) = cabac.get_position();
+                let x_in_sb = (raster_pos & 3) as u8;
+                let y_in_sb = (raster_pos >> 2) as u8;
                 let xc = sb_x * 4 + x_in_sb;
                 let yc = sb_y * 4 + y_in_sb;
                 rc_eprintln!(
@@ -414,7 +446,7 @@ pub fn decode_residual(
                 );
             }
             if sig {
-                let dst_idx = sb_offset + y_in_sb as usize * size + x_in_sb as usize;
+                let dst_idx = sb_offset + (raster_pos >> 2) * size + (raster_pos & 3);
                 coeffs[dst_idx] = 1;
                 touched_coeffs[num_nonzero] = dst_idx as u16;
                 num_nonzero += 1;
@@ -652,11 +684,9 @@ pub fn decode_residual(
                 let (byte_pos, _, _) = cabac.get_position();
                 let raster_x = dst_idx % size;
                 let raster_y = dst_idx / size;
-                let n = find_scan_pos_4x4(
-                    scan_pos,
-                    (raster_x - sb_x as usize * 4) as u8,
-                    (raster_y - sb_y as usize * 4) as u8,
-                );
+                let local_raster =
+                    (raster_y - sb_y as usize * 4) * 4 + raster_x - sb_x as usize * 4;
+                let n = inverse_scan[local_raster];
                 rc_eprintln!(
                     "{rcp}_REM n={} base={} rice={} rem={} final={} range={} byte={}",
                     n,
@@ -824,24 +854,21 @@ fn get_scan_sub_block(log2_size: u8, order: ScanOrder) -> &'static [(u8, u8)] {
     }
 }
 
-/// Find position in scan order
-fn find_scan_pos(scan: &[(u8, u8)], x: u32, y: u32, _width: u32) -> u32 {
-    for (i, &(sx, sy)) in scan.iter().enumerate() {
-        if sx as u32 == x && sy as u32 == y {
-            return i as u32;
-        }
+/// Inverse of the sub-block scan tables. Only 8x8 luma can use the horizontal
+/// 2x2 order; all larger sub-block grids use the diagonal order.
+#[inline]
+fn sub_block_scan_pos(x: u32, y: u32, width: u32, horizontal: bool) -> u32 {
+    if horizontal && width == 2 {
+        return y * width + x;
     }
-    0
-}
 
-/// Find position in 4x4 scan order
-fn find_scan_pos_4x4(scan: &[(u8, u8); 16], x: u8, y: u8) -> u8 {
-    for (i, &(sx, sy)) in scan.iter().enumerate() {
-        if sx == x && sy == y {
-            return i as u8;
-        }
+    let diagonal = x + y;
+    if diagonal < width {
+        diagonal * (diagonal + 1) / 2 + x
+    } else {
+        let tail = 2 * width - 1 - diagonal;
+        width * width - tail * (tail + 1) / 2 + x - (diagonal + 1 - width)
     }
-    0
 }
 
 /// Decode last significant coefficient position
