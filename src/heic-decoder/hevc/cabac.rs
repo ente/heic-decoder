@@ -75,33 +75,55 @@ static LPS_TABLE: [[u8; 4]; 64] = [
     [2, 2, 2, 2],
 ];
 
-/// Renormalization table
-#[allow(dead_code)]
-static RENORM_TABLE: [u8; 32] = [
-    6, 5, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-];
-
 /// State transition for MPS
-static STATE_TRANS_MPS: [u8; 64] = [
+const STATE_TRANS_MPS: [u8; 64] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
     51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 62, 63,
 ];
 
 /// State transition for LPS
-static STATE_TRANS_LPS: [u8; 64] = [
+const STATE_TRANS_LPS: [u8; 64] = [
     0, 0, 1, 2, 2, 4, 4, 5, 6, 7, 8, 9, 9, 11, 11, 12, 13, 13, 15, 15, 16, 16, 18, 18, 19, 19, 21,
     21, 22, 22, 23, 24, 24, 25, 26, 26, 27, 27, 28, 29, 29, 30, 30, 30, 31, 32, 32, 33, 33, 33, 34,
     34, 35, 35, 35, 36, 36, 36, 37, 37, 37, 38, 38, 63,
 ];
 
+const fn build_packed_mps_transitions() -> [u8; 128] {
+    let mut transitions = [0; 128];
+    let mut packed = 0;
+    while packed < transitions.len() {
+        let state = packed >> 1;
+        let mps = packed & 1;
+        transitions[packed] = (STATE_TRANS_MPS[state] << 1) | mps as u8;
+        packed += 1;
+    }
+    transitions
+}
+
+const fn build_packed_lps_transitions() -> [u8; 128] {
+    let mut transitions = [0; 128];
+    let mut packed = 0;
+    while packed < transitions.len() {
+        let state = packed >> 1;
+        let mut mps = packed & 1;
+        if state == 0 {
+            mps ^= 1;
+        }
+        transitions[packed] = (STATE_TRANS_LPS[state] << 1) | mps as u8;
+        packed += 1;
+    }
+    transitions
+}
+
+const PACKED_STATE_TRANS_MPS: [u8; 128] = build_packed_mps_transitions();
+const PACKED_STATE_TRANS_LPS: [u8; 128] = build_packed_lps_transitions();
+
 /// CABAC context model
 #[derive(Clone, Copy)]
 pub struct ContextModel {
-    /// State index (0-63)
-    state: u8,
-    /// Most probable symbol (0 or 1)
-    mps: u8,
+    /// State index (0-63) in bits 1-6 and the MPS value in bit 0.
+    state_mps: u8,
 }
 
 #[allow(dead_code)]
@@ -122,12 +144,14 @@ impl ContextModel {
             ((63 - init_state) as u8, 0)
         };
 
-        Self { state, mps }
+        Self {
+            state_mps: (state << 1) | mps,
+        }
     }
 
     /// Get the current context state and MPS
     pub fn get_state(&self) -> (u8, u8) {
-        (self.state, self.mps)
+        (self.state_mps >> 1, self.state_mps & 1)
     }
 
     /// Initialize context for a given slice QP
@@ -140,11 +164,9 @@ impl ContextModel {
         let init_state = init_state.clamp(1, 126);
 
         if init_state >= 64 {
-            self.state = (init_state - 64) as u8;
-            self.mps = 1;
+            self.state_mps = ((init_state - 64) as u8) << 1 | 1;
         } else {
-            self.state = (63 - init_state) as u8;
-            self.mps = 0;
+            self.state_mps = ((63 - init_state) as u8) << 1;
         }
     }
 }
@@ -248,27 +270,14 @@ impl<'a> CabacDecoder<'a> {
         Ok(())
     }
 
-    /// Read a single bit from the bitstream (for regular context decoding)
-    fn read_bit(&mut self) {
-        self.value <<= 1;
-        self.bits_needed += 1;
-
-        if self.bits_needed >= 0 {
-            if self.byte_pos < self.data.len() {
-                self.bits_needed = -8;
-                self.value |= self.data[self.byte_pos] as u32;
-                self.byte_pos += 1;
-            } else {
-                self.bits_needed = -8;
-            }
-        }
-    }
-
     /// Decode a single bin using context model
     #[inline]
     pub fn decode_bin(&mut self, ctx: &mut ContextModel) -> u8 {
+        let packed_state = ctx.state_mps as usize;
+        let state = packed_state >> 1;
+        let mps = (packed_state & 1) as u8;
         let q_range_idx = (self.range >> 6) & 3;
-        let lps_range = LPS_TABLE[ctx.state as usize][q_range_idx as usize] as u32;
+        let lps_range = LPS_TABLE[state][q_range_idx as usize] as u32;
 
         self.range -= lps_range;
 
@@ -278,18 +287,14 @@ impl<'a> CabacDecoder<'a> {
         let bin_val;
         if self.value < scaled_range {
             // MPS path
-            bin_val = ctx.mps;
-            ctx.state = STATE_TRANS_MPS[ctx.state as usize];
+            bin_val = mps;
+            ctx.state_mps = PACKED_STATE_TRANS_MPS[packed_state];
         } else {
             // LPS path
-            bin_val = 1 - ctx.mps;
+            bin_val = mps ^ 1;
             self.value -= scaled_range;
             self.range = lps_range;
-
-            if ctx.state == 0 {
-                ctx.mps = 1 - ctx.mps;
-            }
-            ctx.state = STATE_TRANS_LPS[ctx.state as usize];
+            ctx.state_mps = PACKED_STATE_TRANS_LPS[packed_state];
         }
 
         // Renormalize
@@ -368,10 +373,22 @@ impl<'a> CabacDecoder<'a> {
     /// Renormalize the decoder state
     #[inline]
     fn renormalize(&mut self) {
-        while self.range < 256 {
-            self.range <<= 1;
-            // Shift value and read more bits
-            self.read_bit();
+        if self.range < 256 {
+            // `range` is non-zero and at most seven shifts are needed. Since
+            // `bits_needed` starts in -8..=-1, the batch crosses at most one
+            // byte boundary. When it does, place the new byte exactly where
+            // the remaining single-bit shifts would have moved it.
+            let shift = self.range.leading_zeros() - 23;
+            self.range <<= shift;
+            self.value <<= shift;
+            self.bits_needed += shift as i32;
+            if self.bits_needed >= 0 {
+                if self.byte_pos < self.data.len() {
+                    self.value |= (self.data[self.byte_pos] as u32) << self.bits_needed;
+                    self.byte_pos += 1;
+                }
+                self.bits_needed -= 8;
+            }
         }
         // Invariant: after renormalization, range >= 256
         debug_assert!(self.range >= 256, "range {} < 256 after renorm", self.range);
