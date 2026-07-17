@@ -8,6 +8,8 @@ STATE_DIR="${HEIC_AUTORESEARCH_STATE_DIR:-$DEFAULT_STATE_BASE/$REPO_ID}"
 STATE_FILE="$STATE_DIR/state.tsv"
 RESULTS_FILE="$STATE_DIR/results.tsv"
 STOP_FILE="$STATE_DIR/STOP"
+JOURNAL_FILE="${STATE_DIR}.experiments.md"
+JOURNAL_MIRROR="$ROOT_DIR/.heic-autoresearch/experiments.md"
 BENCHMARK_SOURCE="$ROOT_DIR/autoresearch/benchmark.rs"
 BENCHMARK_CORPUS="$ROOT_DIR/autoresearch/benchmark-corpus.txt"
 CONFIRMATION_CORPUS="$STATE_DIR/confirmation-corpus.txt"
@@ -40,6 +42,9 @@ Run options:
 
 The trusted state directory defaults to:
   ~/.cache/heic-decoder-autoresearch/<repo-id>/
+
+The durable experiment journal is mirrored to:
+  .heic-autoresearch/experiments.md
 EOF
 }
 
@@ -123,6 +128,25 @@ ensure_external_state_dir() {
       die "HEIC_AUTORESEARCH_STATE_DIR must be outside the repository so the optimization agent cannot modify trusted state."
       ;;
   esac
+}
+
+mirror_journal() {
+  [[ -f "$JOURNAL_FILE" ]] || return 0
+  mkdir -p "$(dirname "$JOURNAL_MIRROR")"
+  cp "$JOURNAL_FILE" "$JOURNAL_MIRROR"
+}
+
+initialize_journal() {
+  if [[ ! -f "$JOURNAL_FILE" ]]; then
+    mkdir -p "$(dirname "$JOURNAL_FILE")"
+    {
+      printf '# HEIC decoder autoresearch experiment journal\n\n'
+      printf 'This is the controller-owned history of accepted and rejected experiments. '
+      printf 'The live repository mirror is `.heic-autoresearch/experiments.md`; '
+      printf 'optimization agents may read it but must not edit it.\n'
+    } > "$JOURNAL_FILE"
+  fi
+  mirror_journal
 }
 
 require_clean_worktree() {
@@ -449,6 +473,115 @@ append_result() {
     "$cumulative" "$status" "$(sanitize_field "$description")" >> "$RESULTS_FILE"
 }
 
+journal_learning() {
+  local status="$1" reason="$2" primary_speedup="$3" confirmation_speedup="$4"
+  case "$status" in
+    accepted)
+      printf 'The candidate cleared both production image-hook speed gates and all promotion checks. '
+      printf 'It is preserved in the recorded commit and becomes the next champion.'
+      ;;
+    baseline)
+      printf 'This entry establishes a measurement baseline; it is not an optimization attempt.'
+      ;;
+    rejected)
+      case "$reason" in
+        *"primary hook improvement"*)
+          printf 'The implementation measured %s on the primary production image-hook benchmark, ' "x${primary_speedup}"
+          printf 'which did not clear the controller\x27s required latency reduction. '
+          printf 'Do not retry this implementation unchanged; revisit the idea only with a materially different mechanism or evidence that it affects more of the measured path.'
+          ;;
+        *"full-corpus hook confirmation"*)
+          printf 'The primary benchmark cleared its gate, but the full-corpus confirmation measured %s and did not clear its gate. ' "x${confirmation_speedup}"
+          printf 'The gain was not broad or stable enough across the pinned corpus; do not repeat the same implementation unchanged.'
+          ;;
+        *"correctness failed"*)
+          printf 'The candidate was fast enough to promote but failed the full pixel-exact oracle. '
+          printf 'Any follow-up must first explain and fix the recorded correctness mismatch; speed alone cannot rescue this implementation.'
+          ;;
+        *)
+          printf 'The controller rejected this implementation because %s. ' "$reason"
+          printf 'Consult the attempt artifacts before revisiting it, and do not retry it unchanged without directly addressing that failure.'
+          ;;
+      esac
+      ;;
+    no_change)
+      printf 'The agent produced no evaluable source change, so no performance factor exists. '
+      printf 'A follow-up needs a concrete implementation rather than repeating the same exploration.'
+      ;;
+    crash)
+      printf 'The agent or evaluator exited before a trustworthy performance result was available. '
+      printf 'Inspect the attempt log and address that failure before retrying the underlying idea.'
+      ;;
+  esac
+}
+
+append_journal_entry() {
+  local attempt="$1" status="$2" description="$3" reason="$4" commit="$5"
+  local primary_score="$6" primary_speedup="$7"
+  local confirmation_score="$8" confirmation_speedup="$9" cumulative="${10}"
+  local patch="${11:-}" timestamp agent_report
+  timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  agent_report="$STATE_DIR/attempts/$attempt/agent-last.txt"
+  initialize_journal
+
+  {
+    printf '\n## %s — attempt %s — %s\n\n' "$timestamp" "$attempt" "$status"
+    printf -- '- Experiment: %s\n' "$(sanitize_field "$description")"
+    printf -- '- Primary production-hook speed factor: '
+    if [[ "$primary_speedup" == "-" ]]; then
+      printf 'not measured\n'
+    else
+      printf '`x%s` (candidate `%s ms`)\n' "$primary_speedup" "$primary_score"
+    fi
+    printf -- '- Full-corpus production-hook speed factor: '
+    if [[ "$confirmation_speedup" == "-" ]]; then
+      printf 'not measured\n'
+    else
+      printf '`x%s` (candidate `%s ms`)\n' "$confirmation_speedup" "$confirmation_score"
+    fi
+    printf -- '- Cumulative speed factor for this baseline: `x%s`\n' "$cumulative"
+    [[ "$commit" == "-" ]] || printf -- '- Commit: `%s`\n' "$commit"
+    [[ -z "$reason" ]] || printf -- '- Controller result: %s\n' "$reason"
+    if [[ -n "$patch" ]]; then
+      printf -- '- Rejected patch: `rejected/%s.diff` in this run\x27s trusted-state directory or archive\n' "$attempt"
+    fi
+    printf '\n### Learning\n\n'
+    journal_learning "$status" "$reason" "$primary_speedup" "$confirmation_speedup"
+    printf '\n'
+    if [[ -s "$agent_report" ]]; then
+      printf '\n### Agent report\n\n'
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        printf '> %s\n' "$line"
+      done < "$agent_report"
+    fi
+  } >> "$JOURNAL_FILE"
+  mirror_journal
+}
+
+record_result() {
+  local attempt="$1" commit="$2" primary_score="$3" primary_speedup="$4"
+  local confirmation_score="$5" confirmation_speedup="$6" cumulative="$7"
+  local ledger_status="$8" description="$9" reason="${10:-}" patch="${11:-}"
+  local journal_status ledger_description
+  ledger_description="$description"
+  [[ -z "$reason" ]] || ledger_description="$reason; $description"
+  case "$ledger_status" in
+    keep)
+      if [[ "$attempt" == "baseline" ]]; then journal_status=baseline; else journal_status=accepted; fi
+      ;;
+    discard) journal_status=rejected ;;
+    no_change) journal_status=no_change ;;
+    crash) journal_status=crash ;;
+    *) journal_status="$ledger_status" ;;
+  esac
+  append_result "$attempt" "$commit" "$primary_score" "$primary_speedup" \
+    "$confirmation_score" "$confirmation_speedup" "$cumulative" \
+    "$ledger_status" "$ledger_description"
+  append_journal_entry "$attempt" "$journal_status" "$description" "$reason" "$commit" \
+    "$primary_score" "$primary_speedup" "$confirmation_score" \
+    "$confirmation_speedup" "$cumulative" "$patch"
+}
+
 reject_candidate() {
   local attempt="$1" description="$2" reason="$3"
   local primary_score="${4:--}" primary_speedup="${5:--}"
@@ -457,8 +590,9 @@ reject_candidate() {
   collect_changed_files
   patch="$(archive_candidate_patch "$attempt")"
   cumulative="$(get_state cumulative_speedup)"
-  append_result "$attempt" - "$primary_score" "$primary_speedup" \
-    "$confirmation_score" "$confirmation_speedup" "$cumulative" discard "$reason; $description"
+  record_result "$attempt" - "$primary_score" "$primary_speedup" \
+    "$confirmation_score" "$confirmation_speedup" "$cumulative" discard \
+    "$description" "$reason" "$patch"
   discard_candidate_changes
   log discard "$reason (patch: $patch)"
   return 2
@@ -547,6 +681,7 @@ evaluate_candidate() {
   local primary_baseline_score primary_candidate_score primary_speedup
   local confirmation_candidate_score confirmation_speedup
   mkdir -p "$attempt_dir"
+  initialize_journal
 
   awk -v improvement="$min_improvement" \
     'BEGIN {exit(improvement >= 0 && improvement < 1 ? 0 : 1)}' \
@@ -565,7 +700,8 @@ evaluate_candidate() {
   changes_are_allowed || change_status=$?
   if [[ "$change_status" -ne 0 ]]; then
     if [[ "$change_status" -eq 1 ]]; then
-      append_result "$attempt" - - - - - "$(get_state cumulative_speedup)" no_change "$description"
+      record_result "$attempt" - - - - - "$(get_state cumulative_speedup)" \
+        no_change "$description" "agent made no source changes"
       log discard "Agent made no source changes."
       return 2
     fi
@@ -673,7 +809,7 @@ evaluate_candidate() {
   set_state champion_score_ms "$primary_candidate_score"
   set_state champion_confirmation_score_ms "$confirmation_candidate_score"
   set_state cumulative_speedup "$cumulative"
-  append_result "$attempt" "$(short_commit "$commit")" \
+  record_result "$attempt" "$(short_commit "$commit")" \
     "$primary_candidate_score" "$primary_speedup" \
     "$confirmation_candidate_score" "$confirmation_speedup" \
     "$cumulative" keep "$description"
@@ -694,6 +830,7 @@ cmd_setup() {
   require_cmd shasum
   require_cmd sort
   ensure_external_state_dir
+  initialize_journal
   require_clean_worktree
   load_benchmark_files
   resolve_setup_paths
@@ -751,7 +888,7 @@ cmd_setup() {
   set_state champion_score_ms "$score"
   set_state initial_confirmation_score_ms "$confirmation_score"
   set_state champion_confirmation_score_ms "$confirmation_score"
-  append_result baseline "$(short_commit "$(current_commit)")" \
+  record_result baseline "$(short_commit "$(current_commit)")" \
     "$score" 1.000000 "$confirmation_score" 1.000000 1.000000 keep baseline
   log setup "Ready on $(current_branch) at $(short_commit "$(current_commit)"); primary=${score}ms confirmation=${confirmation_score}ms"
   log setup "Trusted state: $STATE_DIR"
@@ -763,14 +900,19 @@ first_nonempty_line() {
 
 run_agent_attempt() {
   local attempt="$1" model="$2" prompt_file="$3" output_file="$4" log_file="$5"
-  local champion history
+  local champion history journal_excerpt
+  initialize_journal
   champion="$(short_commit "$(get_state champion_commit)")"
   history="$(tail -n 31 "$RESULTS_FILE")"
+  journal_excerpt="$(tail -n 500 "$JOURNAL_FILE")"
   {
     printf 'Read and follow autoresearch/program.md exactly.\n\n'
     printf 'This is experiment attempt %s. The current champion is %s.\n' "$attempt" "$champion"
     printf 'The trusted controller will evaluate after you return. Do not commit.\n\n'
+    printf 'The complete controller-owned experiment journal is mirrored at '
+    printf '`.heic-autoresearch/experiments.md`. Read it completely before choosing an idea.\n\n'
     printf 'Recent experiment ledger (TSV):\n%s\n' "$history"
+    printf '\nRecent journal excerpt (Markdown):\n%s\n' "$journal_excerpt"
   } > "$prompt_file"
 
   local args=(exec --ephemeral --color never --sandbox workspace-write --cd "$ROOT_DIR" --output-last-message "$output_file")
@@ -796,6 +938,7 @@ cmd_run() {
 
   require_cmd codex
   ensure_external_state_dir
+  initialize_journal
   require_champion_head
   require_clean_worktree
   check_environment_matches_setup
@@ -833,6 +976,9 @@ cmd_run() {
       "$attempt_dir/agent-last.txt" "$attempt_dir/agent.log"
     agent_status=$?
     set -e
+    # The repository copy is deliberately untrusted and ignored. Replace it
+    # after every agent turn from the controller-owned external journal.
+    mirror_journal
     description="$(first_nonempty_line "$attempt_dir/agent-last.txt")"
     description="${description:-agent attempt $attempt}"
     collect_changed_files
@@ -840,8 +986,8 @@ cmd_run() {
       if [[ ${#CHANGED_FILES[@]} -gt 0 ]]; then
         reject_candidate "$attempt" "$description" "Codex exited with status $agent_status" || true
       else
-        append_result "$attempt" - - - - - "$(get_state cumulative_speedup)" crash \
-          "Codex exited with status $agent_status; $description"
+        record_result "$attempt" - - - - - "$(get_state cumulative_speedup)" \
+          crash "$description" "Codex exited with status $agent_status"
       fi
       experiments=$((experiments + 1))
       continue
@@ -871,6 +1017,7 @@ cmd_evaluate() {
     esac
   done
   ensure_external_state_dir
+  initialize_journal
   require_champion_head
   check_environment_matches_setup
   verify_asset_integrity
@@ -905,6 +1052,7 @@ cmd_bench() {
 cmd_status() {
   ensure_external_state_dir
   [[ -f "$STATE_FILE" ]] || die "No baseline has been set up."
+  initialize_journal
   printf 'branch:              %s\n' "$(get_state branch)"
   printf 'champion:            %s\n' "$(short_commit "$(get_state champion_commit)")"
   printf 'initial_score_ms:    %s\n' "$(get_state initial_score_ms)"
@@ -914,6 +1062,7 @@ cmd_status() {
   printf 'confirmation_files:  %s\n' "$(get_state confirmation_file_count)"
   printf 'cumulative_speedup:  %sx\n' "$(get_state cumulative_speedup)"
   printf 'trusted_state:       %s\n' "$STATE_DIR"
+  printf 'experiment_journal:  %s\n' "$JOURNAL_MIRROR"
   printf '\nRecent results:\n'
   tail -n 11 "$RESULTS_FILE"
 }

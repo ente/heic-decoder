@@ -46,6 +46,16 @@ results, rejected patches, and logs outside the repository under
 `~/.cache/heic-decoder-autoresearch/<repo-id>/`. This prevents a workspace-only
 optimization agent from modifying the acceptance state.
 
+Every terminal attempt is also appended to a controller-owned Markdown journal
+at `~/.cache/heic-decoder-autoresearch/<repo-id>.experiments.md`. Its readable
+repository mirror is `.heic-autoresearch/experiments.md`. The journal survives
+fresh baselines and records the exact primary speed factor for every measured
+success or failure, the full-corpus factor when that gate is reached, the
+controller's rejection reason, a short learning, and the agent's report. The
+controller refreshes the ignored mirror from trusted external state before and
+after each agent turn, and every agent must read the complete journal before
+choosing an experiment.
+
 ## Start a run
 
 First commit the harness itself on `faster`, then begin from a clean worktree:
@@ -67,6 +77,7 @@ Useful controls from another terminal:
 ```bash
 scripts/autoresearch.sh status
 scripts/autoresearch.sh stop
+less .heic-autoresearch/experiments.md
 ```
 
 `stop` is cooperative: it stops before the next agent attempt, not in the middle
@@ -110,8 +121,11 @@ confirmation corpus is discovered once by the trusted baseline and stored
 outside the agent-writable repository.
 
 Rejected diffs are archived for review, but are removed from the worktree. The
-loop refuses to start unless the branch, HEAD, and tracked/untracked worktree
-match the saved champion, so unrelated user changes are never discarded.
+Markdown journal records both accepted and rejected experiments so later agents
+do not repeat an unsuccessful implementation without addressing its measured
+result or failure. The loop refuses to start unless the branch, HEAD, and
+tracked/untracked worktree match the saved champion, so unrelated user changes
+are never discarded.
 
 ## Portability and final promotion
 
