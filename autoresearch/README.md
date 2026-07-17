@@ -10,7 +10,7 @@ This directory adapts Karpathy's `autoresearch` pattern to decoder optimization:
 The controller never asks the optimization agent to decide whether its own work
 passes. It builds the current champion and candidate as separate executables,
 runs them in baseline/candidate/candidate/baseline order, and only runs the full
-correctness suite for a candidate that is at least 5% faster. It then repeats a
+correctness suite for a candidate that is at least 2% faster. It then repeats a
 larger A/B benchmark across every pinned hook-decodable HEIC/HEIF corpus file. A
 candidate is committed only after both speed gates and correctness pass.
 
@@ -104,13 +104,13 @@ For each candidate the controller:
 4. builds a fresh candidate benchmark executable in trusted external state;
 5. compares it against the saved champion with multiple interleaved samples on
    six large real-camera inputs;
-6. requires at least `HEIC_AUTORESEARCH_MIN_IMPROVEMENT` (default `0.05`, or
-   5%) improvement;
+6. requires at least `HEIC_AUTORESEARCH_MIN_IMPROVEMENT` (default `0.02`, or
+   2%) improvement;
 7. for a faster candidate, runs host clippy, installed portability target checks,
    and the complete pixel-exact validator + production-shaped image-hook suite;
 8. after correctness, runs a second A/B benchmark over every HEIC/HEIF file that
    the baseline champion decoded through the hook during setup, requiring
-   `HEIC_AUTORESEARCH_CONFIRM_MIN_IMPROVEMENT` (also 5% by default); and
+   `HEIC_AUTORESEARCH_CONFIRM_MIN_IMPROVEMENT` (also 2% by default); and
 9. commits the candidate and promotes its executable only if every check passes.
 
 The primary benchmark measures Ente's path-based image-hook flow, including file
@@ -137,11 +137,14 @@ commits for maintainability, safety, dependency quality, and over-specialization
 
 Environment knobs:
 
+- The primary and full-corpus gates both default to a 2% latency improvement,
+  measured with four interleaved A/B samples. This admitted repeatable wins that
+  the former 5% gate discarded while still rejecting corpus-specific gains.
 - `HEIC_AUTORESEARCH_MIN_IMPROVEMENT=0.10` requires a 10% primary win.
 - `HEIC_AUTORESEARCH_CONFIRM_MIN_IMPROVEMENT=0.10` requires a 10% full-corpus
   confirmation.
-- `HEIC_AUTORESEARCH_PAIR_SAMPLES=3` increases A/B samples per invocation.
-- `HEIC_AUTORESEARCH_CONFIRM_SAMPLES=4` increases full-corpus A/B samples.
+- `HEIC_AUTORESEARCH_PAIR_SAMPLES=6` increases A/B samples per invocation.
+- `HEIC_AUTORESEARCH_CONFIRM_SAMPLES=6` increases full-corpus A/B samples.
 - `HEIC_AUTORESEARCH_CHECK_TARGETS=aarch64-apple-ios,aarch64-linux-android`
   selects extra installed targets checked before promotion.
 - `HEIC_AUTORESEARCH_STATE_DIR=/trusted/path` overrides external state.

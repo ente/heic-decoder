@@ -81,8 +81,8 @@ promotion includes benchmarks on other representative hardware.
 2. Make the smallest clean change that tests it.
 3. Run `cargo fmt --all` after Rust edits.
 4. Run a focused check or unit test if useful. Do not run the full libheif suite;
-   the controller does that only for candidates which are at least 5% faster on
-   the primary image-hook benchmark. After correctness, it also requires a 5%
+   the controller does that only for candidates which are at least 2% faster on
+   the primary image-hook benchmark. After correctness, it also requires a 2%
    confirmation on the pinned full HEIC/HEIF hook corpus.
 5. Return after this single attempt. In the final response, put a concise
    one-line experiment description first, followed by the hypothesis and any

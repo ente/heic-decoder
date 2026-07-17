@@ -673,10 +673,10 @@ evaluate_candidate() {
   local attempt_dir="$STATE_DIR/attempts/$attempt"
   local candidate_binary="$attempt_dir/candidate-bench"
   local champion_binary="$STATE_DIR/champion-bench"
-  local min_improvement="${HEIC_AUTORESEARCH_MIN_IMPROVEMENT:-0.05}"
-  local confirmation_min_improvement="${HEIC_AUTORESEARCH_CONFIRM_MIN_IMPROVEMENT:-0.05}"
-  local primary_samples="${HEIC_AUTORESEARCH_PAIR_SAMPLES:-2}"
-  local confirmation_samples="${HEIC_AUTORESEARCH_CONFIRM_SAMPLES:-3}"
+  local min_improvement="${HEIC_AUTORESEARCH_MIN_IMPROVEMENT:-0.02}"
+  local confirmation_min_improvement="${HEIC_AUTORESEARCH_CONFIRM_MIN_IMPROVEMENT:-0.02}"
+  local primary_samples="${HEIC_AUTORESEARCH_PAIR_SAMPLES:-4}"
+  local confirmation_samples="${HEIC_AUTORESEARCH_CONFIRM_SAMPLES:-4}"
   local allowed_ratio confirmation_allowed_ratio cumulative commit message
   local primary_baseline_score primary_candidate_score primary_speedup
   local confirmation_candidate_score confirmation_speedup
