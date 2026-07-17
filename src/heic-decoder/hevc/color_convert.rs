@@ -39,30 +39,87 @@ pub(crate) fn convert_420_8bit_to_interleaved(
     channels: usize,
     output: &mut [u8],
 ) {
+    convert_420_8bit_region_to_interleaved(
+        y_plane,
+        cb_plane,
+        cr_plane,
+        width,
+        chroma_width,
+        0,
+        0,
+        width,
+        height,
+        r_cr,
+        g_cb,
+        g_cr,
+        b_cb,
+        channels,
+        output,
+    );
+}
+
+/// Convert a rectangular region of full-range 8-bit 4:2:0 planes.
+///
+/// Source coordinates remain in the uncropped planes, so an odd `x_start`
+/// retains the original chroma phase. The result is tightly packed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn convert_420_8bit_region_to_interleaved(
+    y_plane: &[u16],
+    cb_plane: &[u16],
+    cr_plane: &[u16],
+    y_stride: usize,
+    chroma_stride: usize,
+    x_start: usize,
+    y_start: usize,
+    width: usize,
+    height: usize,
+    r_cr: i32,
+    g_cb: i32,
+    g_cr: i32,
+    b_cb: i32,
+    channels: usize,
+    output: &mut [u8],
+) {
     assert!(matches!(channels, 3 | 4), "channels must be RGB or RGBA");
     let pixel_count = width
         .checked_mul(height)
-        .expect("4:2:0 pixel count must fit in usize");
+        .expect("4:2:0 region pixel count must fit in usize");
     let output_len = pixel_count
         .checked_mul(channels)
         .expect("interleaved output length must fit in usize");
-    let chroma_height = height.div_ceil(2);
-    let chroma_len = chroma_width
-        .checked_mul(chroma_height)
-        .expect("4:2:0 chroma sample count must fit in usize");
+    let x_end = x_start
+        .checked_add(width)
+        .expect("4:2:0 region x extent must fit in usize");
+    let y_end = y_start
+        .checked_add(height)
+        .expect("4:2:0 region y extent must fit in usize");
+    let y_len = y_stride
+        .checked_mul(y_end)
+        .expect("4:2:0 luma extent must fit in usize");
+    let chroma_rows = y_end.div_ceil(2);
+    let chroma_len = chroma_stride
+        .checked_mul(chroma_rows)
+        .expect("4:2:0 chroma extent must fit in usize");
     assert_eq!(output.len(), output_len, "interleaved output length");
-    assert!(y_plane.len() >= pixel_count, "luma plane length");
-    assert!(chroma_width >= width.div_ceil(2), "4:2:0 chroma row width");
+    assert!(x_end <= y_stride, "4:2:0 region exceeds luma row");
+    assert!(y_plane.len() >= y_len, "luma plane length");
+    assert!(
+        chroma_stride >= x_end.div_ceil(2),
+        "4:2:0 region exceeds chroma row"
+    );
     assert!(cb_plane.len() >= chroma_len, "Cb plane length");
     assert!(cr_plane.len() >= chroma_len, "Cr plane length");
     incant!(
-        convert_420_8bit_to_interleaved(
+        convert_420_8bit_region_to_interleaved(
             y_plane,
             cb_plane,
             cr_plane,
+            y_stride,
+            chroma_stride,
+            x_start,
+            y_start,
             width,
             height,
-            chroma_width,
             r_cr,
             g_cb,
             g_cr,
@@ -75,14 +132,17 @@ pub(crate) fn convert_420_8bit_to_interleaved(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn convert_420_8bit_to_interleaved_scalar(
+fn convert_420_8bit_region_to_interleaved_scalar(
     _token: ScalarToken,
     y_plane: &[u16],
     cb_plane: &[u16],
     cr_plane: &[u16],
+    y_stride: usize,
+    chroma_stride: usize,
+    x_start: usize,
+    y_start: usize,
     width: usize,
     height: usize,
-    chroma_width: usize,
     r_cr: i32,
     g_cb: i32,
     g_cr: i32,
@@ -90,20 +150,22 @@ fn convert_420_8bit_to_interleaved_scalar(
     channels: usize,
     output: &mut [u8],
 ) {
-    for y in 0..height {
-        let y_row = y * width;
-        let chroma_row = (y / 2) * chroma_width;
-        for x in 0..width {
+    for output_y in 0..height {
+        let source_y = y_start + output_y;
+        let y_row = source_y * y_stride;
+        let chroma_row = (source_y / 2) * chroma_stride;
+        for output_x in 0..width {
+            let source_x = x_start + output_x;
             write_420_8bit_pixel(
-                y_plane[y_row + x],
-                cb_plane[chroma_row + x / 2],
-                cr_plane[chroma_row + x / 2],
+                y_plane[y_row + source_x],
+                cb_plane[chroma_row + source_x / 2],
+                cr_plane[chroma_row + source_x / 2],
                 r_cr,
                 g_cb,
                 g_cr,
                 b_cb,
                 channels,
-                &mut output[(y_row + x) * channels..],
+                &mut output[(output_y * width + output_x) * channels..],
             );
         }
     }
@@ -139,14 +201,17 @@ fn write_420_8bit_pixel(
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
 #[arcane]
-fn convert_420_8bit_to_interleaved_neon(
+fn convert_420_8bit_region_to_interleaved_neon(
     _token: NeonToken,
     y_plane: &[u16],
     cb_plane: &[u16],
     cr_plane: &[u16],
+    y_stride: usize,
+    chroma_stride: usize,
+    x_start: usize,
+    y_start: usize,
     width: usize,
     height: usize,
-    chroma_width: usize,
     r_cr: i32,
     g_cb: i32,
     g_cr: i32,
@@ -166,14 +231,17 @@ fn convert_420_8bit_to_interleaved_neon(
     let green_fits = (i64::from(g_cb).abs() + i64::from(g_cr).abs()) * max_delta + max_y + rounded
         <= i64::from(i32::MAX);
     if !single_channel_fits(r_cr) || !green_fits || !single_channel_fits(b_cb) {
-        convert_420_8bit_to_interleaved_scalar(
+        convert_420_8bit_region_to_interleaved_scalar(
             ScalarToken,
             y_plane,
             cb_plane,
             cr_plane,
+            y_stride,
+            chroma_stride,
+            x_start,
+            y_start,
             width,
             height,
-            chroma_width,
             r_cr,
             g_cb,
             g_cr,
@@ -189,21 +257,46 @@ fn convert_420_8bit_to_interleaved_neon(
     let center = vdupq_n_s32(128);
     let rounding = vdupq_n_s32(128);
     let opaque = vdup_n_u8(u8::MAX);
-    let simd_width = width / 8 * 8;
+    let x_end = x_start + width;
+    // Chroma pairs start on even luma coordinates. Peel an odd first sample
+    // so every SIMD group can duplicate four adjacent chroma samples.
+    let simd_start = x_start.next_multiple_of(2).min(x_end);
+    let simd_end = simd_start + (x_end - simd_start) / 8 * 8;
 
-    for y in 0..height {
-        let y_row = y * width;
-        let chroma_row = (y / 2) * chroma_width;
-        let mut x = 0;
-        while x < simd_width {
-            let y_values = vld1q_u16((&y_plane[y_row + x..y_row + x + 8]).try_into().unwrap());
+    for output_y in 0..height {
+        let source_y = y_start + output_y;
+        let y_row = source_y * y_stride;
+        let chroma_row = (source_y / 2) * chroma_stride;
+
+        for source_x in x_start..simd_start {
+            let output_x = source_x - x_start;
+            write_420_8bit_pixel(
+                y_plane[y_row + source_x],
+                cb_plane[chroma_row + source_x / 2],
+                cr_plane[chroma_row + source_x / 2],
+                r_cr,
+                g_cb,
+                g_cr,
+                b_cb,
+                channels,
+                &mut output[(output_y * width + output_x) * channels..],
+            );
+        }
+
+        let mut source_x = simd_start;
+        while source_x < simd_end {
+            let y_values = vld1q_u16(
+                (&y_plane[y_row + source_x..y_row + source_x + 8])
+                    .try_into()
+                    .unwrap(),
+            );
             let cb_values = vld1_u16(
-                (&cb_plane[chroma_row + x / 2..chroma_row + x / 2 + 4])
+                (&cb_plane[chroma_row + source_x / 2..chroma_row + source_x / 2 + 4])
                     .try_into()
                     .unwrap(),
             );
             let cr_values = vld1_u16(
-                (&cr_plane[chroma_row + x / 2..chroma_row + x / 2 + 4])
+                (&cr_plane[chroma_row + source_x / 2..chroma_row + source_x / 2 + 4])
                     .try_into()
                     .unwrap(),
             );
@@ -257,7 +350,8 @@ fn convert_420_8bit_to_interleaved_neon(
             let r = vqmovn_u16(vcombine_u16(vqmovun_s32(r_lo), vqmovun_s32(r_hi)));
             let g = vqmovn_u16(vcombine_u16(vqmovun_s32(g_lo), vqmovun_s32(g_hi)));
             let b = vqmovn_u16(vcombine_u16(vqmovun_s32(b_lo), vqmovun_s32(b_hi)));
-            let output_index = (y_row + x) * channels;
+            let output_x = source_x - x_start;
+            let output_index = (output_y * width + output_x) * channels;
 
             // SAFETY: the caller-proven output length is `width * height *
             // channels`; this iteration starts at an in-row group of eight
@@ -270,20 +364,21 @@ fn convert_420_8bit_to_interleaved_neon(
                     vst3_u8(destination, uint8x8x3_t(r, g, b));
                 }
             }
-            x += 8;
+            source_x += 8;
         }
 
-        for x in simd_width..width {
+        for source_x in simd_end..x_end {
+            let output_x = source_x - x_start;
             write_420_8bit_pixel(
-                y_plane[y_row + x],
-                cb_plane[chroma_row + x / 2],
-                cr_plane[chroma_row + x / 2],
+                y_plane[y_row + source_x],
+                cb_plane[chroma_row + source_x / 2],
+                cr_plane[chroma_row + source_x / 2],
                 r_cr,
                 g_cb,
                 g_cr,
                 b_cb,
                 channels,
-                &mut output[(y_row + x) * channels..],
+                &mut output[(output_y * width + output_x) * channels..],
             );
         }
     }
@@ -652,14 +747,17 @@ mod tests {
 
             for channels in [3, 4] {
                 let mut expected = vec![0_u8; width * height * channels];
-                convert_420_8bit_to_interleaved_scalar(
+                convert_420_8bit_region_to_interleaved_scalar(
                     ScalarToken,
                     &y_plane,
                     &cb_plane,
                     &cr_plane,
                     width,
-                    height,
                     chroma_width,
+                    0,
+                    0,
+                    width,
+                    height,
                     403,
                     -48,
                     -120,
@@ -685,6 +783,70 @@ mod tests {
                 );
                 assert_eq!(actual, expected, "{width}x{height}, {channels} channels");
             }
+        }
+    }
+
+    #[test]
+    fn full_range_420_cropped_region_preserves_odd_chroma_phase() {
+        let y_stride = 19_usize;
+        let source_height = 7_usize;
+        let chroma_stride = y_stride.div_ceil(2);
+        let mut state = 0x6d28_1b45_u32;
+        let mut sample = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 16) as u16
+        };
+        let y_plane = (0..y_stride * source_height)
+            .map(|_| sample())
+            .collect::<Vec<_>>();
+        let cb_plane = (0..chroma_stride * source_height.div_ceil(2))
+            .map(|_| sample())
+            .collect::<Vec<_>>();
+        let cr_plane = (0..chroma_stride * source_height.div_ceil(2))
+            .map(|_| sample())
+            .collect::<Vec<_>>();
+        let (x_start, y_start, width, height) = (1, 1, 17, 5);
+
+        for channels in [3, 4] {
+            let mut expected = vec![0_u8; width * height * channels];
+            convert_420_8bit_region_to_interleaved_scalar(
+                ScalarToken,
+                &y_plane,
+                &cb_plane,
+                &cr_plane,
+                y_stride,
+                chroma_stride,
+                x_start,
+                y_start,
+                width,
+                height,
+                403,
+                -48,
+                -120,
+                475,
+                channels,
+                &mut expected,
+            );
+
+            let mut actual = vec![0_u8; expected.len()];
+            convert_420_8bit_region_to_interleaved(
+                &y_plane,
+                &cb_plane,
+                &cr_plane,
+                y_stride,
+                chroma_stride,
+                x_start,
+                y_start,
+                width,
+                height,
+                403,
+                -48,
+                -120,
+                475,
+                channels,
+                &mut actual,
+            );
+            assert_eq!(actual, expected, "{channels} channels");
         }
     }
 }

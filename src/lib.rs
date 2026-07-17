@@ -8606,12 +8606,11 @@ fn decoded_heic_to_rgba8_slice(
     auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
-    // The common coded-image case needs no coordinate remap or alpha
-    // composition. Route it through the shared contiguous converter so its
-    // architecture-specific 4:2:0 kernel can write the caller's buffer
-    // directly. Non-empty transform sequences still take the exact generic
-    // mapping path, including identity-valued properties and their guards.
-    if transforms.is_empty() && auxiliary_alpha.is_none() {
+    // Identity and clean-aperture-only coded images remain rectangular source
+    // regions. Route those directly through the shared contiguous converter
+    // so its architecture-specific 4:2:0 kernel writes the caller's buffer
+    // without materializing a full-frame RGBA intermediate.
+    if auxiliary_alpha.is_none() {
         let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
         if heic_storage_bit_depth(source_bit_depth) != 8 {
             return Err(DecodeError::Unsupported(format!(
@@ -8619,26 +8618,51 @@ fn decoded_heic_to_rgba8_slice(
                 heic_storage_bit_depth(source_bit_depth)
             )));
         }
-        RgbaTransformPlan::from_primary_transforms(decoded.width, decoded.height, transforms)?;
-        let expected = checked_rgba_sample_count(decoded.width, decoded.height)?;
+        let transform_plan =
+            RgbaTransformPlan::from_primary_transforms(decoded.width, decoded.height, transforms)?;
+        let expected = checked_rgba_sample_count(
+            transform_plan.destination_width,
+            transform_plan.destination_height,
+        )?;
         if out.len() != expected {
             return Err(DecodeError::TransformGuard(
                 TransformGuardError::RgbaSampleCountMismatch {
                     stage: "HEIC direct transformed image adapter output",
                     actual: out.len(),
                     expected,
-                    width: decoded.width,
-                    height: decoded.height,
+                    width: transform_plan.destination_width,
+                    height: transform_plan.destination_height,
                 },
             ));
         }
-        return convert_heic_to_interleaved_rgb8_slice::<4>(
-            &decoded,
-            out,
-            scale_sample_to_u8,
-            "RGBA8",
-        )
-        .map_err(DecodeError::from);
+        if transform_plan
+            .steps
+            .iter()
+            .all(|step| matches!(step, ResolvedRgbaTransformStep::CleanAperture { .. }))
+        {
+            let (source_x, source_y) = transform_plan.map_destination_pixel(0, 0)?;
+            let destination_width = transform_dimension_to_usize(
+                "HEIC clean-aperture adapter",
+                "destination width",
+                transform_plan.destination_width,
+            )?;
+            let destination_height = transform_dimension_to_usize(
+                "HEIC clean-aperture adapter",
+                "destination height",
+                transform_plan.destination_height,
+            )?;
+            return convert_heic_to_interleaved_rgb8_region_slice::<4>(
+                &decoded,
+                source_x,
+                source_y,
+                destination_width,
+                destination_height,
+                out,
+                scale_sample_to_u8,
+                "RGBA8",
+            )
+            .map_err(DecodeError::from);
+        }
     }
 
     let mut output = SliceRgbaOutput(out);
@@ -11770,6 +11794,37 @@ fn convert_heic_to_interleaved_rgb8_slice<const CHANNELS: usize>(
     scale_sample: fn(u16, u8) -> u8,
     output_label: &str,
 ) -> Result<(), DecodeHeicError> {
+    let width =
+        usize::try_from(decoded.width).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("HEIC width does not fit in usize ({})", decoded.width),
+        })?;
+    let height =
+        usize::try_from(decoded.height).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!("HEIC height does not fit in usize ({})", decoded.height),
+        })?;
+    convert_heic_to_interleaved_rgb8_region_slice::<CHANNELS>(
+        decoded,
+        0,
+        0,
+        width,
+        height,
+        out,
+        scale_sample,
+        output_label,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn convert_heic_to_interleaved_rgb8_region_slice<const CHANNELS: usize>(
+    decoded: &DecodedHeicImage,
+    source_x_start: usize,
+    source_y_start: usize,
+    width: usize,
+    height: usize,
+    out: &mut [u8],
+    scale_sample: fn(u16, u8) -> u8,
+    output_label: &str,
+) -> Result<(), DecodeHeicError> {
     debug_assert!(matches!(CHANNELS, 3 | 4));
     let ycbcr_transform =
         ycbcr_transform_from_matrix(decoded.ycbcr_matrix).map_err(|matrix_coefficients| {
@@ -11791,15 +11846,42 @@ fn convert_heic_to_interleaved_rgb8_slice<const CHANNELS: usize>(
         });
     }
 
-    let width =
+    let source_width =
         usize::try_from(decoded.width).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
             detail: format!("HEIC width does not fit in usize ({})", decoded.width),
         })?;
-    let height =
+    let source_height =
         usize::try_from(decoded.height).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
             detail: format!("HEIC height does not fit in usize ({})", decoded.height),
         })?;
-    let output_len = checked_heic_interleaved_output_len(decoded, CHANNELS, output_label)?;
+    let source_x_end =
+        source_x_start
+            .checked_add(width)
+            .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                detail: format!("{output_label} source region x extent overflow"),
+            })?;
+    let source_y_end =
+        source_y_start
+            .checked_add(height)
+            .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                detail: format!("{output_label} source region y extent overflow"),
+            })?;
+    if source_x_end > source_width || source_y_end > source_height {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "{output_label} source region ({source_x_start},{source_y_start}) {width}x{height} exceeds {}x{}",
+                decoded.width, decoded.height
+            ),
+        });
+    }
+    let output_len = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(CHANNELS))
+        .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "{output_label} region output sample count overflow for {width}x{height}"
+            ),
+        })?;
     if out.len() != output_len {
         return Err(DecodeHeicError::InvalidDecodedFrame {
             detail: format!(
@@ -11832,13 +11914,16 @@ fn convert_heic_to_interleaved_rgb8_slice<const CHANNELS: usize>(
         PreparedYcbcrTransform::MatrixFull { coeffs, .. },
     ) = (&chroma, converter.transform)
     {
-        heic_decoder::hevc::color_convert::convert_420_8bit_to_interleaved(
+        heic_decoder::hevc::color_convert::convert_420_8bit_region_to_interleaved(
             &decoded.y_plane.samples,
             u_samples,
             v_samples,
+            source_width,
+            *chroma_width,
+            source_x_start,
+            source_y_start,
             width,
             height,
-            *chroma_width,
             coeffs.r_cr_fp8,
             coeffs.g_cb_fp8,
             coeffs.g_cr_fp8,
@@ -11849,12 +11934,14 @@ fn convert_heic_to_interleaved_rgb8_slice<const CHANNELS: usize>(
         return Ok(());
     }
 
-    for y in 0..height {
-        let row_start = y * width;
-        let out_row_start = row_start * CHANNELS;
+    for output_y in 0..height {
+        let source_y = source_y_start + output_y;
+        let row_start = source_y * source_width;
+        let out_row_start = output_y * width * CHANNELS;
 
-        for x in 0..width {
-            let y_index = row_start + x;
+        for output_x in 0..width {
+            let source_x = source_x_start + output_x;
+            let y_index = row_start + source_x;
             let y_sample = i32::from(decoded.y_plane.samples[y_index]);
 
             let (cb_sample, cr_sample) = match &chroma {
@@ -11865,7 +11952,8 @@ fn convert_heic_to_interleaved_rgb8_slice<const CHANNELS: usize>(
                     chroma_width,
                     layout,
                 } => {
-                    let chroma_index = heic_chroma_sample_index(x, y, *chroma_width, *layout);
+                    let chroma_index =
+                        heic_chroma_sample_index(source_x, source_y, *chroma_width, *layout);
                     (
                         i32::from(u_samples[chroma_index]),
                         i32::from(v_samples[chroma_index]),
@@ -11881,7 +11969,7 @@ fn convert_heic_to_interleaved_rgb8_slice<const CHANNELS: usize>(
             } else {
                 converter.convert(y_sample, cb_sample, cr_sample)
             };
-            let out_index = out_row_start + (x * CHANNELS);
+            let out_index = out_row_start + (output_x * CHANNELS);
             out[out_index] = scale_sample(r, bit_depth);
             out[out_index + 1] = scale_sample(g, bit_depth);
             out[out_index + 2] = scale_sample(b, bit_depth);
