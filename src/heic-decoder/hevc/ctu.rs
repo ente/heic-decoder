@@ -362,7 +362,7 @@ impl<'a> SliceContext<'a> {
             }
 
             // Check for end of slice segment
-            let end_of_slice = self.cabac.decode_terminate()?;
+            let end_of_slice = self.cabac.decode_terminate();
             se_trace("end_of_slice", end_of_slice as i64, &self.cabac);
             if end_of_slice != 0 {
                 debug_trace!(
@@ -386,7 +386,7 @@ impl<'a> SliceContext<'a> {
 
             // WPP: at row boundaries, decode end_of_sub_stream and reinit CABAC
             if wpp && self.ctb_y != prev_ctb_y {
-                let _eoss = self.cabac.decode_terminate()?;
+                let _eoss = self.cabac.decode_terminate();
                 let entry_point_index = self.ctb_y.saturating_sub(start_ctb_y + 1) as usize;
                 if let Some(&offset) = self.header.entry_point_offsets.get(entry_point_index) {
                     self.cabac.seek_to(offset as usize)?;
@@ -451,7 +451,7 @@ impl<'a> SliceContext<'a> {
             let left_in_slice = ctb_addr_rs > slice_addr_rs;
             if left_in_slice {
                 let ctx_idx = context::SAO_MERGE_FLAG;
-                sao_merge_left_flag = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
+                sao_merge_left_flag = self.cabac.decode_bin(&mut self.ctx[ctx_idx]) != 0;
                 se_trace("sao_merge_left", sao_merge_left_flag as i64, &self.cabac);
             }
         }
@@ -464,7 +464,7 @@ impl<'a> SliceContext<'a> {
             let up_in_slice = ctb_addr_rs >= pic_width_ctbs + slice_addr_rs;
             if up_in_slice {
                 let ctx_idx = context::SAO_MERGE_FLAG;
-                sao_merge_up_flag = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
+                sao_merge_up_flag = self.cabac.decode_bin(&mut self.ctx[ctx_idx]) != 0;
                 se_trace("sao_merge_up", sao_merge_up_flag as i64, &self.cabac);
             }
         }
@@ -536,7 +536,7 @@ impl<'a> SliceContext<'a> {
                         let mut signed_offsets = [0i8; 4];
                         for i in 0..4 {
                             if offsets_abs[i] != 0 {
-                                let sign = self.cabac.decode_bypass()?;
+                                let sign = self.cabac.decode_bypass();
                                 se_trace("sao_offset_sign", sign as i64, &self.cabac);
                                 let val = (offsets_abs[i] as i32 * offset_scale) as i8;
                                 signed_offsets[i] = if sign != 0 { -val } else { val };
@@ -544,7 +544,7 @@ impl<'a> SliceContext<'a> {
                         }
                         info.sao_offset_val[c_idx] = signed_offsets;
 
-                        let band_pos = self.cabac.decode_bypass_bits(5)?;
+                        let band_pos = self.cabac.decode_bypass_bits(5);
                         se_trace("sao_band_position", band_pos as i64, &self.cabac);
                         info.sao_band_position[c_idx] = band_pos as u8;
                     } else {
@@ -554,7 +554,7 @@ impl<'a> SliceContext<'a> {
                         }
 
                         if c_idx <= 1 {
-                            let eo_class = self.cabac.decode_bypass_bits(2)?;
+                            let eo_class = self.cabac.decode_bypass_bits(2);
                             se_trace("sao_eo_class", eo_class as i64, &self.cabac);
                             if c_idx == 0 {
                                 info.sao_eo_class[0] = eo_class as u8;
@@ -578,11 +578,11 @@ impl<'a> SliceContext<'a> {
     /// Decode sao_type_idx: context bin + optional bypass bin
     fn decode_sao_type_idx(&mut self) -> Result<u8> {
         let ctx_idx = context::SAO_TYPE_IDX;
-        let bit0 = self.cabac.decode_bin(&mut self.ctx[ctx_idx])?;
+        let bit0 = self.cabac.decode_bin(&mut self.ctx[ctx_idx]);
         if bit0 == 0 {
             Ok(0)
         } else {
-            let bit1 = self.cabac.decode_bypass()?;
+            let bit1 = self.cabac.decode_bypass();
             if bit1 == 0 { Ok(1) } else { Ok(2) }
         }
     }
@@ -590,7 +590,7 @@ impl<'a> SliceContext<'a> {
     /// Decode truncated unary with bypass bins (for sao_offset_abs)
     fn decode_cabac_tu_bypass(&mut self, c_max: u32) -> Result<u32> {
         for i in 0..c_max {
-            let bit = self.cabac.decode_bypass()?;
+            let bit = self.cabac.decode_bypass();
             if bit == 0 {
                 return Ok(i);
             }
@@ -768,7 +768,7 @@ impl<'a> SliceContext<'a> {
         }
 
         let ctx_idx = context::SPLIT_CU_FLAG + cond_l + cond_a;
-        let bin = self.cabac.decode_bin(&mut self.ctx[ctx_idx])?;
+        let bin = self.cabac.decode_bin(&mut self.ctx[ctx_idx]);
         se_trace("split_cu_flag", bin as i64, &self.cabac);
 
         Ok(bin != 0)
@@ -804,7 +804,7 @@ impl<'a> SliceContext<'a> {
         // Decode transquant_bypass_flag if enabled
         self.cu_transquant_bypass_flag = if self.pps.transquant_bypass_enabled_flag {
             let ctx_idx = context::CU_TRANSQUANT_BYPASS_FLAG;
-            self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0
+            self.cabac.decode_bin(&mut self.ctx[ctx_idx]) != 0
         } else {
             false
         };
@@ -1041,7 +1041,7 @@ impl<'a> SliceContext<'a> {
         {
             // Decode split_transform_flag
             let ctx_idx = context::SPLIT_TRANSFORM_FLAG + (5 - log2_size as usize).min(2);
-            let flag = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
+            let flag = self.cabac.decode_bin(&mut self.ctx[ctx_idx]) != 0;
             se_trace("split_transform", flag as i64, &self.cabac);
             flag
         } else if log2_size > log2_max_trafo_size || (intra_split_flag && trafo_depth == 0) {
@@ -1071,10 +1071,10 @@ impl<'a> SliceContext<'a> {
 
             let cb = if cbf_cb_parent != 0 {
                 let ctx_idx = context::CBF_CBCR + trafo_depth as usize;
-                let mut val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])?;
+                let mut val = self.cabac.decode_bin(&mut self.ctx[ctx_idx]);
                 se_trace("cbf_cb", val as i64, &self.cabac);
                 if decode_extra_422_cbf {
-                    let extra = self.cabac.decode_bin(&mut self.ctx[ctx_idx])?;
+                    let extra = self.cabac.decode_bin(&mut self.ctx[ctx_idx]);
                     se_trace("cbf_cb", extra as i64, &self.cabac);
                     val |= extra << 1;
                 }
@@ -1084,10 +1084,10 @@ impl<'a> SliceContext<'a> {
             };
             let cr = if cbf_cr_parent != 0 {
                 let ctx_idx = context::CBF_CBCR + trafo_depth as usize;
-                let mut val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])?;
+                let mut val = self.cabac.decode_bin(&mut self.ctx[ctx_idx]);
                 se_trace("cbf_cr", val as i64, &self.cabac);
                 if decode_extra_422_cbf {
-                    let extra = self.cabac.decode_bin(&mut self.ctx[ctx_idx])?;
+                    let extra = self.cabac.decode_bin(&mut self.ctx[ctx_idx]);
                     se_trace("cbf_cr", extra as i64, &self.cabac);
                     val |= extra << 1;
                 }
@@ -1215,7 +1215,7 @@ impl<'a> SliceContext<'a> {
         // Context: offset 0 if trafo_depth > 0, offset 1 if trafo_depth == 0
         let ctx_offset = if trafo_depth == 0 { 1 } else { 0 };
         let ctx_idx = context::CBF_LUMA + ctx_offset;
-        let cbf_luma = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
+        let cbf_luma = self.cabac.decode_bin(&mut self.ctx[ctx_idx]) != 0;
         se_trace("cbf_luma", cbf_luma as i64, &self.cabac);
 
         // Per H.265 7.3.8.11: decode cu_qp_delta before residuals
@@ -1226,7 +1226,7 @@ impl<'a> SliceContext<'a> {
         {
             let cu_qp_delta_abs = self.decode_cu_qp_delta_abs()?;
             let cu_qp_delta_sign = if cu_qp_delta_abs != 0 {
-                self.cabac.decode_bypass()?
+                self.cabac.decode_bypass()
             } else {
                 0
             };
@@ -1452,7 +1452,7 @@ impl<'a> SliceContext<'a> {
     fn decode_cu_qp_delta_abs(&mut self) -> Result<u32> {
         let first_bin = self
             .cabac
-            .decode_bin(&mut self.ctx[context::CU_QP_DELTA_ABS])?;
+            .decode_bin(&mut self.ctx[context::CU_QP_DELTA_ABS]);
         if first_bin == 0 {
             return Ok(0);
         }
@@ -1460,7 +1460,7 @@ impl<'a> SliceContext<'a> {
         for _ in 0..4 {
             let bin = self
                 .cabac
-                .decode_bin(&mut self.ctx[context::CU_QP_DELTA_ABS + 1])?;
+                .decode_bin(&mut self.ctx[context::CU_QP_DELTA_ABS + 1]);
             if bin == 0 {
                 break;
             }
@@ -1644,7 +1644,7 @@ impl<'a> SliceContext<'a> {
         if pred_mode == PredMode::Intra {
             // For intra, first bin distinguishes 2Nx2N from NxN
             let ctx_idx = context::PART_MODE;
-            let bin = self.cabac.decode_bin(&mut self.ctx[ctx_idx])?;
+            let bin = self.cabac.decode_bin(&mut self.ctx[ctx_idx]);
             se_trace("part_mode", bin as i64, &self.cabac);
 
             if bin != 0 {
@@ -1698,7 +1698,7 @@ impl<'a> SliceContext<'a> {
     /// Decode prev_intra_luma_pred_flag (context-coded bin)
     fn decode_prev_intra_luma_pred_flag(&mut self) -> Result<bool> {
         let ctx_idx = context::PREV_INTRA_LUMA_PRED_FLAG;
-        let val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
+        let val = self.cabac.decode_bin(&mut self.ctx[ctx_idx]) != 0;
         se_trace("prev_intra_luma_pred", val as i64, &self.cabac);
         Ok(val)
     }
@@ -1739,14 +1739,14 @@ impl<'a> SliceContext<'a> {
     /// - If candidate mode collides with luma mode → Angular34
     fn decode_intra_chroma_mode(&mut self, luma_mode: IntraPredMode) -> Result<IntraPredMode> {
         let ctx_idx = context::INTRA_CHROMA_PRED_MODE;
-        let first_bin = self.cabac.decode_bin(&mut self.ctx[ctx_idx])?;
+        let first_bin = self.cabac.decode_bin(&mut self.ctx[ctx_idx]);
         let intra_chroma_mode = if first_bin == 0 {
             // Mode 4: derived from luma
             se_trace("intra_chroma_mode", 4, &self.cabac);
             luma_mode
         } else {
             // Read 2 fixed-length bypass bits for modes 0-3
-            let mode_idx = self.cabac.decode_bypass_bits(2)? as u8;
+            let mode_idx = self.cabac.decode_bypass_bits(2) as u8;
             se_trace("intra_chroma_mode", mode_idx as i64, &self.cabac);
 
             let candidate = match mode_idx {
@@ -1921,9 +1921,9 @@ impl<'a> SliceContext<'a> {
     /// Decode mpm_idx (0, 1, or 2)
     fn decode_mpm_idx(&mut self) -> Result<u8> {
         // Truncated unary: 0, 10, 11
-        let val = if self.cabac.decode_bypass()? == 0 {
+        let val = if self.cabac.decode_bypass() == 0 {
             0
-        } else if self.cabac.decode_bypass()? == 0 {
+        } else if self.cabac.decode_bypass() == 0 {
             1
         } else {
             2
@@ -1936,7 +1936,7 @@ impl<'a> SliceContext<'a> {
     fn decode_rem_intra_luma_pred_mode(&mut self) -> Result<u32> {
         let mut val = 0u32;
         for _ in 0..5 {
-            val = (val << 1) | self.cabac.decode_bypass()? as u32;
+            val = (val << 1) | self.cabac.decode_bypass() as u32;
         }
         se_trace("rem_intra_luma", val as i64, &self.cabac);
         Ok(val)

@@ -249,7 +249,7 @@ pub fn decode_residual(
     // Log2MaxTransformSkipSize defaults to 2 (4x4 blocks only)
     let transform_skip = if transform_skip_enabled && !cu_transquant_bypass && log2_size <= 2 {
         let ctx_idx = context::TRANSFORM_SKIP_FLAG + if c_idx > 0 { 1 } else { 0 };
-        let flag = cabac.decode_bin(&mut ctx[ctx_idx])? != 0;
+        let flag = cabac.decode_bin(&mut ctx[ctx_idx]) != 0;
         if rc_trace {
             let (range, _, _) = cabac.get_state_extended();
             let (byte_pos, _, _) = cabac.get_position();
@@ -629,7 +629,7 @@ pub fn decode_residual(
         while significant != 0 {
             let n = (u16::BITS - 1 - significant.leading_zeros()) as u8;
             significant &= !(1 << n);
-            if (n != first_sig_pos || !sign_hidden) && cabac.decode_bypass()? != 0 {
+            if (n != first_sig_pos || !sign_hidden) && cabac.decode_bypass() != 0 {
                 coeff_signs |= 1 << n;
             }
         }
@@ -882,7 +882,7 @@ fn decode_last_sig_coeff_pos(
     // Decode suffix if needed
     let x = if x_prefix > 3 {
         let n_bits = (x_prefix >> 1) - 1;
-        let suffix = cabac.decode_bypass_bits(n_bits as u8)?;
+        let suffix = cabac.decode_bypass_bits(n_bits as u8);
         ((2 + (x_prefix & 1)) << n_bits) + suffix
     } else {
         x_prefix
@@ -890,7 +890,7 @@ fn decode_last_sig_coeff_pos(
 
     let y = if y_prefix > 3 {
         let n_bits = (y_prefix >> 1) - 1;
-        let suffix = cabac.decode_bypass_bits(n_bits as u8)?;
+        let suffix = cabac.decode_bypass_bits(n_bits as u8);
         ((2 + (y_prefix & 1)) << n_bits) + suffix
     } else {
         y_prefix
@@ -932,7 +932,7 @@ fn decode_last_sig_coeff_prefix(
     let mut prefix = 0u32;
     while prefix < max_prefix as u32 {
         let ctx_idx = ctx_base + ctx_offset + (prefix as usize >> ctx_shift as usize);
-        let bin = cabac.decode_bin(&mut ctx[ctx_idx])?;
+        let bin = cabac.decode_bin(&mut ctx[ctx_idx]);
         if bin == 0 {
             break;
         }
@@ -956,7 +956,7 @@ fn decode_coded_sub_block_flag(
     // csbfCtx = 1 if either neighbor is coded, else 0
     let csbf_ctx = if csbf_neighbors != 0 { 1 } else { 0 };
     let ctx_idx = context::CODED_SUB_BLOCK_FLAG + csbf_ctx + if c_idx > 0 { 2 } else { 0 };
-    Ok(cabac.decode_bin(&mut ctx[ctx_idx])? != 0)
+    Ok(cabac.decode_bin(&mut ctx[ctx_idx]) != 0)
 }
 
 /// Context index map for 4x4 TU sig_coeff_flag (H.265 Table 9-41)
@@ -1093,7 +1093,7 @@ fn decode_sig_coeff_flag(
 
     let ctx_idx = calc_sig_coeff_flag_ctx(x_c, y_c, log2_size, c_idx, scan_idx, prev_csbf);
 
-    Ok(cabac.decode_bin(&mut ctx[ctx_idx])? != 0)
+    Ok(cabac.decode_bin(&mut ctx[ctx_idx]) != 0)
 }
 
 /// Decode coeff_abs_level_greater1_flag
@@ -1110,7 +1110,7 @@ fn decode_coeff_greater1_flag(
         + if c_idx > 0 { 16 } else { 0 }
         + (ctx_set as usize) * 4
         + (greater1_ctx as usize).min(3);
-    Ok(cabac.decode_bin(&mut ctx[ctx_idx])? != 0)
+    Ok(cabac.decode_bin(&mut ctx[ctx_idx]) != 0)
 }
 
 /// Decode coeff_abs_level_greater2_flag
@@ -1123,7 +1123,7 @@ fn decode_coeff_greater2_flag(
 ) -> Result<bool> {
     let ctx_idx =
         context::COEFF_ABS_LEVEL_GREATER2_FLAG + if c_idx > 0 { 4 } else { 0 } + ctx_set as usize;
-    Ok(cabac.decode_bin(&mut ctx[ctx_idx])? != 0)
+    Ok(cabac.decode_bin(&mut ctx[ctx_idx]) != 0)
 }
 
 /// Decode coeff_abs_level_remaining (Golomb-Rice with adaptive rice parameter)
@@ -1135,14 +1135,14 @@ fn decode_coeff_abs_level_remaining(
 ) -> Result<(i16, u8)> {
     // Decode prefix (unary part)
     let mut prefix = 0u32;
-    while cabac.decode_bypass()? != 0 && prefix < 32 {
+    while cabac.decode_bypass() != 0 && prefix < 32 {
         prefix += 1;
     }
 
     let value = if prefix <= 3 {
         // TR part only: value = (prefix << rice_param) + suffix
         let suffix = if rice_param > 0 {
-            cabac.decode_bypass_bits(rice_param)?
+            cabac.decode_bypass_bits(rice_param)
         } else {
             0
         };
@@ -1158,7 +1158,7 @@ fn decode_coeff_abs_level_remaining(
         }
         // EGk part: suffix bits = prefix - 3 + rice_param
         let suffix_bits = (prefix - 3 + rice_param as u32) as u8;
-        let suffix = cabac.decode_bypass_bits(suffix_bits)?;
+        let suffix = cabac.decode_bypass_bits(suffix_bits);
         // value = (((1 << (prefix-3)) + 3 - 1) << rice_param) + suffix
         let base = ((1u32 << (prefix - 3)) + 2) << rice_param;
         let v = base + suffix;

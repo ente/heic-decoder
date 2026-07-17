@@ -164,8 +164,6 @@ pub struct CabacDecoder<'a> {
     value: u32,
     /// Bits needed before next byte read (negative means bits available)
     bits_needed: i32,
-    /// Bin counter for debug tracing
-    bin_counter: u32,
 }
 
 #[allow(dead_code)]
@@ -198,7 +196,6 @@ impl<'a> CabacDecoder<'a> {
             range: 510,
             value: 0,
             bits_needed: 8,
-            bin_counter: 0,
         };
 
         // Initialize value (matching libde265 exactly)
@@ -252,7 +249,7 @@ impl<'a> CabacDecoder<'a> {
     }
 
     /// Read a single bit from the bitstream (for regular context decoding)
-    fn read_bit(&mut self) -> Result<u32> {
+    fn read_bit(&mut self) {
         self.value <<= 1;
         self.bits_needed += 1;
 
@@ -265,13 +262,11 @@ impl<'a> CabacDecoder<'a> {
                 self.bits_needed = -8;
             }
         }
-
-        Ok(0) // Return value not used, just for error handling
     }
 
     /// Decode a single bin using context model
-    pub fn decode_bin(&mut self, ctx: &mut ContextModel) -> Result<u8> {
-        self.bin_counter += 1;
+    #[inline]
+    pub fn decode_bin(&mut self, ctx: &mut ContextModel) -> u8 {
         let q_range_idx = (self.range >> 6) & 3;
         let lps_range = LPS_TABLE[ctx.state as usize][q_range_idx as usize] as u32;
 
@@ -298,14 +293,14 @@ impl<'a> CabacDecoder<'a> {
         }
 
         // Renormalize
-        self.renormalize()?;
+        self.renormalize();
 
-        Ok(bin_val)
+        bin_val
     }
 
     /// Decode a bypass bin (equal probability) - libde265 compatible
-    pub fn decode_bypass(&mut self) -> Result<u8> {
-        self.bin_counter += 1;
+    #[inline]
+    pub fn decode_bypass(&mut self) -> u8 {
         self.value <<= 1;
         self.bits_needed += 1;
 
@@ -322,19 +317,20 @@ impl<'a> CabacDecoder<'a> {
         let scaled_range = self.range << 7;
         if self.value >= scaled_range {
             self.value -= scaled_range;
-            Ok(1)
+            1
         } else {
-            Ok(0)
+            0
         }
     }
 
     /// Decode multiple bypass bins
-    pub fn decode_bypass_bits(&mut self, n: u8) -> Result<u32> {
+    #[inline]
+    pub fn decode_bypass_bits(&mut self, n: u8) -> u32 {
         let mut result = 0u32;
         for _ in 0..n {
-            result = (result << 1) | self.decode_bypass()? as u32;
+            result = (result << 1) | self.decode_bypass() as u32;
         }
-        Ok(result)
+        result
     }
 
     /// Decode Exp-Golomb coded value (EGk) using bypass bins
@@ -342,7 +338,7 @@ impl<'a> CabacDecoder<'a> {
         let mut base = 0u32;
         let mut n = k;
         loop {
-            let bit = self.decode_bypass()?;
+            let bit = self.decode_bypass();
             if bit == 0 {
                 break;
             }
@@ -352,40 +348,40 @@ impl<'a> CabacDecoder<'a> {
                 return Err(HevcError::InvalidBitstream("EGk prefix too long"));
             }
         }
-        let suffix = self.decode_bypass_bits(n)?;
+        let suffix = self.decode_bypass_bits(n);
         Ok(base + suffix)
     }
 
     /// Decode a terminate bin (end of slice check)
-    pub fn decode_terminate(&mut self) -> Result<u8> {
+    pub fn decode_terminate(&mut self) -> u8 {
         self.range -= 2;
 
         let scaled_range = self.range << 7;
         if self.value >= scaled_range {
-            Ok(1)
+            1
         } else {
-            self.renormalize()?;
-            Ok(0)
+            self.renormalize();
+            0
         }
     }
 
     /// Renormalize the decoder state
-    fn renormalize(&mut self) -> Result<()> {
+    #[inline]
+    fn renormalize(&mut self) {
         while self.range < 256 {
             self.range <<= 1;
             // Shift value and read more bits
-            self.read_bit()?;
+            self.read_bit();
         }
         // Invariant: after renormalization, range >= 256
         debug_assert!(self.range >= 256, "range {} < 256 after renorm", self.range);
-        Ok(())
     }
 
     /// Decode unsigned Exp-Golomb code using bypass bins
     pub fn decode_eg(&mut self, k: u8) -> Result<u32> {
         // Count leading zeros
         let mut n = 0;
-        while self.decode_bypass()? != 0 {
+        while self.decode_bypass() != 0 {
             n += 1;
             if n > 31 {
                 return Err(HevcError::CabacError("exp-golomb overflow"));
@@ -394,7 +390,7 @@ impl<'a> CabacDecoder<'a> {
 
         let mut value = 0u32;
         for _ in 0..(n + k) {
-            value = (value << 1) | self.decode_bypass()? as u32;
+            value = (value << 1) | self.decode_bypass() as u32;
         }
 
         Ok((1 << n) - 1 + value)
