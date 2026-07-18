@@ -6,6 +6,18 @@ The current decode path can traverse and parse the same HEVC stream multiple tim
 
 Refactor the decoder boundary so a single NAL pass supplies both the decoded frame and parsed metadata. This should reduce RBSP conversion, SPS parsing, temporary allocations, and per-tile setup costs, with the largest benefit expected on tiled images and smaller mobile images.
 
+### Experiment result (2026-07-18): rejected
+
+Implemented a source-only candidate that walked hvcC and payload NALs directly, reused the first parsed SPS across metadata/backend decode, handed the image-hook probe SPS into pixel decode (including the first grid tile), and removed the normalized intermediate stream allocation. The candidate passed formatting, Clippy, all 63 library tests, and the complete validator run: 272 corpus files accounted for, 219 pixel-oracle cases passed, 219 production image-hook parity checks passed, and zero failures.
+
+The 225-file production `image`-crate hook A/B benchmark was nevertheless neutral on every target, with identical output fingerprints:
+
+- Apple Silicon desktop: `0.997307x` (baseline 1141.273 ms, candidate 1144.355 ms; -0.27%).
+- Pixel 4 / Android 13: `1.005837x` (baseline 7020.472 ms, candidate 6979.729 ms; +0.58%; thermal status 0 before/after).
+- iPhone 11 Pro / iOS 26.5: `0.999721x` (baseline 2312.484 ms, candidate 2313.130 ms; -0.03%).
+
+This did not meet the repeatable 2% improvement gate on either mobile device or desktop, so the implementation was reverted. The result suggests NAL normalization/SPS re-parsing is not a material share of end-to-end production-hook latency on this corpus.
+
 ## 2. Avoid materializing cropped YUV planes
 
 Clean-aperture crops and non-default strides currently cause full Y, U, and V plane copies before color conversion. Even a one-pixel crop can therefore add substantial memory traffic.
