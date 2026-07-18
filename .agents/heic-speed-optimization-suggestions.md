@@ -134,6 +134,18 @@ SAO edge-offset processing clones the entire Y, Cb, and Cr planes (`sao.rs`) to 
 
 Replace the full-plane copies with CTB-local (or row-band) temporary buffers, or a direct source-to-destination pass. Re-measure on a mobile device rather than the desktop host before rejecting.
 
+### Experiment result (2026-07-18): rejected
+
+Reworked SAO into planewise raster passes backed by a two-row ring of original samples, removing the full Y/Cb/Cr plane clones and the per-pass deblock-flag clone. Peak SAO scratch fell from roughly 34.9 MiB for a representative 4032-pixel-wide image to about 15.75 KiB, while preserving original left, top, top-left, and top-right neighbors across CTB and band boundaries. The candidate passed clone-reference differential tests, 76 library tests, strict Clippy, portability builds, and the complete validator gate: 272 corpus files accounted for, 219 pixel-oracle cases passed, 219 production image-hook parity checks passed, and zero failures.
+
+The 225-file production `image`-crate hook A/B benchmark retained identical output fingerprints, but the speed result was not repeatable:
+
+- Apple Silicon desktop: `0.988078x` (baseline 1066.698 ms, candidate 1079.568 ms; -1.19%).
+- Pixel 4 / Android 13: the first B/C/C/B round was `1.041985x` (baseline 7380.305 ms, candidate 7082.865 ms; +4.20%), but a reversed C/B/B/C confirmation was `0.984376x` (baseline 7107.233 ms, candidate 7220.038 ms; -1.56%). Across all eight invocations the result was only `1.012909x` (+1.29%), with thermal status 0 throughout.
+- iPhone 11 Pro / iOS 26.5: `1.005008x` (baseline 2197.791 ms, candidate 2186.840 ms; +0.50%); the run finished at thermal state fair and neither interleaved pair cleared 2%.
+
+The implementation was reverted. Its memory reduction is attractive, but the requested production-hook speed win did not survive confirmation and the desktop result regressed, so it does not belong on this speed-focused branch.
+
 ## 9. Avoid full-plane rotation allocations for non-grid oriented images
 
 Grid images now use accepted affine row-stride placement, but non-grid images with `irot`/`imir` still go through full-plane rotation/mirror functions (`transforms.rs`) that allocate a complete new plane and use per-pixel multiplicative indexing. A prior bounded-band attempt was host-neutral, but the extra full-frame traffic is more expensive on mobile.
