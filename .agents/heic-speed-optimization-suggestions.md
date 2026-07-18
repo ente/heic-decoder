@@ -78,6 +78,18 @@ The decoder's CABAC and residual paths contain many small helpers and data-depen
 
 Benchmark ThinLTO with a single codegen unit in the consuming application, followed by PGO trained on a stratified HEIC corpus. Measure binary size and cold-start performance as guardrails. Apply release-profile settings in the final application workspace because dependency crates cannot reliably control the consumer's Cargo profile.
 
+### Experiment result (2026-07-18): rejected
+
+Implemented an opt-in final-consumer build wrapper rather than a misleading dependency profile. It supported default release, ThinLTO with one codegen unit, and target-specific PGO instrument/train/merge/use builds with compiler/LLVM/target/manifest validation. PGO was trained independently on desktop, Pixel, and iPhone using a fixed 15-file set spanning six real-camera images plus bit-depth, chroma, lossless, scaling-list, transform-skip, and WPP cases; the full 225-file hook corpus remained evaluation-only. Android and iOS raw profiles were generated on their physical devices and retrieved successfully.
+
+The unchanged decoder source passed the complete validator gate: 272 corpus files accounted for, 219 pixel-oracle cases passed, 219 production image-hook parity checks passed, and zero failures. Every default, ThinLTO, and PGO evaluation artifact also produced the identical 225-file hook fingerprint. Full-corpus timings were:
+
+- Apple Silicon desktop: ThinLTO `1.001877x` (default 1101.577 ms, ThinLTO 1099.513 ms; +0.19%); PGO `0.981025x` (1122.884 ms; -1.90%).
+- Pixel 4 / Android 13: ThinLTO `0.997096x` (default 6877.490 ms, ThinLTO 6897.521 ms; -0.29%); PGO `1.018734x` (6751.014 ms; +1.87%; thermal status 0). The PGO result remained below the 2% gate.
+- iPhone 11 Pro / iOS 26.5: ThinLTO `1.000189x` (default 2154.960 ms, ThinLTO 2154.553 ms; +0.02%; nominal thermal state). The PGO confirmation was `0.984277x` (thermally loaded default 2275.528 ms, PGO 2311.878 ms; -1.57%); its ordering biased the final default slower, so throttling could not be hiding a qualifying PGO win.
+
+Binary size improved despite neutral latency: ThinLTO reduced the final executable by roughly 5.5–12.1% and PGO by 11.0–17.1%, depending on target. A 40-launch tiny-hook guardrail was also neutral at about 3.0 ms median on desktop. Because neither build mode met the production-hook speed gate, the wrapper, training manifest, and documentation were reverted rather than adding maintenance and target-specific training complexity for a size-only benefit.
+
 ## 6. Extend SIMD color conversion beyond full-range 8-bit 4:2:0
 
 The NEON fast path is gated to 8-bit, full-range, 4:2:0, opaque matrix content only (`src/lib.rs` `PreparedYcbcrTransform` selection). Everything else — 10-bit HDR photos (`MatrixFullFloat`), limited/video-range YCbCr (`MatrixLimited`), 4:2:2/4:4:4, and alpha-bearing images — falls back to a per-pixel scalar float loop with `fmaf_parity` calls. Recent iPhones (HDR) and many Android cameras produce exactly these formats, so on mobile this is likely the largest untapped win.
