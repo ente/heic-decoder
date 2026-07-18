@@ -42,6 +42,18 @@ Grid tiles are converted into temporary RGBA buffers before being copied or tran
 
 For identity orientation, add an output-stride-aware NEON conversion path that writes each tile directly into its final destination region. For 90-degree and 270-degree orientations, investigate blocked conversion and transpose operations to retain cache locality. Keep this experiment narrower than the previously rejected general affine-conversion implementation.
 
+### Experiment result (2026-07-18): rejected
+
+Implemented the deliberately narrow production-hook path: opaque, identity-oriented RGBA8 grids converted each validated and clipped YUV tile directly into its final caller-buffer region using the canvas row stride. Full-range 8-bit 4:2:0 kept the AArch64 NEON kernel with strided stores, while the portable scalar converter covered the other 8-bit layouts and ranges. Rotations, mirrors, clean apertures, auxiliary alpha, and RGBA16 stayed on the established temporary-tile fallback. The candidate passed 65 library tests, strict Clippy, all portability builds, focused real-grid parity, and the complete validator run: 272 corpus files accounted for, 219 pixel-oracle cases passed, 219 production image-hook parity checks passed, and zero failures.
+
+The 225-file production `image`-crate hook A/B benchmark retained identical fingerprints and showed small improvements, but none was repeatably above the 2% gate:
+
+- Apple Silicon desktop: `1.012266x` (baseline 1135.645 ms, candidate 1121.884 ms; +1.23%).
+- Pixel 4 / Android 13: `1.006170x` (baseline 7055.583 ms, candidate 7012.319 ms; +0.62%; thermal status 0 before/after).
+- iPhone 11 Pro / iOS 26.5: `1.019976x` (baseline 2284.174 ms, candidate 2239.440 ms; +2.00%; thermal state nominal throughout). The two interleaved iPhone pairs were only +0.3% and +3.6%, so this borderline mean was not repeatable.
+
+The implementation was reverted. Direct identity-grid conversion reduced work as intended, but it affects too little of the full production-hook corpus to justify the added specialized path under the experiment's acceptance rule.
+
 ## 4. Make grid and frame parallelism mobile-aware
 
 Fixed concurrency and use of the global Rayon pool can oversubscribe mobile CPUs, increase memory pressure, and cause thermal throttling—particularly when an application decodes multiple images concurrently.
