@@ -24,6 +24,18 @@ Clean-aperture crops and non-default strides currently cause full Y, U, and V pl
 
 Represent decoded planes as stride-aware views containing an origin, dimensions, and row stride, then convert the cropped region directly. Alternatively, add a finalizer that converts directly from the decoded frame into the caller's RGB/RGBA buffer. This should lower both latency and peak memory use on mobile devices.
 
+### Experiment result (2026-07-18): rejected
+
+Implemented a coded-image `image`-hook fast path that retained backend-owned planes as validated stride/origin views and converted directly into the caller's RGBA8/RGBA16 buffer. It covered YUV400/420/422/444, full/limited range, 8/10/12-bit content, auxiliary alpha, clean aperture, mirror, and rotation; full-range 8-bit 4:2:0 retained the region SIMD kernel. Grid paths were deliberately left for suggestion 3. The candidate passed 66 library tests, strict Clippy, portability checks, focused adapter/direct parity fixtures, and the complete validator run: 272 corpus files accounted for, 219 pixel-oracle cases passed, 219 production image-hook parity checks passed, and zero failures.
+
+The 225-file production `image`-crate hook A/B benchmark retained identical fingerprints but did not improve end-to-end latency:
+
+- Apple Silicon desktop: `0.994873x` (baseline 1141.117 ms, candidate 1146.998 ms; -0.51%).
+- Pixel 4 / Android 13: `0.965463x` (baseline 6718.879 ms, candidate 6959.226 ms; -3.45%; thermal status 0 before/after).
+- iPhone 11 Pro / iOS 26.5: `1.001774x` (baseline 2294.987 ms, candidate 2290.924 ms; +0.18%; thermal state nominal throughout).
+
+The implementation was reverted. Avoiding conformance-window plane copies was not a material production-hook win on this corpus, and the roughly 860-line specialized finalizer was not justified—particularly with a clear Android regression.
+
 ## 3. Convert grid tiles directly into the final output
 
 Grid tiles are converted into temporary RGBA buffers before being copied or transformed into the destination image.
