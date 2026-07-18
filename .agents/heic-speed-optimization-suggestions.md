@@ -96,6 +96,20 @@ The NEON fast path is gated to 8-bit, full-range, 4:2:0, opaque matrix content o
 
 Add NEON f32 kernels for the `MatrixFullFloat` and `MatrixLimited` paths. Bit-exact parity with the libheif float oracle is achievable because `fmaf_parity` already uses fused `mul_add` on aarch64 and `vfmaq_f32` is also fused. Also consider ARMv7 NEON and WASM SIMD128 variants, which currently have zero SIMD coverage.
 
+### Experiment result (2026-07-18): accepted
+
+Added AArch64 NEON float-matrix conversion for full/limited-range YUV 4:2:0, 4:2:2, and 4:4:4, covering RGB8/RGBA8 at 8-bit and RGBA16 at high bit depth. The production image hook gained a naturally aligned contiguous RGBA16 path, and identity alpha-bearing coded/grid images use SIMD color conversion before the existing alpha composition. Scalar fallbacks remain for non-AArch64, identity/monochrome matrices, deliberately unaligned RGBA16 buffers, transformed coded images, and non-finite/extreme coefficients. The kernels preserve the scalar FMA graph, limited-range subtraction/scaling, `+0.5` truncation/clipping, odd chroma phase, tails, and exact 10/12-bit-to-u16 bit replication.
+
+The candidate passed 71 library tests, 8 CLI tests, strict Clippy, no-default and iOS/Android/Wasm builds, synthetic SIMD/scalar parity across all supported layouts and boundaries, 12 real affected-format fixture comparisons, and the complete validator gate: 272 corpus files accounted for, 219 pixel-oracle cases passed, 219 production image-hook parity checks passed, and zero failures.
+
+The 225-file production `image`-crate hook A/B benchmark retained identical fingerprints:
+
+- Apple Silicon desktop: `1.014672x` (baseline 1089.079 ms, candidate 1073.331 ms; +1.47%).
+- Pixel 4 / Android 13: `1.056063x` (baseline 7057.459 ms, candidate 6682.801 ms; +5.61%; thermal status 0 before/after). Both interleaved pairs improved.
+- iPhone 11 Pro / iOS 26.5: `1.002181x` (baseline 2253.249 ms, candidate 2248.344 ms; +0.22%; candidate runs stayed nominal and pairwise neutral).
+
+The implementation was kept. Although the affected formats are a small share of corpus pixels and the architecture-specific patch is substantial, the repeatable 5.6% Android full-hook win clears the gate without a material desktop or iPhone regression.
+
 ## 7. Batch residual/CABAC micro-optimizations into one coherent change
 
 Several individually positive but sub-gate residual/CABAC experiments were rejected: caller-side bounds-check elimination (x1.007), fused range+transition lookup (x1.008), hoisted/flattened helpers (x1.012), scan-ordered context tables (x1.011), and bypass-bin batching (x1.019–x1.025). The journal shows that combining compatible near-threshold ideas cleared the gate twice before (attempts 33 and 36).

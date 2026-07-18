@@ -8847,7 +8847,7 @@ fn decoded_heic_to_rgba8_slice(
     // regions. Route those directly through the shared contiguous converter
     // so its architecture-specific 4:2:0 kernel writes the caller's buffer
     // without materializing a full-frame RGBA intermediate.
-    if auxiliary_alpha.is_none() {
+    if auxiliary_alpha.is_none() || transforms.is_empty() {
         let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
         if heic_storage_bit_depth(source_bit_depth) != 8 {
             return Err(DecodeError::Unsupported(format!(
@@ -8877,6 +8877,9 @@ fn decoded_heic_to_rgba8_slice(
             .iter()
             .all(|step| matches!(step, ResolvedRgbaTransformStep::CleanAperture { .. }))
         {
+            if let Some(alpha) = auxiliary_alpha {
+                validate_auxiliary_alpha_plane(alpha, decoded.width, decoded.height)?;
+            }
             let (source_x, source_y) = transform_plan.map_destination_pixel(0, 0)?;
             let destination_width = transform_dimension_to_usize(
                 "HEIC clean-aperture adapter",
@@ -8888,7 +8891,7 @@ fn decoded_heic_to_rgba8_slice(
                 "destination height",
                 transform_plan.destination_height,
             )?;
-            return convert_heic_to_interleaved_rgb8_region_slice::<4>(
+            convert_heic_to_interleaved_rgb8_region_slice::<4>(
                 &decoded,
                 source_x,
                 source_y,
@@ -8898,7 +8901,11 @@ fn decoded_heic_to_rgba8_slice(
                 scale_sample_to_u8,
                 "RGBA8",
             )
-            .map_err(DecodeError::from);
+            .map_err(DecodeError::from)?;
+            if let Some(alpha) = auxiliary_alpha {
+                apply_auxiliary_alpha_to_rgba8(out, decoded.width, decoded.height, alpha)?;
+            }
+            return Ok(());
         }
     }
 
@@ -8921,6 +8928,36 @@ fn decoded_heic_to_rgba16_native_endian_bytes(
     auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
+    // `image` allocates the identity decode buffer through the global
+    // allocator, which is naturally aligned on the mobile targets. Reuse the
+    // contiguous RGBA16 converter in that common case so its high-bit-depth
+    // AArch64 float kernel writes directly into the hook's caller buffer.
+    // A deliberately unaligned public slice or any primary transform keeps
+    // the byte-wise generic path below. For identity alpha images, color is
+    // converted first and the validated auxiliary plane replaces A in-place.
+    if transforms.is_empty() {
+        let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
+        if heic_storage_bit_depth(source_bit_depth) != 16 {
+            return Err(DecodeError::Unsupported(format!(
+                "HEIC storage is RGBA{}, not RGBA16",
+                heic_storage_bit_depth(source_bit_depth)
+            )));
+        }
+        // SAFETY: `align_to_mut` only exposes the maximally aligned middle;
+        // conversion is used solely when it spans the entire caller slice.
+        let (prefix, samples, suffix) = unsafe { out.align_to_mut::<u16>() };
+        if prefix.is_empty() && suffix.is_empty() {
+            if let Some(alpha) = auxiliary_alpha {
+                validate_auxiliary_alpha_plane(alpha, decoded.width, decoded.height)?;
+            }
+            convert_heic_to_rgba16_slice(&decoded, samples).map_err(DecodeError::from)?;
+            if let Some(alpha) = auxiliary_alpha {
+                apply_auxiliary_alpha_to_rgba16(samples, decoded.width, decoded.height, alpha)?;
+            }
+            return Ok(());
+        }
+    }
+
     let mut output = NativeEndianRgba16Output(out);
     decoded_heic_to_rgba_output(
         decoded,
@@ -12171,6 +12208,41 @@ fn convert_heic_to_interleaved_rgb8_region_slice<const CHANNELS: usize>(
         return Ok(());
     }
 
+    // libheif routes limited-range 4:2:0 and all matrix 4:2:2/4:4:4
+    // conversions through its generic f32 operation. On AArch64, preserve
+    // that exact operation graph in four-lane NEON; other targets retain the
+    // scalar implementation selected by the converter module. High-bit-depth
+    // RGB8 has distinct image-crate rounding, so it stays on the established
+    // loop below (the production RGBA16 hook is accelerated separately).
+    if bit_depth == 8
+        && let HeicChromaPlanes::Color {
+            u_samples,
+            v_samples,
+            chroma_width,
+            layout,
+        } = &chroma
+        && let Some(params) = prepared_float_matrix_params(converter.transform)
+    {
+        let (subsample_x, subsample_y) = heic_chroma_subsampling(*layout);
+        heic_decoder::hevc::color_convert::convert_float_matrix_8bit_region_to_interleaved(
+            &decoded.y_plane.samples,
+            u_samples,
+            v_samples,
+            source_width,
+            *chroma_width,
+            subsample_x as usize,
+            subsample_y as usize,
+            source_x_start,
+            source_y_start,
+            width,
+            height,
+            params,
+            CHANNELS,
+            out,
+        );
+        return Ok(());
+    }
+
     for output_y in 0..height {
         let source_y = source_y_start + output_y;
         let row_start = source_y * source_width;
@@ -12292,6 +12364,34 @@ fn convert_heic_to_rgba16_slice(
         ycbcr_transform,
         decoded.layout == HeicPixelLayout::Yuv420,
     );
+
+    if let HeicChromaPlanes::Color {
+        u_samples,
+        v_samples,
+        chroma_width,
+        layout,
+    } = &chroma
+        && let Some(params) = prepared_float_matrix_params(converter.transform)
+    {
+        let (subsample_x, subsample_y) = heic_chroma_subsampling(*layout);
+        heic_decoder::hevc::color_convert::convert_float_matrix_region_to_rgba16(
+            &decoded.y_plane.samples,
+            u_samples,
+            v_samples,
+            width,
+            *chroma_width,
+            subsample_x as usize,
+            subsample_y as usize,
+            0,
+            0,
+            width,
+            height,
+            bit_depth,
+            params,
+            out,
+        );
+        return Ok(());
+    }
 
     for y in 0..height {
         let row_start = y * width;
@@ -12760,6 +12860,41 @@ enum PreparedYcbcrTransform {
         limited_offset: f32,
         chroma_midpoint: f32,
     },
+}
+
+fn prepared_float_matrix_params(
+    transform: PreparedYcbcrTransform,
+) -> Option<heic_decoder::hevc::color_convert::FloatMatrixParams> {
+    let (coeffs, y_offset, y_scale, chroma_midpoint, chroma_scale) = match transform {
+        PreparedYcbcrTransform::MatrixFullFloat {
+            coeffs,
+            chroma_midpoint,
+        } => (coeffs, 0.0_f32, 1.0_f32, chroma_midpoint as f32, 1.0_f32),
+        PreparedYcbcrTransform::MatrixLimited {
+            coeffs,
+            limited_offset,
+            chroma_midpoint,
+        } => (
+            coeffs,
+            limited_offset,
+            1.1689_f32,
+            chroma_midpoint,
+            1.1429_f32,
+        ),
+        PreparedYcbcrTransform::IdentityFull
+        | PreparedYcbcrTransform::IdentityLimited { .. }
+        | PreparedYcbcrTransform::MatrixFull { .. } => return None,
+    };
+    Some(heic_decoder::hevc::color_convert::FloatMatrixParams {
+        y_offset,
+        y_scale,
+        chroma_midpoint,
+        chroma_scale,
+        r_cr: coeffs.r_cr_f32,
+        g_cb: coeffs.g_cb_f32,
+        g_cr: coeffs.g_cr_f32,
+        b_cb: coeffs.b_cb_f32,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -14374,6 +14509,87 @@ mod tests {
             .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
             .collect();
         assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "image-integration")]
+    #[test]
+    fn identity_alpha_float_matrix_slice_paths_match_owned_output() {
+        let mut image8 = synthetic_yuv_image(super::HeicPixelLayout::Yuv422);
+        image8.ycbcr_range = super::YCbCrRange::Limited;
+        let alpha8 = super::HeicAuxiliaryAlphaPlane {
+            width: image8.width,
+            height: image8.height,
+            bit_depth: 8,
+            samples: (0..image8.width * image8.height)
+                .map(|index| ((index * 29) & 255) as u16)
+                .collect(),
+        };
+        let owned8 = super::decoded_heic_to_rgba_image(image8.clone(), &[], Some(&alpha8), None)
+            .expect("owned RGBA8 alpha conversion should succeed");
+        let expected8 = match owned8.pixels {
+            super::DecodedRgbaPixels::U8(pixels) => pixels,
+            other => panic!("expected RGBA8 pixels, got {other:?}"),
+        };
+        let mut actual8 = vec![0_u8; expected8.len()];
+        super::decoded_heic_to_rgba8_slice(image8, &[], Some(&alpha8), &mut actual8)
+            .expect("identity RGBA8 alpha slice conversion should succeed");
+        assert_eq!(actual8, expected8);
+
+        let mut image16 = synthetic_yuv_image(super::HeicPixelLayout::Yuv420);
+        image16.bit_depth_luma = 10;
+        image16.bit_depth_chroma = 10;
+        for sample in &mut image16.y_plane.samples {
+            *sample *= 4;
+        }
+        for sample in image16
+            .u_plane
+            .as_mut()
+            .expect("U plane")
+            .samples
+            .iter_mut()
+        {
+            *sample *= 4;
+        }
+        for sample in image16
+            .v_plane
+            .as_mut()
+            .expect("V plane")
+            .samples
+            .iter_mut()
+        {
+            *sample *= 4;
+        }
+        let alpha16 = super::HeicAuxiliaryAlphaPlane {
+            width: image16.width,
+            height: image16.height,
+            bit_depth: 10,
+            samples: (0..image16.width * image16.height)
+                .map(|index| ((index * 37) & 1023) as u16)
+                .collect(),
+        };
+        let owned16 = super::decoded_heic_to_rgba_image(image16.clone(), &[], Some(&alpha16), None)
+            .expect("owned RGBA16 alpha conversion should succeed");
+        let expected16 = match owned16.pixels {
+            super::DecodedRgbaPixels::U16(pixels) => pixels,
+            other => panic!("expected RGBA16 pixels, got {other:?}"),
+        };
+        let mut actual16 = vec![0_u16; expected16.len()];
+        // SAFETY: the byte view spans the initialized u16 allocation exactly;
+        // the production API writes native-endian u16 bytes.
+        let actual16_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                actual16.as_mut_ptr().cast::<u8>(),
+                actual16.len() * std::mem::size_of::<u16>(),
+            )
+        };
+        super::decoded_heic_to_rgba16_native_endian_bytes(
+            image16,
+            &[],
+            Some(&alpha16),
+            actual16_bytes,
+        )
+        .expect("identity RGBA16 alpha byte conversion should succeed");
+        assert_eq!(actual16, expected16);
     }
 
     #[cfg(feature = "image-integration")]
