@@ -37,7 +37,9 @@ the CI toolchain, validator, or corpus forward deliberately.
 - pixel-for-pixel comparison of the `image` crate integration hook output
   (`ImageReader`/`DynamicImage::from_decoder`) against the direct Rust decode
   for every comparable verifier file, including exact ICC-profile equality
-  through the hook decoder's `ImageDecoder::icc_profile`
+  through the hook decoder's `ImageDecoder::icc_profile`; this reproduces
+  Ente's production hook shape, including its explicit guardrails,
+  `with_guessed_format`, `Limits::reserve`, and `set_limits`
 - embedded ICC colour-profile comparison against the validator's PNG output:
   when `heif-dec` embeds a profile, the Rust PNG must carry byte-identical
   profile data; a Rust-only profile is allowed (the Rust decoder synthesizes

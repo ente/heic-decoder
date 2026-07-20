@@ -75,33 +75,55 @@ static LPS_TABLE: [[u8; 4]; 64] = [
     [2, 2, 2, 2],
 ];
 
-/// Renormalization table
-#[allow(dead_code)]
-static RENORM_TABLE: [u8; 32] = [
-    6, 5, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-];
-
 /// State transition for MPS
-static STATE_TRANS_MPS: [u8; 64] = [
+const STATE_TRANS_MPS: [u8; 64] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
     51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 62, 63,
 ];
 
 /// State transition for LPS
-static STATE_TRANS_LPS: [u8; 64] = [
+const STATE_TRANS_LPS: [u8; 64] = [
     0, 0, 1, 2, 2, 4, 4, 5, 6, 7, 8, 9, 9, 11, 11, 12, 13, 13, 15, 15, 16, 16, 18, 18, 19, 19, 21,
     21, 22, 22, 23, 24, 24, 25, 26, 26, 27, 27, 28, 29, 29, 30, 30, 30, 31, 32, 32, 33, 33, 33, 34,
     34, 35, 35, 35, 36, 36, 36, 37, 37, 37, 38, 38, 63,
 ];
 
+const fn build_packed_mps_transitions() -> [u8; 128] {
+    let mut transitions = [0; 128];
+    let mut packed = 0;
+    while packed < transitions.len() {
+        let state = packed >> 1;
+        let mps = packed & 1;
+        transitions[packed] = (STATE_TRANS_MPS[state] << 1) | mps as u8;
+        packed += 1;
+    }
+    transitions
+}
+
+const fn build_packed_lps_transitions() -> [u8; 128] {
+    let mut transitions = [0; 128];
+    let mut packed = 0;
+    while packed < transitions.len() {
+        let state = packed >> 1;
+        let mut mps = packed & 1;
+        if state == 0 {
+            mps ^= 1;
+        }
+        transitions[packed] = (STATE_TRANS_LPS[state] << 1) | mps as u8;
+        packed += 1;
+    }
+    transitions
+}
+
+const PACKED_STATE_TRANS_MPS: [u8; 128] = build_packed_mps_transitions();
+const PACKED_STATE_TRANS_LPS: [u8; 128] = build_packed_lps_transitions();
+
 /// CABAC context model
 #[derive(Clone, Copy)]
 pub struct ContextModel {
-    /// State index (0-63)
-    state: u8,
-    /// Most probable symbol (0 or 1)
-    mps: u8,
+    /// State index (0-63) in bits 1-6 and the MPS value in bit 0.
+    state_mps: u8,
 }
 
 #[allow(dead_code)]
@@ -122,12 +144,14 @@ impl ContextModel {
             ((63 - init_state) as u8, 0)
         };
 
-        Self { state, mps }
+        Self {
+            state_mps: (state << 1) | mps,
+        }
     }
 
     /// Get the current context state and MPS
     pub fn get_state(&self) -> (u8, u8) {
-        (self.state, self.mps)
+        (self.state_mps >> 1, self.state_mps & 1)
     }
 
     /// Initialize context for a given slice QP
@@ -140,11 +164,9 @@ impl ContextModel {
         let init_state = init_state.clamp(1, 126);
 
         if init_state >= 64 {
-            self.state = (init_state - 64) as u8;
-            self.mps = 1;
+            self.state_mps = ((init_state - 64) as u8) << 1 | 1;
         } else {
-            self.state = (63 - init_state) as u8;
-            self.mps = 0;
+            self.state_mps = ((63 - init_state) as u8) << 1;
         }
     }
 }
@@ -164,8 +186,6 @@ pub struct CabacDecoder<'a> {
     value: u32,
     /// Bits needed before next byte read (negative means bits available)
     bits_needed: i32,
-    /// Bin counter for debug tracing
-    bin_counter: u32,
 }
 
 #[allow(dead_code)]
@@ -198,7 +218,6 @@ impl<'a> CabacDecoder<'a> {
             range: 510,
             value: 0,
             bits_needed: 8,
-            bin_counter: 0,
         };
 
         // Initialize value (matching libde265 exactly)
@@ -223,19 +242,23 @@ impl<'a> CabacDecoder<'a> {
     /// Equivalent to libde265's init_CABAC_decoder_2().
     pub fn reinit(&mut self) {
         self.range = 510;
-        self.bits_needed = 8;
+        // With fewer than two bytes left, the legacy per-bit refill consumed
+        // the available high byte and then normalized bits_needed to -8 on
+        // the first decoded bit. Represent that pending first-bit transition
+        // directly as -9 so batched renormalization remains exactly
+        // equivalent without a special case in its hot path.
+        self.bits_needed = -9;
         self.value = 0;
 
         let remaining = self.data.len() - self.byte_pos;
         if remaining > 0 {
             self.value = (self.data[self.byte_pos] as u32) << 8;
             self.byte_pos += 1;
-            self.bits_needed -= 8;
         }
         if remaining > 1 {
             self.value |= self.data[self.byte_pos] as u32;
             self.byte_pos += 1;
-            self.bits_needed -= 8;
+            self.bits_needed = -8;
         }
     }
 
@@ -251,29 +274,14 @@ impl<'a> CabacDecoder<'a> {
         Ok(())
     }
 
-    /// Read a single bit from the bitstream (for regular context decoding)
-    fn read_bit(&mut self) -> Result<u32> {
-        self.value <<= 1;
-        self.bits_needed += 1;
-
-        if self.bits_needed >= 0 {
-            if self.byte_pos < self.data.len() {
-                self.bits_needed = -8;
-                self.value |= self.data[self.byte_pos] as u32;
-                self.byte_pos += 1;
-            } else {
-                self.bits_needed = -8;
-            }
-        }
-
-        Ok(0) // Return value not used, just for error handling
-    }
-
     /// Decode a single bin using context model
-    pub fn decode_bin(&mut self, ctx: &mut ContextModel) -> Result<u8> {
-        self.bin_counter += 1;
+    #[inline]
+    pub fn decode_bin(&mut self, ctx: &mut ContextModel) -> u8 {
+        let packed_state = ctx.state_mps as usize;
+        let state = packed_state >> 1;
+        let mps = (packed_state & 1) as u8;
         let q_range_idx = (self.range >> 6) & 3;
-        let lps_range = LPS_TABLE[ctx.state as usize][q_range_idx as usize] as u32;
+        let lps_range = LPS_TABLE[state][q_range_idx as usize] as u32;
 
         self.range -= lps_range;
 
@@ -283,29 +291,25 @@ impl<'a> CabacDecoder<'a> {
         let bin_val;
         if self.value < scaled_range {
             // MPS path
-            bin_val = ctx.mps;
-            ctx.state = STATE_TRANS_MPS[ctx.state as usize];
+            bin_val = mps;
+            ctx.state_mps = PACKED_STATE_TRANS_MPS[packed_state];
         } else {
             // LPS path
-            bin_val = 1 - ctx.mps;
+            bin_val = mps ^ 1;
             self.value -= scaled_range;
             self.range = lps_range;
-
-            if ctx.state == 0 {
-                ctx.mps = 1 - ctx.mps;
-            }
-            ctx.state = STATE_TRANS_LPS[ctx.state as usize];
+            ctx.state_mps = PACKED_STATE_TRANS_LPS[packed_state];
         }
 
         // Renormalize
-        self.renormalize()?;
+        self.renormalize();
 
-        Ok(bin_val)
+        bin_val
     }
 
     /// Decode a bypass bin (equal probability) - libde265 compatible
-    pub fn decode_bypass(&mut self) -> Result<u8> {
-        self.bin_counter += 1;
+    #[inline]
+    pub fn decode_bypass(&mut self) -> u8 {
         self.value <<= 1;
         self.bits_needed += 1;
 
@@ -322,19 +326,20 @@ impl<'a> CabacDecoder<'a> {
         let scaled_range = self.range << 7;
         if self.value >= scaled_range {
             self.value -= scaled_range;
-            Ok(1)
+            1
         } else {
-            Ok(0)
+            0
         }
     }
 
     /// Decode multiple bypass bins
-    pub fn decode_bypass_bits(&mut self, n: u8) -> Result<u32> {
+    #[inline]
+    pub fn decode_bypass_bits(&mut self, n: u8) -> u32 {
         let mut result = 0u32;
         for _ in 0..n {
-            result = (result << 1) | self.decode_bypass()? as u32;
+            result = (result << 1) | self.decode_bypass() as u32;
         }
-        Ok(result)
+        result
     }
 
     /// Decode Exp-Golomb coded value (EGk) using bypass bins
@@ -342,7 +347,7 @@ impl<'a> CabacDecoder<'a> {
         let mut base = 0u32;
         let mut n = k;
         loop {
-            let bit = self.decode_bypass()?;
+            let bit = self.decode_bypass();
             if bit == 0 {
                 break;
             }
@@ -352,40 +357,54 @@ impl<'a> CabacDecoder<'a> {
                 return Err(HevcError::InvalidBitstream("EGk prefix too long"));
             }
         }
-        let suffix = self.decode_bypass_bits(n)?;
+        let suffix = self.decode_bypass_bits(n);
         Ok(base + suffix)
     }
 
     /// Decode a terminate bin (end of slice check)
-    pub fn decode_terminate(&mut self) -> Result<u8> {
+    pub fn decode_terminate(&mut self) -> u8 {
         self.range -= 2;
 
         let scaled_range = self.range << 7;
         if self.value >= scaled_range {
-            Ok(1)
+            1
         } else {
-            self.renormalize()?;
-            Ok(0)
+            self.renormalize();
+            0
         }
     }
 
     /// Renormalize the decoder state
-    fn renormalize(&mut self) -> Result<()> {
-        while self.range < 256 {
-            self.range <<= 1;
-            // Shift value and read more bits
-            self.read_bit()?;
+    #[inline]
+    fn renormalize(&mut self) {
+        if self.range < 256 {
+            // `range` is non-zero and at most seven shifts are needed. Since
+            // `bits_needed` starts in -9..=-1, the batch crosses at most one
+            // byte boundary. (`-9` is the canonical short-reinit state and
+            // cannot cross within a seven-bit batch.) When a normal state
+            // crosses, place the new byte exactly where the remaining
+            // single-bit shifts would have moved it.
+            let shift = self.range.leading_zeros() - 23;
+            self.range <<= shift;
+            self.value <<= shift;
+            self.bits_needed += shift as i32;
+            if self.bits_needed >= 0 {
+                if self.byte_pos < self.data.len() {
+                    self.value |= (self.data[self.byte_pos] as u32) << self.bits_needed;
+                    self.byte_pos += 1;
+                }
+                self.bits_needed -= 8;
+            }
         }
         // Invariant: after renormalization, range >= 256
         debug_assert!(self.range >= 256, "range {} < 256 after renorm", self.range);
-        Ok(())
     }
 
     /// Decode unsigned Exp-Golomb code using bypass bins
     pub fn decode_eg(&mut self, k: u8) -> Result<u32> {
         // Count leading zeros
         let mut n = 0;
-        while self.decode_bypass()? != 0 {
+        while self.decode_bypass() != 0 {
             n += 1;
             if n > 31 {
                 return Err(HevcError::CabacError("exp-golomb overflow"));
@@ -394,7 +413,7 @@ impl<'a> CabacDecoder<'a> {
 
         let mut value = 0u32;
         for _ in 0..(n + k) {
-            value = (value << 1) | self.decode_bypass()? as u32;
+            value = (value << 1) | self.decode_bypass() as u32;
         }
 
         Ok((1 << n) - 1 + value)
@@ -513,3 +532,79 @@ pub static INIT_VALUES: [u8; context::NUM_CONTEXTS] = [
     154, 154, 154, 154, 154, 154, 154, 154, // RES_SCALE_SIGN_FLAG (2)
     154, 154,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::CabacDecoder;
+
+    fn legacy_reinit(decoder: &mut CabacDecoder<'_>, byte_pos: usize) {
+        decoder.byte_pos = byte_pos;
+        decoder.range = 510;
+        decoder.bits_needed = 8;
+        decoder.value = 0;
+
+        let remaining = decoder.data.len() - decoder.byte_pos;
+        if remaining > 0 {
+            decoder.value = (decoder.data[decoder.byte_pos] as u32) << 8;
+            decoder.byte_pos += 1;
+            decoder.bits_needed -= 8;
+        }
+        if remaining > 1 {
+            decoder.value |= decoder.data[decoder.byte_pos] as u32;
+            decoder.byte_pos += 1;
+            decoder.bits_needed -= 8;
+        }
+    }
+
+    fn legacy_renormalize(decoder: &mut CabacDecoder<'_>) {
+        while decoder.range < 256 {
+            decoder.range <<= 1;
+            decoder.value <<= 1;
+            decoder.bits_needed += 1;
+            if decoder.bits_needed >= 0 {
+                decoder.bits_needed = -8;
+                if decoder.byte_pos < decoder.data.len() {
+                    decoder.value |= decoder.data[decoder.byte_pos] as u32;
+                    decoder.byte_pos += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_renormalization_matches_legacy_after_short_reinit() {
+        let data = [0x12, 0x34, 0x56, 0x78];
+
+        for remaining in 0..=2 {
+            let byte_pos = data.len() - remaining;
+            for range in [128, 64, 32, 16, 8, 4, 2] {
+                let mut batched = CabacDecoder::new(&data).expect("CABAC test data");
+                batched.seek_to(byte_pos).expect("valid byte offset");
+                batched.range = range;
+
+                let mut legacy = CabacDecoder::new(&data).expect("CABAC test data");
+                legacy_reinit(&mut legacy, byte_pos);
+                legacy.range = range;
+
+                batched.renormalize();
+                legacy_renormalize(&mut legacy);
+
+                assert_eq!(
+                    (
+                        batched.range,
+                        batched.value,
+                        batched.bits_needed,
+                        batched.byte_pos,
+                    ),
+                    (
+                        legacy.range,
+                        legacy.value,
+                        legacy.bits_needed,
+                        legacy.byte_pos,
+                    ),
+                    "remaining={remaining}, range={range}"
+                );
+            }
+        }
+    }
+}

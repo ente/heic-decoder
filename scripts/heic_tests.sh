@@ -419,9 +419,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 RS
 
   cat > "$HELPER_DIR/src/bin/heif-image-adapter-bench.rs" <<'RS'
-use heic_decoder::image_integration::register_image_decoder_hooks;
-use heic_decoder::{DecodedRgbaImage, DecodedRgbaPixels, decode_path_to_rgba};
-use image::{DynamicImage, ImageReader};
+use heic_decoder::image_integration::register_image_decoder_hooks_with_guardrails;
+use heic_decoder::{DecodeGuardrails, DecodedRgbaImage, DecodedRgbaPixels, decode_path_to_rgba};
+use image::{DynamicImage, ImageDecoder, ImageReader, Limits};
 use std::error::Error;
 use std::path::Path;
 
@@ -462,8 +462,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let value = match args[1].as_str() {
         "direct" => direct_checksum(&decode_path_to_rgba(input)?),
         "adapter" => {
-            let _ = register_image_decoder_hooks();
-            let decoded = ImageReader::open(input)?.decode()?;
+            let _ = register_image_decoder_hooks_with_guardrails(DecodeGuardrails {
+                max_input_bytes: Some(128 * 1024 * 1024),
+                max_pixels: Some(256_000_000),
+                max_temp_spool_bytes: Some(256 * 1024 * 1024),
+                temp_spool_directory: None,
+            });
+            let mut decoder = ImageReader::open(input)?.with_guessed_format()?.into_decoder()?;
+            let _icc_profile = decoder.icc_profile()?;
+            let mut limits = Limits::default();
+            limits.reserve(decoder.total_bytes())?;
+            decoder.set_limits(limits)?;
+            let decoded = DynamicImage::from_decoder(decoder)?;
             let (width, height) = (decoded.width(), decoded.height());
             let pixels = match decoded {
                 DynamicImage::ImageRgba8(buffer) => checksum(buffer.as_raw()),
@@ -480,9 +490,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 RS
 
   cat > "$HELPER_DIR/src/bin/heif-image-hook-check.rs" <<'RS'
-use heic_decoder::image_integration::register_image_decoder_hooks;
-use heic_decoder::{DecodedRgbaPixels, decode_path_to_rgba};
-use image::{DynamicImage, ImageDecoder, ImageReader};
+use heic_decoder::image_integration::register_image_decoder_hooks_with_guardrails;
+use heic_decoder::{DecodeGuardrails, DecodedRgbaPixels, decode_path_to_rgba};
+use image::{DynamicImage, ImageDecoder, ImageReader, Limits};
 use std::error::Error;
 use std::path::Path;
 
@@ -495,9 +505,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let input = Path::new(&args[1]);
     let direct = decode_path_to_rgba(input)?;
 
-    let _ = register_image_decoder_hooks();
-    let mut decoder = ImageReader::open(input)?.into_decoder()?;
+    let _ = register_image_decoder_hooks_with_guardrails(DecodeGuardrails {
+        max_input_bytes: Some(128 * 1024 * 1024),
+        max_pixels: Some(256_000_000),
+        max_temp_spool_bytes: Some(256 * 1024 * 1024),
+        temp_spool_directory: None,
+    });
+    let mut decoder = ImageReader::open(input)?.with_guessed_format()?.into_decoder()?;
     let icc_profile = decoder.icc_profile()?;
+    let mut limits = Limits::default();
+    limits.reserve(decoder.total_bytes())?;
+    decoder.set_limits(limits)?;
     if icc_profile != direct.icc_profile {
         return Err("image hook ICC profile differs from direct decode".into());
     }
