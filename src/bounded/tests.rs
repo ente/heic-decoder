@@ -29,12 +29,16 @@ fn full_box(kind: &[u8; 4], version: u8, data: &[u8]) -> Vec<u8> {
 }
 
 fn configuration(sps: &[u8]) -> Vec<u8> {
+    configuration_with_pps(sps, &nal_sets()[2])
+}
+
+fn configuration_with_pps(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     let nals = nal_sets();
     let mut result = vec![0; 23];
     result[0] = 1;
     result[21] = 3;
     result[22] = 3;
-    for nal in [nals[0].as_slice(), sps, nals[2].as_slice()] {
+    for nal in [nals[0].as_slice(), sps, pps] {
         result.push((nal[0] >> 1) & 63);
         result.extend_from_slice(&1u16.to_be_bytes());
         result.extend_from_slice(&(nal.len() as u16).to_be_bytes());
@@ -231,6 +235,10 @@ fn huge_cropped_sps() -> Vec<u8> {
         write_ue(&mut replacement, crop);
     }
     bits.splice(start..cursor, replacement);
+    nal_from_bits(&nals[1][..2], bits)
+}
+
+fn nal_from_bits(header: &[u8], mut bits: Vec<bool>) -> Vec<u8> {
     while !bits.len().is_multiple_of(8) {
         bits.push(false);
     }
@@ -238,7 +246,7 @@ fn huge_cropped_sps() -> Vec<u8> {
         .chunks_exact(8)
         .map(|b| b.iter().fold(0, |v, &bit| (v << 1) | u8::from(bit)))
         .collect();
-    let mut result = vec![0x42, 1];
+    let mut result = header.to_vec();
     let mut zeros = 0;
     for byte in raw {
         if zeros >= 2 && byte <= 3 {
@@ -249,6 +257,138 @@ fn huge_cropped_sps() -> Vec<u8> {
         zeros = if byte == 0 { zeros + 1 } else { 0 };
     }
     result
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+fn scaling_list_parameter_set(parameter: usize, dc: i32, delta: i32, reference: u32) -> Vec<u8> {
+    let nals = nal_sets();
+    let nal = crate::heic_decoder::hevc::bitstream::parse_single_nal(&nals[parameter]).unwrap();
+    let mut bits: Vec<bool> = nal
+        .payload
+        .iter()
+        .flat_map(|byte| (0..8).rev().map(move |i| byte & (1 << i) != 0))
+        .collect();
+    let mut cursor = if parameter == 1 { 104 } else { 0 };
+    if parameter == 1 {
+        for _ in 0..4 {
+            read_ue(&bits, &mut cursor);
+        }
+        assert!(!bits[cursor]);
+        cursor += 1;
+        for _ in 0..3 {
+            read_ue(&bits, &mut cursor);
+        }
+        cursor += 1;
+        for _ in 0..9 {
+            read_ue(&bits, &mut cursor);
+        }
+    } else {
+        assert_eq!(parameter, 2);
+        for _ in 0..2 {
+            read_ue(&bits, &mut cursor);
+        }
+        cursor += 7;
+        for _ in 0..3 {
+            read_ue(&bits, &mut cursor);
+        }
+        cursor += 2;
+        let cu_qp_delta_enabled = bits[cursor];
+        cursor += 1;
+        if cu_qp_delta_enabled {
+            read_ue(&bits, &mut cursor);
+        }
+        for _ in 0..2 {
+            read_ue(&bits, &mut cursor);
+        }
+        cursor += 4;
+        assert!(!bits[cursor] && !bits[cursor + 1]);
+        cursor += 3;
+        let deblocking_filter_control_present = bits[cursor];
+        cursor += 1;
+        if deblocking_filter_control_present {
+            cursor += 1;
+            let deblocking_filter_disabled = bits[cursor];
+            cursor += 1;
+            if !deblocking_filter_disabled {
+                for _ in 0..2 {
+                    read_ue(&bits, &mut cursor);
+                }
+            }
+        }
+    }
+    assert!(!bits[cursor]);
+    let mut inserted = vec![true; if parameter == 1 { 2 } else { 1 }];
+    let signed_code = |value: i32| {
+        if value > 0 {
+            value as u32 * 2 - 1
+        } else {
+            value.unsigned_abs() * 2
+        }
+    };
+    for size in 0..4 {
+        for matrix in (0..6).step_by(if size == 3 { 3 } else { 1 }) {
+            inserted.push(size != 3);
+            if size == 3 {
+                write_ue(&mut inserted, if matrix == 0 { 0 } else { reference });
+            } else {
+                if size > 1 {
+                    write_ue(&mut inserted, signed_code(dc));
+                }
+                for _ in 0..if size == 0 { 16 } else { 64 } {
+                    write_ue(&mut inserted, signed_code(delta));
+                }
+            }
+        }
+    }
+    bits.splice(cursor..cursor + 1, inserted);
+    nal_from_bits(&nals[parameter][..2], bits)
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn public_decode_rejects_malformed_scaling_lists_in_sps_and_pps() {
+    for parameter in [1, 2] {
+        for (dc, delta, reference, message) in [
+            (8, i32::MAX, 0, "scaling list coefficient delta"),
+            (8, -i32::MAX, 0, "scaling list coefficient delta"),
+            (8, 128, 0, "scaling list coefficient delta"),
+            (8, -129, 0, "scaling list coefficient delta"),
+            (i32::MAX, 0, 0, "scaling list DC coefficient"),
+            (-i32::MAX, 0, 0, "scaling list DC coefficient"),
+            (248, 0, 0, "scaling list DC coefficient"),
+            (-8, 0, 0, "scaling list DC coefficient"),
+            (8, 0, 2, "scaling list matrix reference"),
+            (8, 0, u32::MAX - 1, "scaling list matrix reference"),
+        ] {
+            let mut nals = nal_sets();
+            nals[parameter] = scaling_list_parameter_set(parameter, dc, delta, reference);
+            let bytes = fixture(&[configuration_with_pps(&nals[1], &nals[2])], &nals[3], &[]);
+            assert!(matches!(
+                decode_bounded(BoundedInput::Bytes(&bytes), Default::default()),
+                Err(BoundedDecodeError::Decode(error))
+                    if error == format!("invalid bitstream: {message}")
+            ));
+        }
+    }
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn public_decode_accepts_scaling_list_boundaries_like_normal_decode() {
+    for parameter in [1, 2] {
+        for (dc, delta, reference) in [(-7, -128, 0), (247, 127, 1), (8, 0, 1)] {
+            let mut nals = nal_sets();
+            nals[parameter] = scaling_list_parameter_set(parameter, dc, delta, reference);
+            let bytes = fixture(&[configuration_with_pps(&nals[1], &nals[2])], &nals[3], &[]);
+            let normal = crate::decode_bytes_to_rgb8(&bytes).unwrap();
+            let bounded = decode_bounded(BoundedInput::Bytes(&bytes), Default::default()).unwrap();
+            assert_eq!(
+                (bounded.image.width, bounded.image.height),
+                (normal.width, normal.height)
+            );
+            assert_eq!(bounded.image.pixels, normal.pixels);
+        }
+    }
 }
 
 #[test]
@@ -342,6 +482,35 @@ fn rejects_required_unknown_properties_and_auxiliary_primaries() {
         assert!(matches!(
             grid::Grid::preflight(&index, &mut source, &budget),
             Err(BoundedDecodeError::Unsupported(_))
+        ));
+    }
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn public_decode_ignores_known_semantic_mattes_and_rejects_unknown_auxiliaries() {
+    let bytes = include_bytes!("testdata/apple-semantic-mattes.heic");
+    let normal = crate::decode_bytes_to_rgb8(bytes).unwrap();
+    let bounded = decode_bounded(BoundedInput::Bytes(bytes), Default::default()).unwrap();
+    assert_eq!((normal.width, normal.height), (1024, 1024));
+    assert_eq!((bounded.image.width, bounded.image.height), (1024, 1024));
+    assert_eq!(bounded.image.pixels, normal.pixels);
+
+    let hair = b"urn:com:apple:photo:2019:aux:semantichairmatte";
+    let offset = bytes.windows(hair.len()).position(|b| b == hair).unwrap();
+    for (replacement, expected) in [
+        (
+            b"urn:unknown:required".as_slice(),
+            "required auxiliary type",
+        ),
+        (b"urn:mpeg:hevc:2015:auxid:1".as_slice(), "alpha auxiliary"),
+    ] {
+        let mut changed = bytes.to_vec();
+        changed[offset..offset + hair.len()].fill(0);
+        changed[offset..offset + replacement.len()].copy_from_slice(replacement);
+        assert!(matches!(
+            decode_bounded(BoundedInput::Bytes(&changed), Default::default()),
+            Err(BoundedDecodeError::Unsupported(message)) if message == expected
         ));
     }
 }

@@ -551,7 +551,7 @@ fn parse_sps_impl(data: &[u8], bounded: bool) -> Result<Sps> {
     let scaling_list = if scaling_list_enabled_flag {
         let scaling_list_data_present = reader.read_bit()? != 0;
         if scaling_list_data_present {
-            Some(parse_scaling_list_data(&mut reader)?)
+            Some(parse_scaling_list_data(&mut reader, bounded)?)
         } else {
             // Use H.265 default scaling matrices
             Some(ScalingListData::new_default())
@@ -849,7 +849,7 @@ fn parse_pps_impl(data: &[u8], bounded: bool) -> Result<Pps> {
 
     let pps_scaling_list_data_present_flag = reader.read_bit()? != 0;
     let pps_scaling_list = if pps_scaling_list_data_present_flag {
-        Some(parse_scaling_list_data(&mut reader)?)
+        Some(parse_scaling_list_data(&mut reader, bounded)?)
     } else {
         None
     };
@@ -1004,7 +1004,10 @@ fn parse_profile_tier_level(
     Ok(ptl)
 }
 
-fn parse_scaling_list_data(reader: &mut BitstreamReader<'_>) -> Result<ScalingListData> {
+fn parse_scaling_list_data(
+    reader: &mut BitstreamReader<'_>,
+    bounded: bool,
+) -> Result<ScalingListData> {
     let mut data = ScalingListData::new_default();
 
     for size_id in 0..4usize {
@@ -1015,6 +1018,9 @@ fn parse_scaling_list_data(reader: &mut BitstreamReader<'_>) -> Result<ScalingLi
             if !pred_mode_flag {
                 // Copy from a reference matrix
                 let pred_matrix_id_delta = reader.read_ue()? as usize;
+                if bounded && pred_matrix_id_delta > matrix_id / matrix_step {
+                    return Err(HevcError::InvalidBitstream("scaling list matrix reference"));
+                }
                 if pred_matrix_id_delta == 0 {
                     // Use default scaling list (already initialized)
                 } else if let Some(ref_id) =
@@ -1032,11 +1038,19 @@ fn parse_scaling_list_data(reader: &mut BitstreamReader<'_>) -> Result<ScalingLi
                 let mut next_coef: i32 = 8;
                 if size_id > 1 {
                     let dc_coef_minus8 = reader.read_se()?;
+                    if bounded && !(-7..=247).contains(&dc_coef_minus8) {
+                        return Err(HevcError::InvalidBitstream("scaling list DC coefficient"));
+                    }
                     next_coef = dc_coef_minus8 + 8;
                     data.dc_coef[size_id - 2][matrix_id] = ((next_coef + 256) % 256) as u8;
                 }
                 for i in 0..coef_num {
                     let delta = reader.read_se()?;
+                    if bounded && !(-128..=127).contains(&delta) {
+                        return Err(HevcError::InvalidBitstream(
+                            "scaling list coefficient delta",
+                        ));
+                    }
                     next_coef = (next_coef + delta + 256) % 256;
                     data.lists[size_id][matrix_id][i] = next_coef as u8;
                 }
