@@ -38,6 +38,10 @@ jobs:
 
             - run: cargo test --all-features --locked
 
+            - run: cargo test --locked bounded::
+
+            - run: cargo test --locked --no-default-features bounded::
+
     # Full TESTING.md correctness pass: pixel-for-pixel and ICC-profile
     # comparison against a pinned heif-dec validator over the libheif corpus,
     # the ente HEIC fixtures, and the generated HEVC stress corpus.

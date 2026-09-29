@@ -54,12 +54,15 @@ pub struct SaoMap {
 }
 
 impl SaoMap {
-    pub fn new(width_ctbs: u32, height_ctbs: u32) -> Self {
-        Self {
-            data: vec![SaoInfo::default(); (width_ctbs * height_ctbs) as usize],
+    pub fn new(width_ctbs: u32, height_ctbs: u32) -> super::Result<Self> {
+        Ok(Self {
+            data: super::allocation::filled(
+                SaoInfo::default(),
+                (width_ctbs * height_ctbs) as usize,
+            )?,
             width_ctbs,
             height_ctbs,
-        }
+        })
     }
 
     #[inline]
@@ -86,7 +89,7 @@ const EO_OFFSETS: [(i32, i32, i32, i32); 4] = [
 ];
 
 /// Apply SAO filter to the entire frame
-pub fn apply_sao(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32) {
+pub fn apply_sao(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32) -> super::Result<()> {
     let width = frame.width;
     let height = frame.height;
     let bit_depth = frame.bit_depth;
@@ -112,17 +115,17 @@ pub fn apply_sao(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32) {
     }
 
     let orig_y = if need_y_clone {
-        frame.y_plane.clone()
+        super::allocation::copy(&frame.y_plane)?
     } else {
         Vec::new()
     };
     let orig_cb = if need_cb_clone {
-        frame.cb_plane.clone()
+        super::allocation::copy(&frame.cb_plane)?
     } else {
         Vec::new()
     };
     let orig_cr = if need_cr_clone {
-        frame.cr_plane.clone()
+        super::allocation::copy(&frame.cr_plane)?
     } else {
         Vec::new()
     };
@@ -140,7 +143,7 @@ pub fn apply_sao(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32) {
     // Snapshot the bypass flags so lossless CUs can be exempted while the
     // sample planes are mutably borrowed. Empty when no CU uses bypass.
     let bypass_flags: Vec<u8> = if frame.has_bypass_blocks() {
-        frame.deblock_flags.clone()
+        super::allocation::copy(&frame.deblock_flags)?
     } else {
         Vec::new()
     };
@@ -288,6 +291,7 @@ pub fn apply_sao(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32) {
             }
         }
     }
+    Ok(())
 }
 
 /// Apply SAO edge offset to a single pixel with bounds checking

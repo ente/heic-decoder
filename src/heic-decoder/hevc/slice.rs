@@ -240,6 +240,23 @@ impl SliceHeader {
     /// Parse slice segment header from NAL unit
     /// Returns both the header and the byte offset where slice data begins
     pub fn parse(nal: &NalUnit<'_>, sps: &Sps, pps: &Pps) -> Result<SliceParseResult> {
+        Self::parse_impl(nal, sps, pps, false)
+    }
+
+    pub(crate) fn parse_bounded(
+        nal: &NalUnit<'_>,
+        sps: &Sps,
+        pps: &Pps,
+    ) -> Result<SliceParseResult> {
+        Self::parse_impl(nal, sps, pps, true)
+    }
+
+    fn parse_impl(
+        nal: &NalUnit<'_>,
+        sps: &Sps,
+        pps: &Pps,
+        bounded: bool,
+    ) -> Result<SliceParseResult> {
         let mut reader = BitstreamReader::new(&nal.payload);
 
         let first_slice_segment_in_pic_flag = reader.read_bit()? != 0;
@@ -251,7 +268,7 @@ impl SliceHeader {
             false
         };
 
-        let pps_id = reader.read_ue()? as u8;
+        let pps_id = super::params::bounded_ue_u8(&mut reader, bounded)?;
         if pps_id != pps.pps_id {
             return Err(HevcError::InvalidBitstream("PPS ID mismatch"));
         }
@@ -294,7 +311,7 @@ impl SliceHeader {
             reader.read_bit()?;
         }
 
-        let slice_type_val = reader.read_ue()? as u8;
+        let slice_type_val = super::params::bounded_ue_u8(&mut reader, bounded)?;
         let slice_type = SliceType::from_u8(slice_type_val)
             .ok_or(HevcError::InvalidBitstream("invalid slice type"))?;
 
@@ -345,13 +362,13 @@ impl SliceHeader {
         }
 
         // slice_qp_delta
-        let slice_qp_delta = reader.read_se()? as i8;
+        let slice_qp_delta = super::params::bounded_se_i8(&mut reader, bounded)?;
 
         // Chroma QP offsets
         let (slice_cb_qp_offset, slice_cr_qp_offset) =
             if pps.pps_slice_chroma_qp_offsets_present_flag {
-                let cb = reader.read_se()? as i8;
-                let cr = reader.read_se()? as i8;
+                let cb = super::params::bounded_se_i8(&mut reader, bounded)?;
+                let cr = super::params::bounded_se_i8(&mut reader, bounded)?;
                 (cb, cr)
             } else {
                 (0, 0)
@@ -371,8 +388,8 @@ impl SliceHeader {
             if deblocking_filter_override_flag {
                 let disabled = reader.read_bit()? != 0;
                 if !disabled {
-                    let beta = reader.read_se()? as i8;
-                    let tc = reader.read_se()? as i8;
+                    let beta = super::params::bounded_se_i8(&mut reader, bounded)?;
+                    let tc = super::params::bounded_se_i8(&mut reader, bounded)?;
                     (disabled, beta, tc)
                 } else {
                     (disabled, 0, 0)
@@ -408,7 +425,10 @@ impl SliceHeader {
                         "num_entry_point_offsets out of range",
                     ));
                 }
-                let mut offsets = Vec::with_capacity(n as usize);
+                let mut offsets = Vec::new();
+                offsets
+                    .try_reserve_exact(n as usize)
+                    .map_err(|_| HevcError::DecodingError("allocation failed"))?;
                 if n > 0 {
                     let offset_len_minus1 = reader.read_ue()?;
                     if offset_len_minus1 > 31 {

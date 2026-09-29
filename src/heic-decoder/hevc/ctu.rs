@@ -246,7 +246,7 @@ impl<'a> SliceContext<'a> {
         let ct_depth_map_stride = sps.pic_width_in_luma_samples.div_ceil(min_cb_size);
         let ct_depth_map_height = sps.pic_height_in_luma_samples.div_ceil(min_cb_size);
         let ct_map_size = (ct_depth_map_stride * ct_depth_map_height) as usize;
-        let ct_depth_map = vec![0xFF; ct_map_size];
+        let ct_depth_map = super::allocation::filled(0xFF, ct_map_size)?;
 
         // Intra mode map at min_pu_size granularity (= min_cb_size / 2)
         // This supports NxN partition PU-level resolution
@@ -254,14 +254,16 @@ impl<'a> SliceContext<'a> {
         let intra_mode_map_stride = sps.pic_width_in_luma_samples.div_ceil(min_pu_size);
         let intra_mode_map_height = sps.pic_height_in_luma_samples.div_ceil(min_pu_size);
         let pu_map_size = (intra_mode_map_stride * intra_mode_map_height) as usize;
-        let intra_mode_map = vec![IntraPredMode::Dc.as_u8(); pu_map_size];
-        let intra_chroma_mode_map = vec![IntraPredMode::Dc.as_u8(); pu_map_size];
+        let intra_mode_map = super::allocation::filled(IntraPredMode::Dc.as_u8(), pu_map_size)?;
+        let intra_chroma_mode_map =
+            super::allocation::filled(IntraPredMode::Dc.as_u8(), pu_map_size)?;
 
         // QP map at min_tb_size granularity
         let min_tb_size = 1u32 << sps.log2_min_tb_size();
         let qp_map_stride = sps.pic_width_in_luma_samples.div_ceil(min_tb_size);
         let qp_map_height = sps.pic_height_in_luma_samples.div_ceil(min_tb_size);
-        let qp_map = vec![slice_qp as i8; (qp_map_stride * qp_map_height) as usize];
+        let qp_map =
+            super::allocation::filled(slice_qp as i8, (qp_map_stride * qp_map_height) as usize)?;
 
         Ok(Self {
             sps,
@@ -293,7 +295,7 @@ impl<'a> SliceContext<'a> {
             last_qpy_in_prev_qg: slice_qp,
             current_qg_x: -1,
             current_qg_y: -1,
-            sao_map: SaoMap::new(sps.pic_width_in_ctbs(), sps.pic_height_in_ctbs()),
+            sao_map: SaoMap::new(sps.pic_width_in_ctbs(), sps.pic_height_in_ctbs())?,
             residual_buf: [0i16; 1024],
             coeff_buf: [0i16; 1024],
             touched_coeffs: [0u16; 1024],

@@ -317,6 +317,33 @@ pub fn parse_single_nal(data: &[u8]) -> Result<NalUnit<'_>> {
     parse_nal_header(data)
 }
 
+pub(crate) fn parse_single_nal_bounded(data: &[u8]) -> Result<NalUnit<'_>> {
+    let mut nal = parse_nal_header(
+        data.get(..2)
+            .ok_or(HevcError::InvalidNalUnit("too short"))?,
+    )?;
+    let data_payload = &data[2..];
+    let count = data_payload
+        .windows(3)
+        .filter(|window| *window == [0, 0, 3])
+        .count();
+    nal.payload
+        .try_reserve_exact(data_payload.len())
+        .map_err(|_| HevcError::DecodingError("allocation failed"))?;
+    nal.skipped_byte_positions
+        .try_reserve_exact(count)
+        .map_err(|_| HevcError::DecodingError("allocation failed"))?;
+    for (i, &byte) in data_payload.iter().enumerate() {
+        if i >= 2 && byte == 3 && data_payload[i - 1] == 0 && data_payload[i - 2] == 0 {
+            nal.skipped_byte_positions.push(i as u32);
+        } else {
+            nal.payload.push(byte);
+        }
+    }
+    nal.raw_data = data;
+    Ok(nal)
+}
+
 /// Parse NAL unit header and remove emulation prevention bytes
 fn parse_nal_header(raw_data: &[u8]) -> Result<NalUnit<'_>> {
     if raw_data.len() < 2 {
