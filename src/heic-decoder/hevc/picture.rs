@@ -72,6 +72,16 @@ impl DecodedFrame {
     /// # Panics
     /// Panics if width * height overflows u32.
     pub(crate) fn with_params(width: u32, height: u32, bit_depth: u8, chroma_format: u8) -> Self {
+        Self::try_with_params(width, height, bit_depth, chroma_format)
+            .expect("frame allocation failed")
+    }
+
+    pub(crate) fn try_with_params(
+        width: u32,
+        height: u32,
+        bit_depth: u8,
+        chroma_format: u8,
+    ) -> super::Result<Self> {
         let luma_size = width
             .checked_mul(height)
             .expect("frame dimensions overflow") as usize;
@@ -90,26 +100,26 @@ impl DecodedFrame {
         let deblock_height = height.div_ceil(4);
         let deblock_size = (deblock_stride * deblock_height) as usize;
 
-        Self {
+        Ok(Self {
             width,
             height,
-            y_plane: vec![UNINIT_SAMPLE; luma_size],
-            cb_plane: vec![UNINIT_SAMPLE; chroma_size],
-            cr_plane: vec![UNINIT_SAMPLE; chroma_size],
+            y_plane: super::allocation::filled(UNINIT_SAMPLE, luma_size)?,
+            cb_plane: super::allocation::filled(UNINIT_SAMPLE, chroma_size)?,
+            cr_plane: super::allocation::filled(UNINIT_SAMPLE, chroma_size)?,
             bit_depth,
             chroma_format,
             crop_left: 0,
             crop_right: 0,
             crop_top: 0,
             crop_bottom: 0,
-            deblock_flags: vec![0; deblock_size],
+            deblock_flags: super::allocation::filled(0, deblock_size)?,
             deblock_stride,
-            qp_map: vec![0; deblock_size],
+            qp_map: super::allocation::filled(0, deblock_size)?,
             alpha_plane: None,
             full_range: false,
             matrix_coeffs: 2,
             colour_primaries: 2,
-        }
+        })
     }
 
     /// Mark a vertical TU/CU boundary at luma position (x, y) with given size

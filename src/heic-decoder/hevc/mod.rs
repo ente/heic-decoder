@@ -3,7 +3,9 @@
 //! This module implements the HEVC (High Efficiency Video Coding) decoder
 //! for decoding HEIC still images.
 
+mod allocation;
 pub(crate) mod bitstream;
+pub(crate) mod bounded;
 mod cabac;
 pub(crate) mod color_convert;
 mod ctu;
@@ -217,7 +219,7 @@ fn decode_slice(
 
     // 6. Apply SAO (Sample Adaptive Offset)
     if slice_header.slice_sao_luma_flag || slice_header.slice_sao_chroma_flag {
-        sao::apply_sao(frame, &ctx.sao_map, sps.ctb_size());
+        sao::apply_sao(frame, &ctx.sao_map, sps.ctb_size())?;
     }
 
     Ok(())

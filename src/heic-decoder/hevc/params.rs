@@ -104,6 +104,7 @@ pub struct Sps {
     pub matrix_coeffs: u8,
     /// Colour primaries (from VUI). 2=unspecified
     pub colour_primaries: u8,
+    pub transfer_characteristics: u8,
     /// First enabled SPS range-extension coding tool that the decoder does
     /// not implement (None when the stream uses none). Checked at decode
     /// time so metadata-only parsing stays capability-agnostic.
@@ -479,6 +480,14 @@ pub fn parse_vps(data: &[u8]) -> Result<Vps> {
 
 /// Parse Sequence Parameter Set
 pub fn parse_sps(data: &[u8]) -> Result<Sps> {
+    parse_sps_impl(data, false)
+}
+
+pub(crate) fn parse_sps_bounded(data: &[u8]) -> Result<Sps> {
+    parse_sps_impl(data, true)
+}
+
+fn parse_sps_impl(data: &[u8], bounded: bool) -> Result<Sps> {
     let mut reader = BitstreamReader::new(data);
 
     let vps_id = reader.read_bits(4)? as u8;
@@ -487,8 +496,8 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
 
     let ptl = parse_profile_tier_level(&mut reader, true, max_sub_layers_minus1)?;
 
-    let sps_id = reader.read_ue()? as u8;
-    let chroma_format_idc = reader.read_ue()? as u8;
+    let sps_id = bounded_ue_u8(&mut reader, bounded)?;
+    let chroma_format_idc = bounded_ue_u8(&mut reader, bounded)?;
 
     let separate_colour_plane_flag = if chroma_format_idc == 3 {
         reader.read_bit()? != 0
@@ -510,9 +519,12 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
         (0, 0, 0, 0)
     };
 
-    let bit_depth_luma_minus8 = reader.read_ue()? as u8;
-    let bit_depth_chroma_minus8 = reader.read_ue()? as u8;
-    let log2_max_pic_order_cnt_lsb_minus4 = reader.read_ue()? as u8;
+    let bit_depth_luma_minus8 = bounded_ue_u8(&mut reader, bounded)?;
+    let bit_depth_chroma_minus8 = bounded_ue_u8(&mut reader, bounded)?;
+    let log2_max_pic_order_cnt_lsb_minus4 = bounded_ue_u8(&mut reader, bounded)?;
+    if bounded && log2_max_pic_order_cnt_lsb_minus4 > 12 {
+        return Err(HevcError::Unsupported("bounded POC width"));
+    }
 
     let sub_layer_ordering_info_present_flag = reader.read_bit()? != 0;
 
@@ -528,18 +540,18 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
         let _max_latency_increase_plus1 = reader.read_ue()?;
     }
 
-    let log2_min_luma_coding_block_size_minus3 = reader.read_ue()? as u8;
-    let log2_diff_max_min_luma_coding_block_size = reader.read_ue()? as u8;
-    let log2_min_luma_transform_block_size_minus2 = reader.read_ue()? as u8;
-    let log2_diff_max_min_luma_transform_block_size = reader.read_ue()? as u8;
-    let max_transform_hierarchy_depth_inter = reader.read_ue()? as u8;
-    let max_transform_hierarchy_depth_intra = reader.read_ue()? as u8;
+    let log2_min_luma_coding_block_size_minus3 = bounded_ue_u8(&mut reader, bounded)?;
+    let log2_diff_max_min_luma_coding_block_size = bounded_ue_u8(&mut reader, bounded)?;
+    let log2_min_luma_transform_block_size_minus2 = bounded_ue_u8(&mut reader, bounded)?;
+    let log2_diff_max_min_luma_transform_block_size = bounded_ue_u8(&mut reader, bounded)?;
+    let max_transform_hierarchy_depth_inter = bounded_ue_u8(&mut reader, bounded)?;
+    let max_transform_hierarchy_depth_intra = bounded_ue_u8(&mut reader, bounded)?;
 
     let scaling_list_enabled_flag = reader.read_bit()? != 0;
     let scaling_list = if scaling_list_enabled_flag {
         let scaling_list_data_present = reader.read_bit()? != 0;
         if scaling_list_data_present {
-            Some(parse_scaling_list_data(&mut reader)?)
+            Some(parse_scaling_list_data(&mut reader, bounded)?)
         } else {
             // Use H.265 default scaling matrices
             Some(ScalingListData::new_default())
@@ -555,8 +567,8 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
     let pcm_params = if pcm_enabled_flag {
         let pcm_sample_bit_depth_luma_minus1 = reader.read_bits(4)? as u8;
         let pcm_sample_bit_depth_chroma_minus1 = reader.read_bits(4)? as u8;
-        let log2_min_pcm_luma_coding_block_size_minus3 = reader.read_ue()? as u8;
-        let log2_diff_max_min_pcm_luma_coding_block_size = reader.read_ue()? as u8;
+        let log2_min_pcm_luma_coding_block_size_minus3 = bounded_ue_u8(&mut reader, bounded)?;
+        let log2_diff_max_min_pcm_luma_coding_block_size = bounded_ue_u8(&mut reader, bounded)?;
         let pcm_loop_filter_disabled_flag = reader.read_bit()? != 0;
         Some(PcmParams {
             pcm_sample_bit_depth_luma_minus1,
@@ -569,10 +581,13 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
         None
     };
 
-    let num_short_term_ref_pic_sets = reader.read_ue()? as u8;
+    let num_short_term_ref_pic_sets = bounded_ue_u8(&mut reader, bounded)?;
     // Skip short term ref pic sets (not needed for still images), tracking
     // NumDeltaPocs so inter-RPS-predicted sets consume the right bit count.
-    let mut num_delta_pocs: Vec<u32> = Vec::with_capacity(num_short_term_ref_pic_sets as usize);
+    let mut num_delta_pocs: Vec<u32> = Vec::new();
+    num_delta_pocs
+        .try_reserve_exact(num_short_term_ref_pic_sets as usize)
+        .map_err(|_| HevcError::DecodingError("allocation failed"))?;
     for i in 0..num_short_term_ref_pic_sets {
         let n = skip_short_term_ref_pic_set(&mut reader, i, &num_delta_pocs)?;
         num_delta_pocs.push(n);
@@ -602,6 +617,7 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
     // Parse VUI color parameters if present
     let mut video_full_range_flag = false; // default: limited range
     let mut matrix_coeffs = 2u8; // default: unspecified
+    let mut transfer_characteristics = 2u8;
     let mut colour_primaries = 2u8; // default: unspecified
     if vui_parameters_present_flag {
         let aspect_ratio_info_present = reader.read_bit()? != 0;
@@ -624,7 +640,7 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
             let colour_description_present = reader.read_bit()? != 0;
             if colour_description_present {
                 colour_primaries = reader.read_bits(8)? as u8;
-                let _transfer_characteristics = reader.read_bits(8)?;
+                transfer_characteristics = reader.read_bits(8)? as u8;
                 matrix_coeffs = reader.read_bits(8)? as u8;
             }
         }
@@ -636,6 +652,9 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
     // SPS extensions (H.265 7.3.2.2.1)
     let mut unsupported_rext_tool: Option<&'static str> = None;
     let sps_extension_present_flag = reader.read_bit()? != 0;
+    if bounded && sps_extension_present_flag {
+        return Err(HevcError::Unsupported("bounded SPS extensions"));
+    }
     if sps_extension_present_flag {
         let sps_range_extension_flag = reader.read_bit()? != 0;
         let _sps_multilayer_extension_flag = reader.read_bit()? != 0;
@@ -710,36 +729,45 @@ pub fn parse_sps(data: &[u8]) -> Result<Sps> {
         video_full_range_flag,
         matrix_coeffs,
         colour_primaries,
+        transfer_characteristics,
         unsupported_rext_tool,
     })
 }
 
 /// Parse Picture Parameter Set
 pub fn parse_pps(data: &[u8]) -> Result<Pps> {
+    parse_pps_impl(data, false)
+}
+
+pub(crate) fn parse_pps_bounded(data: &[u8]) -> Result<Pps> {
+    parse_pps_impl(data, true)
+}
+
+fn parse_pps_impl(data: &[u8], bounded: bool) -> Result<Pps> {
     let mut reader = BitstreamReader::new(data);
 
-    let pps_id = reader.read_ue()? as u8;
-    let sps_id = reader.read_ue()? as u8;
+    let pps_id = bounded_ue_u8(&mut reader, bounded)?;
+    let sps_id = bounded_ue_u8(&mut reader, bounded)?;
     let dependent_slice_segments_enabled_flag = reader.read_bit()? != 0;
     let output_flag_present_flag = reader.read_bit()? != 0;
     let num_extra_slice_header_bits = reader.read_bits(3)? as u8;
     let sign_data_hiding_enabled_flag = reader.read_bit()? != 0;
     let cabac_init_present_flag = reader.read_bit()? != 0;
-    let num_ref_idx_l0_default_active_minus1 = reader.read_ue()? as u8;
-    let num_ref_idx_l1_default_active_minus1 = reader.read_ue()? as u8;
-    let init_qp_minus26 = reader.read_se()? as i8;
+    let num_ref_idx_l0_default_active_minus1 = bounded_ue_u8(&mut reader, bounded)?;
+    let num_ref_idx_l1_default_active_minus1 = bounded_ue_u8(&mut reader, bounded)?;
+    let init_qp_minus26 = bounded_se_i8(&mut reader, bounded)?;
     let constrained_intra_pred_flag = reader.read_bit()? != 0;
     let transform_skip_enabled_flag = reader.read_bit()? != 0;
 
     let cu_qp_delta_enabled_flag = reader.read_bit()? != 0;
     let diff_cu_qp_delta_depth = if cu_qp_delta_enabled_flag {
-        reader.read_ue()? as u8
+        bounded_ue_u8(&mut reader, bounded)?
     } else {
         0
     };
 
-    let pps_cb_qp_offset = reader.read_se()? as i8;
-    let pps_cr_qp_offset = reader.read_se()? as i8;
+    let pps_cb_qp_offset = bounded_se_i8(&mut reader, bounded)?;
+    let pps_cr_qp_offset = bounded_se_i8(&mut reader, bounded)?;
     let pps_slice_chroma_qp_offsets_present_flag = reader.read_bit()? != 0;
     let weighted_pred_flag = reader.read_bit()? != 0;
     let weighted_bipred_flag = reader.read_bit()? != 0;
@@ -748,8 +776,16 @@ pub fn parse_pps(data: &[u8]) -> Result<Pps> {
     let entropy_coding_sync_enabled_flag = reader.read_bit()? != 0;
 
     let tile_info = if tiles_enabled_flag {
-        let num_tile_columns_minus1 = reader.read_ue()? as u16;
-        let num_tile_rows_minus1 = reader.read_ue()? as u16;
+        let columns = reader.read_ue()?;
+        if bounded && columns != 0 {
+            return Err(HevcError::Unsupported("bounded HEVC tiles"));
+        }
+        let num_tile_columns_minus1 = columns as u16;
+        let rows = reader.read_ue()?;
+        if bounded && rows != 0 {
+            return Err(HevcError::Unsupported("bounded HEVC tiles"));
+        }
+        let num_tile_rows_minus1 = rows as u16;
         let uniform_spacing_flag = reader.read_bit()? != 0;
 
         let (column_widths, row_heights) = if !uniform_spacing_flag {
@@ -799,7 +835,10 @@ pub fn parse_pps(data: &[u8]) -> Result<Pps> {
         let override_enabled = reader.read_bit()? != 0;
         let disabled = reader.read_bit()? != 0;
         let (beta, tc) = if !disabled {
-            (reader.read_se()? as i8, reader.read_se()? as i8)
+            (
+                bounded_se_i8(&mut reader, bounded)?,
+                bounded_se_i8(&mut reader, bounded)?,
+            )
         } else {
             (0, 0)
         };
@@ -810,13 +849,13 @@ pub fn parse_pps(data: &[u8]) -> Result<Pps> {
 
     let pps_scaling_list_data_present_flag = reader.read_bit()? != 0;
     let pps_scaling_list = if pps_scaling_list_data_present_flag {
-        Some(parse_scaling_list_data(&mut reader)?)
+        Some(parse_scaling_list_data(&mut reader, bounded)?)
     } else {
         None
     };
 
     let lists_modification_present_flag = reader.read_bit()? != 0;
-    let log2_parallel_merge_level_minus2 = reader.read_ue()? as u8;
+    let log2_parallel_merge_level_minus2 = bounded_ue_u8(&mut reader, bounded)?;
     let slice_segment_header_extension_present_flag = reader.read_bit()? != 0;
 
     // PPS extensions (H.265 7.3.2.3.1). The range extension carries fields
@@ -825,6 +864,9 @@ pub fn parse_pps(data: &[u8]) -> Result<Pps> {
     let mut log2_sao_offset_scale_luma = 0u8;
     let mut log2_sao_offset_scale_chroma = 0u8;
     let pps_extension_present_flag = reader.read_bit().unwrap_or(0) != 0;
+    if bounded && pps_extension_present_flag {
+        return Err(HevcError::Unsupported("bounded PPS extensions"));
+    }
     if pps_extension_present_flag {
         let pps_range_extension_flag = reader.read_bit()? != 0;
         let _pps_multilayer_extension_flag = reader.read_bit()? != 0;
@@ -849,8 +891,8 @@ pub fn parse_pps(data: &[u8]) -> Result<Pps> {
             if chroma_qp_offset_list_enabled_flag {
                 return Err(HevcError::Unsupported("chroma QP offset lists"));
             }
-            log2_sao_offset_scale_luma = reader.read_ue()? as u8;
-            log2_sao_offset_scale_chroma = reader.read_ue()? as u8;
+            log2_sao_offset_scale_luma = bounded_ue_u8(&mut reader, bounded)?;
+            log2_sao_offset_scale_chroma = bounded_ue_u8(&mut reader, bounded)?;
             // Spec bound is Max(0, bitDepth-10); the SAO offset storage (i8)
             // holds scaled offsets up to 31<<2, covering 12-bit content.
             if log2_sao_offset_scale_luma > 2 || log2_sao_offset_scale_chroma > 2 {
@@ -962,7 +1004,10 @@ fn parse_profile_tier_level(
     Ok(ptl)
 }
 
-fn parse_scaling_list_data(reader: &mut BitstreamReader<'_>) -> Result<ScalingListData> {
+fn parse_scaling_list_data(
+    reader: &mut BitstreamReader<'_>,
+    bounded: bool,
+) -> Result<ScalingListData> {
     let mut data = ScalingListData::new_default();
 
     for size_id in 0..4usize {
@@ -973,6 +1018,9 @@ fn parse_scaling_list_data(reader: &mut BitstreamReader<'_>) -> Result<ScalingLi
             if !pred_mode_flag {
                 // Copy from a reference matrix
                 let pred_matrix_id_delta = reader.read_ue()? as usize;
+                if bounded && pred_matrix_id_delta > matrix_id / matrix_step {
+                    return Err(HevcError::InvalidBitstream("scaling list matrix reference"));
+                }
                 if pred_matrix_id_delta == 0 {
                     // Use default scaling list (already initialized)
                 } else if let Some(ref_id) =
@@ -990,11 +1038,19 @@ fn parse_scaling_list_data(reader: &mut BitstreamReader<'_>) -> Result<ScalingLi
                 let mut next_coef: i32 = 8;
                 if size_id > 1 {
                     let dc_coef_minus8 = reader.read_se()?;
+                    if bounded && !(-7..=247).contains(&dc_coef_minus8) {
+                        return Err(HevcError::InvalidBitstream("scaling list DC coefficient"));
+                    }
                     next_coef = dc_coef_minus8 + 8;
                     data.dc_coef[size_id - 2][matrix_id] = ((next_coef + 256) % 256) as u8;
                 }
                 for i in 0..coef_num {
                     let delta = reader.read_se()?;
+                    if bounded && !(-128..=127).contains(&delta) {
+                        return Err(HevcError::InvalidBitstream(
+                            "scaling list coefficient delta",
+                        ));
+                    }
                     next_coef = (next_coef + delta + 256) % 256;
                     data.lists[size_id][matrix_id][i] = next_coef as u8;
                 }
@@ -1172,4 +1228,20 @@ fn skip_short_term_ref_pic_set(
         }
         Ok(num_negative_pics + num_positive_pics)
     }
+}
+
+pub(super) fn bounded_ue_u8(reader: &mut BitstreamReader<'_>, bounded: bool) -> Result<u8> {
+    let value = reader.read_ue()?;
+    if bounded && value > u8::MAX as u32 {
+        return Err(HevcError::InvalidBitstream("parameter narrowing overflow"));
+    }
+    Ok(value as u8)
+}
+
+pub(super) fn bounded_se_i8(reader: &mut BitstreamReader<'_>, bounded: bool) -> Result<i8> {
+    let value = reader.read_se()?;
+    if bounded && i8::try_from(value).is_err() {
+        return Err(HevcError::InvalidBitstream("parameter narrowing overflow"));
+    }
+    Ok(value as i8)
 }

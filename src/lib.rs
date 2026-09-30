@@ -46,8 +46,12 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 
+mod bounded;
 #[path = "heic-decoder/mod.rs"]
 mod heic_decoder;
+pub use bounded::{
+    BoundedDecodeError, BoundedDecodeOptions, BoundedInput, BoundedRgbImage, decode_bounded,
+};
 #[cfg(feature = "image-integration")]
 pub mod image_integration;
 pub mod isobmff;

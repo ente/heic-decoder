@@ -5,3 +5,5 @@ mod error;
 pub mod hevc;
 
 pub use hevc::DecodedFrame;
+
+pub(crate) use error::HevcError;
