@@ -11,6 +11,7 @@ pub(crate) mod color_convert;
 mod ctu;
 mod deblock;
 pub(crate) mod debug;
+pub(crate) mod incremental;
 mod intra;
 pub(crate) mod params;
 mod picture;

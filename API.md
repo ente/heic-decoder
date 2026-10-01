@@ -356,3 +356,40 @@ fn decode(path: &Path) -> Result<(), heic_decoder::DecodeError> {
     Ok(())
 }
 ```
+
+## Experimental incremental bounded decoding
+
+Enable the `incremental-experiment` Cargo feature to use
+`decode_incremental_experiment(BoundedInput, BoundedDecodeOptions)`. It returns
+`(BoundedRgbImage, [u64; 3])`; the diagnostic counters are reconstructed rows,
+SAO edge components, and SAO band components across all coded items. This
+feature and entry point are experimental. Existing decode functions retain
+their behavior and do not select this path automatically.
+
+The incremental path supports opaque 8-bit 4:2:0 HEVC still images with one
+IDR slice per coded item, including non-grid images and uniform grids whose
+individual tiles exceed the output cap. WPP, HEVC tiles, multiple slices,
+higher bit depths, alpha, other chroma formats, and unsupported color profiles
+return errors. The output is display-oriented sRGB RGB8, using area averaging
+when reduced, with a maximum side from 1 through 6000. Known depth, semantic
+matte, and gain-map auxiliaries may accompany the SDR base image; this does
+not apply their effects or provide HDR output.
+
+Reconstruction, deblocking, and SAO finish in rolling bands before conversion
+and reduction. Large coded images use a bounded two-thread pipeline. The
+working state grows with coded width and CTU size, while output storage is
+capped by `max_side`; it does not retain a full source raster or use temporary
+files or repeated reconstruction. A caller's borrowed compressed input is
+separate from decoder-owned memory. Admission is conservative and may reject
+budgets smaller than its reserved workspace, including a worker stack.
+Allocator overhead and process RSS are not the same as requested allocation
+payloads. Use Path input when avoiding a caller-owned compressed input buffer
+is also important.
+
+This first subset retains limits of 16384 per coded side, 256 million display
+pixels, bounded metadata, and a 64 KiB slice-header prefix. It supports one
+clean-aperture crop before orientation, with chroma interpolation for odd
+origins on a single coded image or one-tile grid. Odd-origin crops across
+multiple grid items and repeated crops or crops after orientation are
+unsupported. Exif orientation applies when no effective container orientation
+is present. `decoder-tracing` disables bounded decoding.

@@ -67,12 +67,12 @@ impl SaoMap {
 
     #[inline]
     pub fn get(&self, ctb_x: u32, ctb_y: u32) -> &SaoInfo {
-        &self.data[(ctb_y * self.width_ctbs + ctb_x) as usize]
+        &self.data[((ctb_y % self.height_ctbs) * self.width_ctbs + ctb_x) as usize]
     }
 
     #[inline]
     pub fn get_mut(&mut self, ctb_x: u32, ctb_y: u32) -> &mut SaoInfo {
-        &mut self.data[(ctb_y * self.width_ctbs + ctb_x) as usize]
+        &mut self.data[((ctb_y % self.height_ctbs) * self.width_ctbs + ctb_x) as usize]
     }
 }
 
@@ -515,6 +515,251 @@ fn apply_sao_edge(
                     max_val,
                     &offset_table,
                 );
+            }
+        }
+    }
+}
+
+pub(crate) fn write_filtered_rows(
+    frame: &DecodedFrame,
+    map: &SaoMap,
+    ctb_size: u32,
+    start: u32,
+    rows: u32,
+    output: &mut DecodedFrame,
+) {
+    let bypass = frame.has_bypass_blocks();
+    let maximum = (1i32 << frame.bit_depth) - 1;
+    for component in 0..3 {
+        let sub = if component == 0 { 1 } else { 2 };
+        let origin = frame.plane_origin(component);
+        let (source, stride) = frame.plane(component);
+        let (destination, _) = output.plane_mut(component);
+        let width = frame.width / sub;
+        let height = frame.height / sub;
+        let first_y = start / sub;
+        let last_y = (start + rows) / sub;
+        for ctb_x in 0..map.width_ctbs {
+            let first_x = ctb_x * ctb_size / sub;
+            let last_x = ((ctb_x + 1) * ctb_size / sub).min(width);
+            let info = map.get(ctb_x, start / ctb_size);
+            let c = component as usize;
+            let offsets = info.sao_offset_val[c];
+            for y in first_y..last_y {
+                let input = (y - origin) as usize * stride + first_x as usize;
+                let target = (y - first_y) as usize * stride + first_x as usize;
+                let count = (last_x - first_x) as usize;
+                destination[target..target + count].copy_from_slice(&source[input..input + count]);
+            }
+            match info.sao_type_idx[c] {
+                1 => {
+                    let mut table = [0i32; 32];
+                    for (i, &offset) in offsets.iter().enumerate() {
+                        table[(usize::from(info.sao_band_position[c]) + i) & 31] =
+                            i32::from(offset);
+                    }
+                    for y in first_y..last_y {
+                        let input = (y - origin) as usize * stride;
+                        let target = (y - first_y) as usize * stride;
+                        for x in first_x..last_x {
+                            if bypass && frame.is_block_bypass(x * sub, y * sub) {
+                                continue;
+                            }
+                            let sample = i32::from(source[input + x as usize]);
+                            let offset = table[(sample >> (frame.bit_depth - 5)) as usize];
+                            destination[target + x as usize] =
+                                (sample + offset).clamp(0, maximum) as u16;
+                        }
+                    }
+                }
+                2 => {
+                    let (dx0, dy0, dx1, dy1) = EO_OFFSETS[info.sao_eo_class[c] as usize & 3];
+                    let x0 = first_x.max((-dx0).max(-dx1).max(0) as u32);
+                    let x1 = last_x.min(width - dx0.max(dx1).max(0) as u32);
+                    let y0 = first_y.max((-dy0).max(-dy1).max(0) as u32);
+                    let y1 = last_y.min(height - dy0.max(dy1).max(0) as u32);
+                    let table = [
+                        i32::from(offsets[0]),
+                        i32::from(offsets[1]),
+                        0,
+                        -i32::from(offsets[2]),
+                        -i32::from(offsets[3]),
+                    ];
+                    for y in y0..y1 {
+                        let input = (y - origin) as usize * stride;
+                        let target = (y - first_y) as usize * stride;
+                        let a = ((y as i32 + dy0 - origin as i32) as usize * stride) as isize
+                            + dx0 as isize;
+                        let b = ((y as i32 + dy1 - origin as i32) as usize * stride) as isize
+                            + dx1 as isize;
+                        if !bypass {
+                            let first = x0 as usize;
+                            let last = x1 as usize;
+                            edge_row(
+                                &source[input + first..input + last],
+                                &source
+                                    [(a + first as isize) as usize..(a + last as isize) as usize],
+                                &source
+                                    [(b + first as isize) as usize..(b + last as isize) as usize],
+                                &mut destination[target + first..target + last],
+                                offsets,
+                                maximum,
+                            );
+                            continue;
+                        }
+                        for x in x0..x1 {
+                            if bypass && frame.is_block_bypass(x * sub, y * sub) {
+                                continue;
+                            }
+                            let sample = i32::from(source[input + x as usize]);
+                            let left = i32::from(source[(a + x as isize) as usize]);
+                            let right = i32::from(source[(b + x as isize) as usize]);
+                            let category =
+                                (2 + (sample - left).signum() + (sample - right).signum()) as usize;
+                            destination[target + x as usize] =
+                                (sample + table[category]).clamp(0, maximum) as u16;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn edge_row(
+    input: &[u16],
+    a: &[u16],
+    b: &[u16],
+    output: &mut [u16],
+    offsets: [i8; 4],
+    maximum: i32,
+) {
+    #[cfg(target_arch = "aarch64")]
+    let done = {
+        use archmage::SimdToken;
+        archmage::NeonToken::summon()
+            .filter(|_| maximum <= 255)
+            .map_or(0, |token| {
+                edge_row_neon(token, input, a, b, output, offsets, maximum as i16)
+            })
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let done = 0;
+    let table = [
+        i32::from(offsets[0]),
+        i32::from(offsets[1]),
+        0,
+        -i32::from(offsets[2]),
+        -i32::from(offsets[3]),
+    ];
+    for i in done..output.len() {
+        let sample = i32::from(input[i]);
+        let category =
+            2 + (sample - i32::from(a[i])).signum() + (sample - i32::from(b[i])).signum();
+        output[i] = (sample + table[category as usize]).clamp(0, maximum) as u16;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[archmage::arcane]
+fn edge_row_neon(
+    _token: archmage::NeonToken,
+    input: &[u16],
+    a: &[u16],
+    b: &[u16],
+    output: &mut [u16],
+    offsets: [i8; 4],
+    maximum: i16,
+) -> usize {
+    use core::arch::aarch64::*;
+    use safe_unaligned_simd::aarch64::{vld1q_u16, vst1q_u16};
+    let zero = vdupq_n_s16(0);
+    let maximum = vdupq_n_s16(maximum);
+    let values = [
+        vdupq_n_s16(i16::from(offsets[0])),
+        vdupq_n_s16(i16::from(offsets[1])),
+        vdupq_n_s16(-i16::from(offsets[2])),
+        vdupq_n_s16(-i16::from(offsets[3])),
+    ];
+    let mut done = 0;
+    for chunk in output.chunks_exact_mut(8) {
+        let sample = vld1q_u16(input[done..done + 8].try_into().unwrap());
+        let left = vld1q_u16(a[done..done + 8].try_into().unwrap());
+        let right = vld1q_u16(b[done..done + 8].try_into().unwrap());
+        let sign0 = vsubq_u16(vcltq_u16(sample, left), vcgtq_u16(sample, left));
+        let sign1 = vsubq_u16(vcltq_u16(sample, right), vcgtq_u16(sample, right));
+        let category = vreinterpretq_s16_u16(vaddq_u16(sign0, sign1));
+        let mut offset = zero;
+        for (value, index) in values.iter().zip([-2, -1, 1, 2]) {
+            offset = vbslq_s16(vceqq_s16(category, vdupq_n_s16(index)), *value, offset);
+        }
+        let result = vminq_s16(
+            maximum,
+            vmaxq_s16(zero, vaddq_s16(vreinterpretq_s16_u16(sample), offset)),
+        );
+        vst1q_u16(chunk.try_into().unwrap(), vreinterpretq_u16_s16(result));
+        done += 8;
+    }
+    done
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::edge_row;
+
+    #[test]
+    fn edge_rows_match_scalar_categories_clipping_and_tails() {
+        for maximum in [255, 1023] {
+            for length in 0..=67 {
+                let input: Vec<u16> = (0..length)
+                    .map(|i| match i % 7 {
+                        0 => 0,
+                        1 => maximum as u16,
+                        _ => ((i * 71) % (maximum as usize + 1)) as u16,
+                    })
+                    .collect();
+                let a: Vec<u16> = input
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| match i % 3 {
+                        0 => v.saturating_sub(1),
+                        1 => v,
+                        _ => v.saturating_add(1).min(maximum as u16),
+                    })
+                    .collect();
+                let b: Vec<u16> = input
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| match i / 3 % 3 {
+                        0 => v.saturating_sub(2),
+                        1 => v,
+                        _ => v.saturating_add(2).min(maximum as u16),
+                    })
+                    .collect();
+                for offsets in [[0, 0, 0, 0], [1, 2, 3, 4], [7, 6, 5, 4], [-7, 7, -7, 7]] {
+                    let table = [
+                        i32::from(offsets[0]),
+                        i32::from(offsets[1]),
+                        0,
+                        -i32::from(offsets[2]),
+                        -i32::from(offsets[3]),
+                    ];
+                    let expected: Vec<u16> = input
+                        .iter()
+                        .zip(&a)
+                        .zip(&b)
+                        .map(|((&v, &a), &b)| {
+                            let category = 2
+                                + (i32::from(v) - i32::from(a)).signum()
+                                + (i32::from(v) - i32::from(b)).signum();
+                            (i32::from(v) + table[category as usize]).clamp(0, maximum) as u16
+                        })
+                        .collect();
+                    let mut actual = vec![0; length];
+                    edge_row(&input, &a, &b, &mut actual, offsets, maximum);
+                    assert_eq!(actual, expected);
+                }
             }
         }
     }

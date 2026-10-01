@@ -178,6 +178,7 @@ impl ContextModel {
 pub struct CabacDecoder<'a> {
     /// Input data
     data: &'a [u8],
+    stream: Option<StreamInput<'a>>,
     /// Current byte position
     byte_pos: usize,
     /// Range register (9 bits, 256-510)
@@ -190,6 +191,60 @@ pub struct CabacDecoder<'a> {
 
 #[allow(dead_code)]
 impl<'a> CabacDecoder<'a> {
+    pub(crate) fn new_stream(reader: &'a mut dyn std::io::Read) -> Result<Self> {
+        let mut decoder = Self::new(&[0, 0])?;
+        decoder.stream = Some(StreamInput {
+            reader,
+            buffer: super::allocation::filled(0, 16384)?,
+            position: 0,
+            length: 0,
+            failed: false,
+        });
+        decoder.byte_pos = 0;
+        decoder.reinit();
+        decoder.check_input()?;
+        if decoder.byte_pos < 2 {
+            return Err(HevcError::CabacError("data too short"));
+        }
+        Ok(decoder)
+    }
+
+    pub(crate) fn check_input(&self) -> Result<()> {
+        if self.stream.as_ref().is_some_and(|input| input.failed) {
+            Err(HevcError::DecodingError("stream input failed"))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[inline]
+    fn next_byte(&mut self) -> Option<u8> {
+        let byte = if let Some(input) = &mut self.stream {
+            if input.position == input.length {
+                match input.reader.read(&mut input.buffer) {
+                    Ok(length) => {
+                        input.position = 0;
+                        input.length = length;
+                    }
+                    Err(_) => {
+                        input.failed = true;
+                        return None;
+                    }
+                }
+            }
+            if input.position == input.length {
+                return None;
+            }
+            let byte = input.buffer[input.position];
+            input.position += 1;
+            byte
+        } else {
+            *self.data.get(self.byte_pos)?
+        };
+        self.byte_pos += 1;
+        Some(byte)
+    }
+
     /// Get current CABAC state (range, offset) for debugging
     /// Note: returns (range, value >> 7) for compatibility with old debugging
     pub fn get_state(&self) -> (u16, u16) {
@@ -214,6 +269,7 @@ impl<'a> CabacDecoder<'a> {
 
         let mut decoder = Self {
             data,
+            stream: None,
             byte_pos: 0,
             range: 510,
             value: 0,
@@ -222,15 +278,13 @@ impl<'a> CabacDecoder<'a> {
 
         // Initialize value (matching libde265 exactly)
         decoder.bits_needed = -8;
-        if decoder.byte_pos < decoder.data.len() {
-            decoder.value = decoder.data[decoder.byte_pos] as u32;
-            decoder.byte_pos += 1;
+        if let Some(byte) = decoder.next_byte() {
+            decoder.value = u32::from(byte);
         }
         decoder.value <<= 8;
         decoder.bits_needed = 0;
-        if decoder.byte_pos < decoder.data.len() {
-            decoder.value |= decoder.data[decoder.byte_pos] as u32;
-            decoder.byte_pos += 1;
+        if let Some(byte) = decoder.next_byte() {
+            decoder.value |= u32::from(byte);
             decoder.bits_needed = -8;
         }
 
@@ -250,20 +304,20 @@ impl<'a> CabacDecoder<'a> {
         self.bits_needed = -9;
         self.value = 0;
 
-        let remaining = self.data.len() - self.byte_pos;
-        if remaining > 0 {
-            self.value = (self.data[self.byte_pos] as u32) << 8;
-            self.byte_pos += 1;
+        if let Some(byte) = self.next_byte() {
+            self.value = u32::from(byte) << 8;
         }
-        if remaining > 1 {
-            self.value |= self.data[self.byte_pos] as u32;
-            self.byte_pos += 1;
+        if let Some(byte) = self.next_byte() {
+            self.value |= u32::from(byte);
             self.bits_needed = -8;
         }
     }
 
     /// Reinitialize CABAC at an absolute byte offset within this slice data.
     pub fn seek_to(&mut self, byte_pos: usize) -> Result<()> {
+        if self.stream.is_some() {
+            return Err(HevcError::Unsupported("streaming CABAC seek"));
+        }
         if byte_pos > self.data.len() {
             return Err(HevcError::CabacError(
                 "entry point offset beyond slice data",
@@ -314,10 +368,9 @@ impl<'a> CabacDecoder<'a> {
         self.bits_needed += 1;
 
         if self.bits_needed >= 0 {
-            if self.byte_pos < self.data.len() {
+            if let Some(byte) = self.next_byte() {
                 self.bits_needed = -8;
-                self.value |= self.data[self.byte_pos] as u32;
-                self.byte_pos += 1;
+                self.value |= u32::from(byte);
             } else {
                 self.bits_needed = -8;
             }
@@ -389,9 +442,8 @@ impl<'a> CabacDecoder<'a> {
             self.value <<= shift;
             self.bits_needed += shift as i32;
             if self.bits_needed >= 0 {
-                if self.byte_pos < self.data.len() {
-                    self.value |= (self.data[self.byte_pos] as u32) << self.bits_needed;
-                    self.byte_pos += 1;
+                if let Some(byte) = self.next_byte() {
+                    self.value |= u32::from(byte) << self.bits_needed;
                 }
                 self.bits_needed -= 8;
             }
@@ -532,6 +584,14 @@ pub static INIT_VALUES: [u8; context::NUM_CONTEXTS] = [
     154, 154, 154, 154, 154, 154, 154, 154, // RES_SCALE_SIGN_FLAG (2)
     154, 154,
 ];
+
+struct StreamInput<'a> {
+    reader: &'a mut dyn std::io::Read,
+    buffer: alloc::vec::Vec<u8>,
+    position: usize,
+    length: usize,
+    failed: bool,
+}
 
 #[cfg(test)]
 mod tests {

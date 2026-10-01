@@ -558,6 +558,114 @@ fn display_mapping_matches_existing_transform_plan() {
     }
 }
 
+#[cfg(all(feature = "incremental-experiment", not(feature = "decoder-tracing")))]
+#[test]
+fn incremental_accepts_legacy_pixi_without_relaxing_bit_depth_checks() {
+    let nals = nal_sets();
+    for (channels, expected) in [
+        (vec![1, 8], true),
+        (vec![3, 8, 8, 8], true),
+        (vec![1, 10], false),
+        (vec![3, 8, 10, 8], false),
+        (vec![2, 8, 8], false),
+        (vec![0], false),
+        (vec![1, 8, 8], false),
+    ] {
+        let bytes = fixture(
+            &[configuration(&nals[1])],
+            &nals[3],
+            &[full_box(b"pixi", 0, &channels)],
+        );
+        let result = incremental::decode(BoundedInput::Bytes(&bytes), Default::default());
+        assert_eq!(result.is_ok(), expected, "{channels:?}: {result:?}");
+    }
+}
+
+#[cfg(all(feature = "incremental-experiment", not(feature = "decoder-tracing")))]
+#[test]
+fn incremental_rejects_unimplemented_chroma_transform_orders() {
+    let nals = nal_sets();
+    let config = configuration(&nals[1]);
+    let crop = [13u32, 1, 11, 1, 0, 1, 0, 1]
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect::<Vec<_>>();
+    for extras in [
+        vec![box_bytes(b"irot", &[1]), box_bytes(b"clap", &crop)],
+        vec![box_bytes(b"clap", &crop), box_bytes(b"clap", &crop)],
+    ] {
+        let bytes = fixture(std::slice::from_ref(&config), &nals[3], &extras);
+        assert!(matches!(
+            incremental::decode(BoundedInput::Bytes(&bytes), Default::default()),
+            Err(BoundedDecodeError::Unsupported(
+                "repeated crop or crop after orientation"
+            ))
+        ));
+    }
+    let bytes = fixture(
+        &[config.clone(), config],
+        &nals[3],
+        &[box_bytes(b"clap", &crop)],
+    );
+    assert!(matches!(
+        incremental::decode(BoundedInput::Bytes(&bytes), Default::default()),
+        Err(BoundedDecodeError::Unsupported(
+            "odd grid crop chroma interpolation"
+        ))
+    ));
+}
+
+#[cfg(feature = "incremental-experiment")]
+#[test]
+fn shared_reference_validation_preserves_auxiliary_and_exif_rules() {
+    let original = include_bytes!("testdata/apple-semantic-mattes.heic");
+    let hair = b"urn:com:apple:photo:2019:aux:semantichairmatte";
+    let offset = original
+        .windows(hair.len())
+        .position(|b| b == hair)
+        .unwrap();
+    for (replacement, expected) in [
+        (hair.as_slice(), None),
+        (
+            b"urn:unknown:required".as_slice(),
+            Some("required auxiliary type"),
+        ),
+        (
+            b"urn:mpeg:hevc:2015:auxid:1".as_slice(),
+            Some("alpha auxiliary"),
+        ),
+    ] {
+        let mut bytes = original.to_vec();
+        bytes[offset..offset + hair.len()].fill(0);
+        bytes[offset..offset + replacement.len()].copy_from_slice(replacement);
+        let budget = memory::Budget::new(128 * 1024 * 1024);
+        let mut source = container::Source::new(BoundedInput::Bytes(&bytes)).unwrap();
+        let metadata = source.metadata(&budget).unwrap();
+        let index =
+            container::Index::parse_primary(&metadata, source.len(), &budget, true).unwrap();
+        let result = grid::validate_references(&index, &mut source, &[], &budget);
+        match expected {
+            None => assert!(result.is_ok()),
+            Some(expected) => assert!(
+                matches!(result, Err(BoundedDecodeError::Unsupported(message)) if message == expected)
+            ),
+        }
+    }
+    let nals = nal_sets();
+    for orientation in 1..=8 {
+        let bytes = fixture_with_exif(&[configuration(&nals[1])], &nals[3], &[], Some(orientation));
+        let budget = memory::Budget::new(128 * 1024 * 1024);
+        let mut source = container::Source::new(BoundedInput::Bytes(&bytes)).unwrap();
+        let metadata = source.metadata(&budget).unwrap();
+        let index =
+            container::Index::parse_primary(&metadata, source.len(), &budget, true).unwrap();
+        assert_eq!(
+            grid::validate_references(&index, &mut source, &[], &budget).unwrap(),
+            Some(orientation)
+        );
+    }
+}
+
 #[test]
 fn exif_orientation_applies_only_without_container_orientation() {
     let nals = nal_sets();
@@ -702,6 +810,13 @@ fn mirrored_asymmetric_pixels_match_normal_decode() {
                     .any(|p| p != &normal.pixels[..3])
             );
             let bounded = decode_bounded(BoundedInput::Bytes(&bytes), Default::default()).unwrap();
+            #[cfg(feature = "incremental-experiment")]
+            {
+                let (incremental, _) =
+                    incremental::decode(BoundedInput::Bytes(&bytes), Default::default()).unwrap();
+                assert_eq!(incremental.original_dimensions, bounded.original_dimensions);
+                assert_eq!(incremental.image.pixels, bounded.image.pixels);
+            }
             assert_eq!(
                 (bounded.image.width, bounded.image.height),
                 (normal.width, normal.height)
@@ -741,6 +856,13 @@ fn public_decode_applies_associated_exif_after_identity_rotation() {
             )
             .unwrap();
             let bounded = decode_bounded(BoundedInput::Bytes(&bytes), Default::default()).unwrap();
+            #[cfg(feature = "incremental-experiment")]
+            {
+                let (incremental, _) =
+                    incremental::decode(BoundedInput::Bytes(&bytes), Default::default()).unwrap();
+                assert_eq!(incremental.original_dimensions, bounded.original_dimensions);
+                assert_eq!(incremental.image.pixels, bounded.image.pixels);
+            }
             assert_eq!(
                 bounded.original_dimensions,
                 (plan.destination_width, plan.destination_height)

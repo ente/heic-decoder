@@ -2,6 +2,8 @@ mod codec;
 mod color;
 mod container;
 mod grid;
+#[cfg(feature = "incremental-experiment")]
+pub(crate) mod incremental;
 mod memory;
 mod resample;
 #[cfg(test)]

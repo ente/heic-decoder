@@ -273,7 +273,17 @@ fn unique<'a>(slot: &mut Option<&'a [u8]>, data: &'a [u8]) -> Result<()> {
 
 impl<'a> Index<'a> {
     pub(super) fn parse(metadata: &'a [u8], source_len: u64, budget: &Budget) -> Result<Self> {
+        Self::parse_primary(metadata, source_len, budget, false)
+    }
+
+    pub(super) fn parse_primary(
+        metadata: &'a [u8],
+        source_len: u64,
+        budget: &Budget,
+        direct: bool,
+    ) -> Result<Self> {
         let mut reader = Reader::new(metadata);
+
         if reader.full_box()? != (0, 0) {
             return Err(Error::Unsupported("meta version or flags"));
         }
@@ -351,7 +361,9 @@ impl<'a> Index<'a> {
         let primary = items
             .binary_search_by_key(&primary_id, |item| item.id)
             .map_err(|_| Error::Malformed("primary item missing"))?;
-        if items[primary].kind != *b"grid" {
+        if items[primary].kind != *b"grid"
+            && !(direct && matches!(&items[primary].kind, b"hvc1" | b"hev1"))
+        {
             return Err(Error::Unsupported("primary item must be a HEIC grid"));
         }
         let idat = idat.unwrap_or_default();
@@ -594,6 +606,50 @@ impl<'a> Index<'a> {
                     .checked_sub(1)
                     .map(|i| (value & mask != 0, self.properties[i as usize]))
             })
+    }
+
+    #[cfg(feature = "incremental-experiment")]
+    pub(super) fn read_range(
+        &self,
+        item: usize,
+        source: &mut Source<'_>,
+        mut position: usize,
+        mut output: &mut [u8],
+    ) -> Result<()> {
+        let location = self.items[item]
+            .location
+            .ok_or(Error::Malformed("missing item location"))?;
+        if position
+            .checked_add(output.len())
+            .is_none_or(|end| end > location.length)
+        {
+            return Err(Error::Malformed("item range"));
+        }
+        let mut r = Reader::new(location.extents);
+        while !output.is_empty() && r.pos < r.data.len() {
+            r.uint(location.index_size)?;
+            let offset = location.base + r.uint(location.offset_size)?;
+            let length = r.uint(location.length_size)? as usize;
+            if position >= length {
+                position -= length;
+                continue;
+            }
+            let count = output.len().min(length - position);
+            let offset = offset + position as u64;
+            if location.method == 0 {
+                source.read(offset, &mut output[..count])?;
+            } else {
+                output[..count]
+                    .copy_from_slice(&self.idat[offset as usize..offset as usize + count]);
+            }
+            output = &mut output[count..];
+            position = 0;
+        }
+        if output.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Malformed("item extent coverage"))
+        }
     }
 
     pub(super) fn read_item(
