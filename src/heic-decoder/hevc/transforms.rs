@@ -59,6 +59,7 @@ impl DecodedFrame {
         };
 
         Self {
+            row_origin: 0,
             width: nw,
             height: nh,
             y_plane,
@@ -130,6 +131,7 @@ impl DecodedFrame {
         };
 
         Self {
+            row_origin: 0,
             width: w,
             height: h,
             y_plane,
@@ -204,6 +206,7 @@ impl DecodedFrame {
         };
 
         Self {
+            row_origin: 0,
             width: nw,
             height: nh,
             y_plane,
@@ -270,6 +273,7 @@ impl DecodedFrame {
         };
 
         Self {
+            row_origin: 0,
             width: w,
             height: h,
             y_plane,
@@ -336,6 +340,7 @@ impl DecodedFrame {
         };
 
         Self {
+            row_origin: 0,
             width: w,
             height: h,
             y_plane,

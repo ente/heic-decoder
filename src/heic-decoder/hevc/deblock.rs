@@ -54,17 +54,37 @@ pub fn apply_deblocking_filter(
     cb_qp_offset: i32,
     cr_qp_offset: i32,
 ) {
+    apply_deblocking_rows(
+        frame,
+        beta_offset,
+        tc_offset,
+        cb_qp_offset,
+        cr_qp_offset,
+        0,
+        frame.height,
+    );
+}
+
+pub(crate) fn apply_deblocking_rows(
+    frame: &mut DecodedFrame,
+    beta_offset: i32,
+    tc_offset: i32,
+    cb_qp_offset: i32,
+    cr_qp_offset: i32,
+    start: u32,
+    end: u32,
+) {
     let width = frame.width;
-    let height = frame.height;
+    let height = end;
 
     // Pass 1: Vertical edges
     // Process at 8-sample intervals in x, 4-sample intervals in y
     let mut x = 8u32;
     while x < width {
-        let mut y = 0u32;
+        let mut y = start;
         while y < height {
             let bx = x / 4;
-            let by = y / 4;
+            let by = (y - frame.row_origin) / 4;
             let idx = (by * frame.deblock_stride + bx) as usize;
             if idx < frame.deblock_flags.len()
                 && (frame.deblock_flags[idx] & DEBLOCK_FLAG_VERT) != 0
@@ -86,12 +106,12 @@ pub fn apply_deblocking_filter(
 
     // Pass 2: Horizontal edges
     // Process at 4-sample intervals in x, 8-sample intervals in y
-    let mut y = 8u32;
+    let mut y = start.max(8);
     while y < height {
         let mut x = 0u32;
         while x < width {
             let bx = x / 4;
-            let by = y / 4;
+            let by = (y - frame.row_origin) / 4;
             let idx = (by * frame.deblock_stride + bx) as usize;
             if idx < frame.deblock_flags.len()
                 && (frame.deblock_flags[idx] & DEBLOCK_FLAG_HORIZ) != 0
@@ -112,7 +132,7 @@ pub fn apply_deblocking_filter(
 
     // Chroma deblocking (only for bS=2, which is all edges for I-slices)
     if frame.chroma_format > 0 {
-        apply_chroma_deblocking(frame, tc_offset, cb_qp_offset, cr_qp_offset);
+        apply_chroma_deblocking(frame, tc_offset, cb_qp_offset, cr_qp_offset, start, end);
     }
 }
 
@@ -168,6 +188,7 @@ fn filter_edge_luma(
     }
 
     let stride = frame.y_stride();
+    let y = y - frame.row_origin;
     let plane = &mut frame.y_plane;
 
     // Compute stride-based addressing:
@@ -330,9 +351,11 @@ fn apply_chroma_deblocking(
     tc_offset: i32,
     cb_qp_offset: i32,
     cr_qp_offset: i32,
+    start: u32,
+    end: u32,
 ) {
     let width = frame.width;
-    let height = frame.height;
+    let height = end;
     let bit_depth_c = frame.bit_depth as i32; // Same as luma for typical HEIC
     let max_val = (1i32 << bit_depth_c) - 1;
 
@@ -345,7 +368,7 @@ fn apply_chroma_deblocking(
     };
 
     let c_stride = frame.c_stride();
-    let c_height = height / sub_y;
+    let c_height = (height - frame.row_origin) / sub_y;
     let c_width = width / sub_x;
 
     // For 4:2:0: chroma edges are at 8-chroma-pixel intervals (16 luma pixels).
@@ -362,10 +385,10 @@ fn apply_chroma_deblocking(
     // Pass 1: Vertical edges
     let mut x = x_step_vert;
     while x < width {
-        let mut y = 0u32;
+        let mut y = start;
         while y < height {
             let bx = x / 4;
-            let by = y / 4;
+            let by = (y - frame.row_origin) / 4;
             let idx = (by * frame.deblock_stride + bx) as usize;
             if idx < frame.deblock_flags.len()
                 && (frame.deblock_flags[idx] & DEBLOCK_FLAG_VERT) != 0
@@ -378,13 +401,13 @@ fn apply_chroma_deblocking(
                 };
 
                 let cx = x / sub_x;
-                let cy = y / sub_y;
+                let cy = (y - frame.row_origin) / sub_y;
 
                 // Per-sample transquant-bypass exemption (H.265 8.7.2.5.7)
                 let mut p_bypass = [false; 4];
                 let mut q_bypass = [false; 4];
                 for k in 0..4u32 {
-                    let ly = (cy + k) * sub_y;
+                    let ly = (cy + k) * sub_y + frame.row_origin;
                     p_bypass[k as usize] = frame.is_block_bypass(x.wrapping_sub(1), ly);
                     q_bypass[k as usize] = frame.is_block_bypass(x, ly);
                 }
@@ -449,12 +472,12 @@ fn apply_chroma_deblocking(
     }
 
     // Pass 2: Horizontal edges
-    let mut y = y_step_horiz;
+    let mut y = start.max(y_step_horiz);
     while y < height {
         let mut x = 0u32;
         while x < width {
             let bx = x / 4;
-            let by = y / 4;
+            let by = (y - frame.row_origin) / 4;
             let idx = (by * frame.deblock_stride + bx) as usize;
             if idx < frame.deblock_flags.len()
                 && (frame.deblock_flags[idx] & DEBLOCK_FLAG_HORIZ) != 0
@@ -467,7 +490,7 @@ fn apply_chroma_deblocking(
                 };
 
                 let cx = x / sub_x;
-                let cy = y / sub_y;
+                let cy = (y - frame.row_origin) / sub_y;
 
                 // Per-sample transquant-bypass exemption (H.265 8.7.2.5.7)
                 let mut p_bypass = [false; 4];

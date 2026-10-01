@@ -47,6 +47,8 @@ use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 
 mod bounded;
+#[cfg(feature = "incremental-experiment")]
+pub use bounded::incremental::decode as decode_incremental_experiment;
 #[path = "heic-decoder/mod.rs"]
 mod heic_decoder;
 pub use bounded::{

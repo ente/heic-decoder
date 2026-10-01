@@ -38,9 +38,13 @@ jobs:
 
             - run: cargo test --all-features --locked
 
-            - run: cargo test --locked bounded::
+            - run: "cargo test --locked bounded::"
 
-            - run: cargo test --locked --no-default-features bounded::
+            - run: "cargo test --locked --no-default-features bounded::"
+
+            - run: cargo test --release --locked --features incremental-experiment --lib --bins
+
+            - run: cargo test --release --locked --no-default-features --features incremental-experiment --lib
 
     # Full TESTING.md correctness pass: pixel-for-pixel and ICC-profile
     # comparison against a pinned heif-dec validator over the libheif corpus,
@@ -72,7 +76,7 @@ jobs:
             - name: Install system dependencies
               run: |
                   sudo apt-get update
-                  sudo apt-get install -y cmake pkg-config ffmpeg \
+                  sudo apt-get install -y cmake pkg-config ffmpeg ruby \
                       libde265-dev libx265-dev libaom-dev libdav1d-dev \
                       libopenjp2-7-dev libjpeg-dev libbrotli-dev zlib1g-dev
 
@@ -120,10 +124,45 @@ jobs:
             - name: Full correctness pass
               run: scripts/heic_tests.sh verify --full --require-exts heic,avif
 
+            - name: Incremental decoder oracle comparisons
+              run: |
+                  prefix="$PWD/.heic-test-assets/libpng-install"
+                  cmake -S scripts/incremental -B .heic-test-runs/incremental-oracle \
+                      -DHEIF_SOURCE_DIR="$PWD/.heic-test-assets/libheif" \
+                      -DHEIF_BUILD_DIR="$PWD/.heic-test-runs/validator-build" \
+                      -DPNG_PNG_INCLUDE_DIR="$prefix/include" \
+                      -DPNG_LIBRARY="$prefix/lib/libpng16.a"
+                  cmake --build .heic-test-runs/incremental-oracle --parallel
+                  ruby scripts/incremental/generate.rb \
+                      .heic-test-runs/incremental-oracle/primary-oracle \
+                      .heic-test-assets/libheif/fuzzing/data/corpus/colors-no-alpha.heic
+                  cargo test --release --locked --features incremental-experiment --test incremental-memory
+                  cargo test --release --locked --no-default-features --features incremental-experiment --test incremental-memory
+                  cargo build --release --locked --features incremental-experiment --bins
+                  ruby scripts/incremental/verify.rb \
+                      .heic-test-runs/incremental-oracle/primary-oracle \
+                      target/release/incremental-allocation target/release/incremental-compare \
+                      .heic-test-assets/incremental-corpus/*.heic \
+                      .heic-test-assets/libheif/fuzzing/data/corpus/colors-no-alpha.heic \
+                      .heic-test-assets/libheif/fuzzing/data/corpus/colors-no-alpha-thumbnail.heic \
+                      .heic-test-assets/libheif/fuzzing/data/corpus/hevc32.heif \
+                      .heic-test-assets/stress-corpus/nowpp_photo_small.heic \
+                      .heic-test-assets/stress-corpus/wpp_narrow.heic \
+                      .heic-test-assets/stress-corpus/wpp_narrow2.heic
+                  for name in direct tall pipeline; do
+                      prefix="$PWD/.heic-test-runs/incremental/$name"
+                      ANNEX_B_OUTPUT="$prefix.hevc" target/release/incremental-check ".heic-test-assets/incremental-corpus/$name.heic"
+                      ffmpeg -v error -y -i "$prefix.hevc" -frames:v 1 -pix_fmt yuv420p -f rawvideo "$prefix.yuv"
+                      REFERENCE_YUV="$prefix.yuv" target/release/incremental-check ".heic-test-assets/incremental-corpus/$name.heic"
+                  done
+
             - name: Upload verify report
               if: failure()
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
               with:
                   name: verify-report
-                  path: .heic-test-runs/verify/run/report.txt
+                  path: |
+                      .heic-test-runs/verify/run/report.txt
+                      .heic-test-runs/incremental/*.json*
+                      .heic-test-assets/incremental-corpus/
                   if-no-files-found: ignore

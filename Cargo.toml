@@ -8,6 +8,7 @@ license-file = "LICENSE"
 repository = "https://github.com/ente-io/heic-decoder"
 
 [features]
+incremental-experiment = []
 default = ["std", "parallel-grid"]
 decoder-tracing = ["std"]
 image-integration = ["dep:image"]
@@ -40,3 +41,34 @@ scuffle-h265 = "0.2.2"
 
 [dev-dependencies]
 qcms = "0.3.0"
+
+[[bin]]
+name = "incremental-allocation"
+path = "src/bin/incremental-allocation.rs"
+required-features = ["incremental-experiment"]
+
+[[bin]]
+name = "incremental-check"
+path = "src/bin/incremental-check.rs"
+required-features = ["incremental-experiment"]
+
+[[bin]]
+name = "capability-inspect"
+path = "src/bin/capability-inspect.rs"
+required-features = ["incremental-experiment"]
+
+[[bin]]
+name = "incremental-compare"
+path = "src/bin/incremental-compare.rs"
+required-features = ["incremental-experiment"]
+
+[[bin]]
+name = "incremental-bench"
+path = "src/bin/incremental-bench.rs"
+required-features = ["incremental-experiment"]
+
+[[test]]
+name = "incremental-memory"
+path = "tests/incremental-memory.rs"
+harness = false
+required-features = ["incremental-experiment"]
