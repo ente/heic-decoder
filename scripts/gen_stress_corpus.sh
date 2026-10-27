@@ -23,6 +23,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -n "${DEV_SCRATCH_HELPER:-}" && -z "${HEIC_TEST_ROOT:-}" ]]; then
+  exec "$DEV_SCRATCH_HELPER" heic "$ROOT_DIR" -- "${BASH_SOURCE[0]}" "$@"
+fi
 TEST_ROOT="${HEIC_TEST_ROOT:-$ROOT_DIR/.heic-test-runs}"
 ASSET_ROOT="${HEIC_TEST_ASSET_ROOT:-$ROOT_DIR/.heic-test-assets}"
 LIBHEIF_BUILD_DIR="${LIBHEIF_BUILD_DIR:-$TEST_ROOT/validator-build}"
