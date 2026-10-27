@@ -1154,7 +1154,7 @@ pub fn convert_420_to_rgb(
             matrix_coeffs,
             rgb
         ),
-        [v3]
+        [v3, scalar]
     )
 }
 
