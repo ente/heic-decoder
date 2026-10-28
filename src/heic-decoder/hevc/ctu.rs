@@ -1727,7 +1727,7 @@ impl<'a> SliceContext<'a> {
                     size,
                     max_val
                 ),
-                [v3, neon]
+                [v3, neon, scalar]
             );
         } else {
             for py in 0..size {

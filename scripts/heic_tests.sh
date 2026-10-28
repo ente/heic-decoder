@@ -2,6 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -n "${DEV_SCRATCH_HELPER:-}" && -z "${HEIC_TEST_ROOT:-}" && -n "${1:-}" && "${1:-}" != "--help" && "${1:-}" != "-h" ]]; then
+  exec "$DEV_SCRATCH_HELPER" heic "$ROOT_DIR" -- "${BASH_SOURCE[0]}" "$@"
+fi
 TEST_ROOT="${HEIC_TEST_ROOT:-$ROOT_DIR/.heic-test-runs}"
 ASSET_ROOT="${HEIC_TEST_ASSET_ROOT:-$ROOT_DIR/.heic-test-assets}"
 HELPER_DIR="${HEIC_TEST_HELPER_DIR:-$TEST_ROOT/helper}"
@@ -832,8 +835,8 @@ gather_files() {
 display_path() {
   local path="$1"
   case "$path" in
-    "$ROOT_DIR"/*) echo "${path#$ROOT_DIR/}" ;;
-    "$LIBHEIF_SOURCE_DIR"/*) echo "libheif/${path#$LIBHEIF_SOURCE_DIR/}" ;;
+    "$ROOT_DIR"/*) echo "${path#"$ROOT_DIR"/}" ;;
+    "$LIBHEIF_SOURCE_DIR"/*) echo "libheif/${path#"$LIBHEIF_SOURCE_DIR"/}" ;;
     *) echo "$path" ;;
   esac
 }
@@ -899,8 +902,8 @@ reason_contains() {
 libheif_relative_path() {
   local path="$1"
   case "$path" in
-    "$LIBHEIF_SOURCE_DIR"/*) printf '%s\n' "${path#$LIBHEIF_SOURCE_DIR/}" ;;
-    "$ASSET_ROOT/libheif"/*) printf '%s\n' "${path#$ASSET_ROOT/libheif/}" ;;
+    "$LIBHEIF_SOURCE_DIR"/*) printf '%s\n' "${path#"$LIBHEIF_SOURCE_DIR"/}" ;;
+    "$ASSET_ROOT/libheif"/*) printf '%s\n' "${path#"$ASSET_ROOT"/libheif/}" ;;
     .heic-test-assets/libheif/*) printf '%s\n' "${path#.heic-test-assets/libheif/}" ;;
     libheif/*) printf '%s\n' "${path#libheif/}" ;;
     *) return 1 ;;
