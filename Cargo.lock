@@ -497,7 +497,7 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 [[package]]
 name = "rav1d"
 version = "1.1.0"
-source = "git+https://github.com/ente-io/rav1d.git?branch=arm32_stable#d8205d5e5c7aa0265956e660fae2c005b3b3ad9b"
+source = "git+https://github.com/ente-io/rav1d.git?branch=arm32_stable#d5be48c061b331d0e2e684610be65eaa71037660"
 dependencies = [
  "assert_matches",
  "atomig",
