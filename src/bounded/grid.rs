@@ -24,6 +24,20 @@ pub(super) struct Properties<'a> {
 
 impl<'a> Properties<'a> {
     pub(super) fn read(index: &Index<'a>, item: usize, tile: bool) -> Result<Self> {
+        Self::read_with_compatibility(index, item, tile, false)
+    }
+
+    #[cfg(feature = "incremental-experiment")]
+    pub(super) fn read_incremental(index: &Index<'a>, item: usize, tile: bool) -> Result<Self> {
+        Self::read_with_compatibility(index, item, tile, true)
+    }
+
+    fn read_with_compatibility(
+        index: &Index<'a>,
+        item: usize,
+        tile: bool,
+        legacy_pixi: bool,
+    ) -> Result<Self> {
         let mut result = Self {
             config: None,
             dimensions: None,
@@ -78,7 +92,9 @@ impl<'a> Properties<'a> {
                         return Err(Error::Unsupported("pixi version or flags"));
                     }
                     let count = r.uint(1)? as usize;
-                    if count != 3 || r.take(count)?.iter().any(|&n| n != 8) {
+                    if (count != 3 && !(legacy_pixi && count == 1))
+                        || r.take(count)?.iter().any(|&n| n != 8)
+                    {
                         return Err(Error::Unsupported("8-bit RGB channels required"));
                     }
                     r.finish()?;
@@ -293,90 +309,7 @@ impl<'a> Grid<'a> {
         {
             return Err(Error::Malformed("grid coverage"));
         }
-        let mut exif = None;
-        for reference in index.references.iter() {
-            let required_source = reference.from == primary_id
-                || tiles
-                    .iter()
-                    .any(|tile| index.items[tile.item].id == reference.from);
-            let touches = required_source
-                || reference.targets().any(|id| {
-                    id == primary_id || tiles.iter().any(|tile| index.items[tile.item].id == id)
-                });
-            if !touches {
-                continue;
-            }
-            match &reference.kind {
-                b"dimg" if reference.from == primary_id => {}
-                b"dimg" if !required_source => {}
-                b"auxl" => {
-                    let item = index.item(reference.from)?;
-                    let mut found = false;
-                    for (essential, property) in index.properties(item) {
-                        if property.kind != *b"auxC" {
-                            continue;
-                        }
-                        let mut r = Reader::new(property.data);
-                        if r.full_box()? != (0, 0) {
-                            return Err(Error::Unsupported("auxC version or flags"));
-                        }
-                        let value = &r.data[r.pos..];
-                        let end = value
-                            .iter()
-                            .position(|&b| b == 0)
-                            .ok_or(Error::Malformed("auxiliary type"))?;
-                        let value = &value[..end];
-                        if crate::ALPHA_AUX_TYPES.contains(&value) {
-                            return Err(Error::Unsupported("alpha auxiliary"));
-                        }
-                        let known = [
-                            b"urn:com:apple:photo:2020:aux:hdrgainmap".as_slice(),
-                            b"urn:com:apple:photo:2020:aux:semanticskymatte",
-                            b"urn:com:apple:photo:2018:aux:portraiteffectsmatte",
-                            b"urn:com:apple:photo:2019:aux:semanticskinmatte",
-                            b"urn:com:apple:photo:2019:aux:semantichairmatte",
-                            b"urn:com:apple:photo:2019:aux:semanticteethmatte",
-                            b"urn:com:apple:photo:2020:aux:semanticglassesmatte",
-                            b"tag:apple.com,2023:photo:aux:styledeltamap",
-                            b"tag:apple.com,2023:photo:aux:linearthumbnail",
-                            b"urn:mpeg:hevc:2015:auxid:2",
-                            b"urn:iso:std:iso:ts:21496:-1",
-                        ]
-                        .contains(&value);
-                        if essential && !known {
-                            return Err(Error::Unsupported("required auxiliary type"));
-                        }
-                        found = true;
-                    }
-                    if !found {
-                        return Err(Error::Malformed("auxiliary type missing"));
-                    }
-                }
-                b"cdsc" => {
-                    let item = index.item(reference.from)?;
-                    if index.items[item].is_exif && reference.targets().any(|id| id == primary_id) {
-                        let len = index.items[item]
-                            .location
-                            .ok_or(Error::Malformed("Exif location"))?
-                            .length;
-                        if len > 1024 * 1024 {
-                            return Err(Error::LimitExceeded("Exif bytes"));
-                        }
-                        let mut bytes = budget.zeroed(len, "Exif")?;
-                        index.read_item(item, source, &mut bytes)?;
-                        let orientation = crate::parse_exif_orientation_from_item_payload(&bytes)
-                            .and_then(|n| u8::try_from(n).ok())
-                            .filter(|n| (1..=8).contains(n));
-                        if exif.is_some() && exif != orientation {
-                            return Err(Error::Malformed("conflicting Exif orientation"));
-                        }
-                        exif = orientation;
-                    }
-                }
-                b"thmb" => {}
-                _ => return Err(Error::Unsupported("required item dependency")),
-            }
-        }
+        let exif = validate_references(index, source, &tiles, budget)?;
         Ok(Self {
             width,
             height,
@@ -386,4 +319,99 @@ impl<'a> Grid<'a> {
             exif,
         })
     }
+}
+
+pub(super) fn validate_references(
+    index: &Index<'_>,
+    source: &mut Source<'_>,
+    tiles: &[Tile<'_>],
+    budget: &Budget,
+) -> Result<Option<u8>> {
+    let primary_id = index.items[index.primary].id;
+    let mut exif = None;
+    for reference in index.references.iter() {
+        let required_source = reference.from == primary_id
+            || tiles
+                .iter()
+                .any(|tile| index.items[tile.item].id == reference.from);
+        let touches = required_source
+            || reference.targets().any(|id| {
+                id == primary_id || tiles.iter().any(|tile| index.items[tile.item].id == id)
+            });
+        if !touches {
+            continue;
+        }
+        match &reference.kind {
+            b"dimg"
+                if reference.from == primary_id && index.items[index.primary].kind == *b"grid" => {}
+            b"dimg" if !required_source => {}
+            b"auxl" => {
+                let item = index.item(reference.from)?;
+                let mut found = false;
+                for (essential, property) in index.properties(item) {
+                    if property.kind != *b"auxC" {
+                        continue;
+                    }
+                    let mut r = Reader::new(property.data);
+                    if r.full_box()? != (0, 0) {
+                        return Err(Error::Unsupported("auxC version or flags"));
+                    }
+                    let value = &r.data[r.pos..];
+                    let end = value
+                        .iter()
+                        .position(|&b| b == 0)
+                        .ok_or(Error::Malformed("auxiliary type"))?;
+                    let value = &value[..end];
+                    if crate::ALPHA_AUX_TYPES.contains(&value) {
+                        return Err(Error::Unsupported("alpha auxiliary"));
+                    }
+                    let known = [
+                        b"urn:com:apple:photo:2020:aux:hdrgainmap".as_slice(),
+                        b"urn:com:apple:photo:2020:aux:semanticskymatte",
+                        b"urn:com:apple:photo:2018:aux:portraiteffectsmatte",
+                        b"urn:com:apple:photo:2019:aux:semanticskinmatte",
+                        b"urn:com:apple:photo:2019:aux:semantichairmatte",
+                        b"urn:com:apple:photo:2019:aux:semanticteethmatte",
+                        b"urn:com:apple:photo:2020:aux:semanticglassesmatte",
+                        b"tag:apple.com,2023:photo:aux:styledeltamap",
+                        b"tag:apple.com,2023:photo:aux:linearthumbnail",
+                        b"urn:mpeg:hevc:2015:auxid:2",
+                        b"urn:iso:std:iso:ts:21496:-1",
+                    ]
+                    .contains(&value);
+                    if essential && !known {
+                        return Err(Error::Unsupported("required auxiliary type"));
+                    }
+                    found = true;
+                }
+                if !found {
+                    return Err(Error::Malformed("auxiliary type missing"));
+                }
+            }
+            b"cdsc" => {
+                let item = index.item(reference.from)?;
+                if index.items[item].is_exif && reference.targets().any(|id| id == primary_id) {
+                    let len = index.items[item]
+                        .location
+                        .ok_or(Error::Malformed("Exif location"))?
+                        .length;
+                    if len > 1024 * 1024 {
+                        return Err(Error::LimitExceeded("Exif bytes"));
+                    }
+                    let mut bytes = budget.zeroed(len, "Exif")?;
+                    index.read_item(item, source, &mut bytes)?;
+                    let orientation = crate::parse_exif_orientation_from_item_payload(&bytes)
+                        .and_then(|n| u8::try_from(n).ok())
+                        .filter(|n| (1..=8).contains(n));
+                    if exif.is_some() && exif != orientation {
+                        return Err(Error::Malformed("conflicting Exif orientation"));
+                    }
+                    exif = orientation;
+                }
+            }
+            b"thmb" => {}
+            _ => return Err(Error::Unsupported("required item dependency")),
+        }
+    }
+    Ok(exif)
 }

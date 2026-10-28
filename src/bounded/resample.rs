@@ -103,6 +103,19 @@ impl Layout {
         self.width == self.output_width && self.height == self.output_height
     }
 
+    #[cfg(feature = "incremental-experiment")]
+    pub(super) fn write_row(&self, x: u32, y: u32, pixels: &[u8], output: &mut [u8]) {
+        if self.matrix[0] == 1 {
+            let start = self.pixel_index(x, y);
+            output[start..start + pixels.len()].copy_from_slice(pixels);
+        } else {
+            for (offset, pixel) in pixels.chunks_exact(3).enumerate() {
+                let start = self.pixel_index(x + offset as u32, y);
+                output[start..start + 3].copy_from_slice(pixel);
+            }
+        }
+    }
+
     pub(super) fn pixel_index(&self, x: u32, y: u32) -> usize {
         let [a, b, c, d] = self.matrix;
         let dx = i64::from(a) * i64::from(x)
@@ -325,6 +338,52 @@ impl Accumulator {
         std::mem::swap(&mut self.top, &mut self.bottom);
         self.bottom.fill([0; 3]);
         self.left.fill([0; 3]);
+    }
+
+    #[cfg(feature = "incremental-experiment")]
+    pub(super) fn merge_row(
+        &mut self,
+        region: Region,
+        oy: u32,
+        sums: &[[u64; 3]],
+        output: &mut [u8],
+    ) {
+        let layout = self.layout;
+        let denominator = u64::from(layout.width) * u64::from(layout.height);
+        for ox in region.output_left..region.output_right {
+            let mut sum = sums[(ox - region.output_left) as usize];
+            if u64::from(ox) * u64::from(layout.width)
+                < u64::from(region.left) * u64::from(layout.output_width)
+            {
+                for (value, previous) in sum.iter_mut().zip(self.left[oy as usize]) {
+                    *value += previous;
+                }
+            }
+            if u64::from(ox + 1) * u64::from(layout.width)
+                > u64::from(region.right) * u64::from(layout.output_width)
+            {
+                self.left[oy as usize] = sum;
+                continue;
+            }
+            if u64::from(oy) * u64::from(layout.height)
+                < u64::from(region.top) * u64::from(layout.output_height)
+            {
+                for (value, previous) in sum.iter_mut().zip(self.top[ox as usize]) {
+                    *value += previous;
+                }
+            }
+            if u64::from(oy + 1) * u64::from(layout.height)
+                <= u64::from(region.bottom) * u64::from(layout.output_height)
+            {
+                let index = layout.pixel_index(ox, oy);
+                for channel in 0..3 {
+                    output[index + channel] =
+                        ((sum[channel] + denominator / 2) / denominator) as u8;
+                }
+            } else {
+                self.bottom[ox as usize] = sum;
+            }
+        }
     }
 
     pub(super) fn merge(&mut self, region: Region, sums: &Contribution, output: &mut [u8]) {

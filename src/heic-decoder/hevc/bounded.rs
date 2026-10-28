@@ -120,6 +120,58 @@ impl<'a> Prepared<'a> {
         })
     }
 
+    pub(crate) fn incremental_workspace(&self) -> Result<usize> {
+        if self.pps.entropy_coding_sync_enabled_flag || self.pps.tiles_enabled_flag {
+            return Err(HevcError::Unsupported("incremental coding structure"));
+        }
+        Ok(
+            self.geometry.coded_width as usize * self.sps.ctb_size() as usize * 40
+                + 2 * 1024 * 1024
+                + 512 * 1024,
+        )
+    }
+
+    pub(crate) fn decode_incremental(
+        self,
+        mut emit: impl FnMut(u32, &DecodedFrame) -> Result<()>,
+    ) -> Result<super::incremental::Statistics> {
+        let parsed = SliceHeader::parse_bounded(&self.slice, &self.sps, &self.pps)?;
+        super::incremental::decode(
+            &self.sps,
+            &self.pps,
+            &parsed.header,
+            &mut std::io::Cursor::new(&self.slice.payload[parsed.data_offset..]),
+            |start, frame| emit(start, frame),
+        )
+    }
+
+    pub(crate) fn output_band(&self) -> Result<DecodedFrame> {
+        let g = self.geometry;
+        let mut frame = DecodedFrame::try_with_params(g.coded_width, self.sps.ctb_size(), 8, 1)?;
+        frame.full_range = g.full_range;
+        frame.matrix_coeffs = g.matrix;
+        frame.colour_primaries = g.primaries;
+        Ok(frame)
+    }
+
+    pub(crate) fn decode_stream(
+        self,
+        reader: &mut dyn std::io::Read,
+        emit: impl FnMut(u32, &mut DecodedFrame) -> Result<()>,
+    ) -> Result<super::incremental::Statistics> {
+        let parsed = SliceHeader::parse_bounded(&self.slice, &self.sps, &self.pps)?;
+        let mut skip = [0; 512];
+        let mut remaining = parsed.data_offset;
+        while remaining != 0 {
+            let count = remaining.min(skip.len());
+            reader
+                .read_exact(&mut skip[..count])
+                .map_err(|_| HevcError::InvalidBitstream("truncated slice header"))?;
+            remaining -= count;
+        }
+        super::incremental::decode(&self.sps, &self.pps, &parsed.header, reader, emit)
+    }
+
     pub(crate) fn decode(self) -> Result<DecodedFrame> {
         let g = self.geometry;
         let mut frame = DecodedFrame::try_with_params(g.coded_width, g.coded_height, 8, 1)?;

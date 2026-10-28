@@ -64,9 +64,71 @@ pub struct DecodedFrame {
     /// QP map at 4x4 block granularity (for deblocking)
     #[doc(hidden)]
     pub qp_map: Vec<i8>,
+    pub(crate) row_origin: u32,
 }
 
 impl DecodedFrame {
+    pub(crate) fn plane_origin(&self, c_idx: u8) -> u32 {
+        if c_idx != 0 && self.chroma_format == 1 {
+            self.row_origin / 2
+        } else {
+            self.row_origin
+        }
+    }
+
+    pub(crate) fn advance_rows(&mut self, origin: u32) {
+        let rows = (origin - self.row_origin) as usize;
+        let width = self.width as usize;
+        let chroma_width = self.c_stride();
+        let chroma_rows = if self.chroma_format == 1 {
+            rows / 2
+        } else {
+            rows
+        };
+        shift_rows(&mut self.y_plane, rows * width, UNINIT_SAMPLE);
+        shift_rows(
+            &mut self.cb_plane,
+            chroma_rows * chroma_width,
+            UNINIT_SAMPLE,
+        );
+        shift_rows(
+            &mut self.cr_plane,
+            chroma_rows * chroma_width,
+            UNINIT_SAMPLE,
+        );
+        shift_rows(
+            &mut self.deblock_flags,
+            rows / 4 * self.deblock_stride as usize,
+            0,
+        );
+        shift_rows(&mut self.qp_map, rows / 4 * self.deblock_stride as usize, 0);
+        self.row_origin = origin;
+    }
+
+    pub(crate) fn copy_rows_from(&mut self, source: &Self, start: u32, rows: u32) {
+        for component in 0..3 {
+            let subsample = if component != 0 && self.chroma_format == 1 {
+                2
+            } else {
+                1
+            };
+            let target_y = (start - self.row_origin) / subsample;
+            let source_y = (start - source.row_origin) / subsample;
+            let (input, stride) = source.plane(component);
+            let (output, _) = self.plane_mut(component);
+            let len = (rows / subsample) as usize * stride;
+            output[target_y as usize * stride..][..len]
+                .copy_from_slice(&input[source_y as usize * stride..][..len]);
+        }
+        let stride = self.deblock_stride as usize;
+        let target = ((start - self.row_origin) / 4) as usize * stride;
+        let source_start = ((start - source.row_origin) / 4) as usize * stride;
+        let len = (rows / 4) as usize * stride;
+        self.deblock_flags[target..][..len]
+            .copy_from_slice(&source.deblock_flags[source_start..][..len]);
+        self.qp_map[target..][..len].copy_from_slice(&source.qp_map[source_start..][..len]);
+    }
+
     /// Create a frame with specific parameters
     ///
     /// # Panics
@@ -102,6 +164,7 @@ impl DecodedFrame {
 
         Ok(Self {
             width,
+            row_origin: 0,
             height,
             y_plane: super::allocation::filled(UNINIT_SAMPLE, luma_size)?,
             cb_plane: super::allocation::filled(UNINIT_SAMPLE, chroma_size)?,
@@ -125,7 +188,7 @@ impl DecodedFrame {
     /// Mark a vertical TU/CU boundary at luma position (x, y) with given size
     pub(crate) fn mark_tu_boundary(&mut self, x: u32, y: u32, size: u32) {
         let bx = x / 4;
-        let by = y / 4;
+        let by = (y - self.row_origin) / 4;
         let bs = size / 4;
 
         // Mark vertical edge at x (left edge of TU)
@@ -152,7 +215,7 @@ impl DecodedFrame {
     /// Store QP for a block region at 4x4 granularity
     pub(crate) fn store_block_qp(&mut self, x: u32, y: u32, size: u32, qp: i8) {
         let bx = x / 4;
-        let by = y / 4;
+        let by = (y - self.row_origin) / 4;
         let bs = size / 4;
         for j in 0..bs {
             for i in 0..bs {
@@ -167,7 +230,7 @@ impl DecodedFrame {
     /// Mark a CU region as cu_transquant_bypass at 4x4 granularity
     pub(crate) fn store_block_bypass(&mut self, x: u32, y: u32, size: u32) {
         let bx = x / 4;
-        let by = y / 4;
+        let by = (y - self.row_origin) / 4;
         let bs = size / 4;
         for j in 0..bs {
             for i in 0..bs {
@@ -183,7 +246,7 @@ impl DecodedFrame {
     /// cu_transquant_bypass CU.
     #[inline]
     pub(crate) fn is_block_bypass(&self, x: u32, y: u32) -> bool {
-        let idx = ((y / 4) * self.deblock_stride + x / 4) as usize;
+        let idx = (((y - self.row_origin) / 4) * self.deblock_stride + x / 4) as usize;
         self.deblock_flags
             .get(idx)
             .is_some_and(|f| f & DEBLOCK_FLAG_BYPASS != 0)
@@ -793,4 +856,11 @@ impl DecodedFrame {
             _ => (self.width.div_ceil(2), self.height.div_ceil(2)),
         }
     }
+}
+
+pub(crate) fn shift_rows<T: Copy>(data: &mut [T], count: usize, value: T) {
+    let count = count.min(data.len());
+    data.copy_within(count.., 0);
+    let keep = data.len() - count;
+    data[keep..].fill(value);
 }

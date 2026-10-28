@@ -159,6 +159,7 @@ pub struct SliceContext<'a> {
     touched_coeffs: [u16; 1024],
     /// Reusable scaling matrix buffer
     scaling_buf: [u8; 1024],
+    map_origin: u32,
 }
 
 impl<'a> SliceContext<'a> {
@@ -169,11 +170,40 @@ impl<'a> SliceContext<'a> {
         header: &'a SliceHeader,
         slice_data: &'a [u8],
     ) -> Result<Self> {
-        // DEBUG: Print first few bytes of slice data
         debug_trace!(
             "DEBUG: Slice data first 16 bytes: {:02x?}",
             &slice_data[..16.min(slice_data.len())]
         );
+        Self::new_with_height(sps, pps, header, slice_data, sps.pic_height_in_luma_samples)
+    }
+
+    pub(crate) fn new_with_height(
+        sps: &'a Sps,
+        pps: &'a Pps,
+        header: &'a SliceHeader,
+        slice_data: &'a [u8],
+        height: u32,
+    ) -> Result<Self> {
+        Self::with_cabac(sps, pps, header, CabacDecoder::new(slice_data)?, height)
+    }
+
+    pub(crate) fn new_stream(
+        sps: &'a Sps,
+        pps: &'a Pps,
+        header: &'a SliceHeader,
+        input: &'a mut dyn std::io::Read,
+        height: u32,
+    ) -> Result<Self> {
+        Self::with_cabac(sps, pps, header, CabacDecoder::new_stream(input)?, height)
+    }
+
+    fn with_cabac(
+        sps: &'a Sps,
+        pps: &'a Pps,
+        header: &'a SliceHeader,
+        cabac: CabacDecoder<'a>,
+        height: u32,
+    ) -> Result<Self> {
         debug_trace!(
             "DEBUG: SPS: {}x{}, ctb_size={}, min_cb_size={}, scaling_list={}",
             sps.pic_width_in_luma_samples,
@@ -192,7 +222,6 @@ impl<'a> SliceContext<'a> {
             sps.log2_max_tb_size()
         );
 
-        let cabac = CabacDecoder::new(slice_data)?;
         let (range, offset) = cabac.get_state();
         debug_trace!(
             "DEBUG: CABAC init state: range={}, offset={}",
@@ -244,7 +273,7 @@ impl<'a> SliceContext<'a> {
         // Map is in units of min_cb_size (typically 8x8)
         let min_cb_size = 1u32 << sps.log2_min_cb_size();
         let ct_depth_map_stride = sps.pic_width_in_luma_samples.div_ceil(min_cb_size);
-        let ct_depth_map_height = sps.pic_height_in_luma_samples.div_ceil(min_cb_size);
+        let ct_depth_map_height = height.div_ceil(min_cb_size);
         let ct_map_size = (ct_depth_map_stride * ct_depth_map_height) as usize;
         let ct_depth_map = super::allocation::filled(0xFF, ct_map_size)?;
 
@@ -252,7 +281,7 @@ impl<'a> SliceContext<'a> {
         // This supports NxN partition PU-level resolution
         let min_pu_size = (min_cb_size / 2).max(1);
         let intra_mode_map_stride = sps.pic_width_in_luma_samples.div_ceil(min_pu_size);
-        let intra_mode_map_height = sps.pic_height_in_luma_samples.div_ceil(min_pu_size);
+        let intra_mode_map_height = height.div_ceil(min_pu_size);
         let pu_map_size = (intra_mode_map_stride * intra_mode_map_height) as usize;
         let intra_mode_map = super::allocation::filled(IntraPredMode::Dc.as_u8(), pu_map_size)?;
         let intra_chroma_mode_map =
@@ -261,7 +290,7 @@ impl<'a> SliceContext<'a> {
         // QP map at min_tb_size granularity
         let min_tb_size = 1u32 << sps.log2_min_tb_size();
         let qp_map_stride = sps.pic_width_in_luma_samples.div_ceil(min_tb_size);
-        let qp_map_height = sps.pic_height_in_luma_samples.div_ceil(min_tb_size);
+        let qp_map_height = height.div_ceil(min_tb_size);
         let qp_map =
             super::allocation::filled(slice_qp as i8, (qp_map_stride * qp_map_height) as usize)?;
 
@@ -295,11 +324,19 @@ impl<'a> SliceContext<'a> {
             last_qpy_in_prev_qg: slice_qp,
             current_qg_x: -1,
             current_qg_y: -1,
-            sao_map: SaoMap::new(sps.pic_width_in_ctbs(), sps.pic_height_in_ctbs())?,
+            sao_map: SaoMap::new(
+                sps.pic_width_in_ctbs(),
+                if height < sps.pic_height_in_luma_samples {
+                    3
+                } else {
+                    sps.pic_height_in_ctbs()
+                },
+            )?,
             residual_buf: [0i16; 1024],
             coeff_buf: [0i16; 1024],
             touched_coeffs: [0u16; 1024],
             scaling_buf: [16u8; 1024],
+            map_origin: 0,
         })
     }
 
@@ -418,6 +455,51 @@ impl<'a> SliceContext<'a> {
         #[cfg(feature = "decoder-tracing")]
         if DEBUG_TRACE {
             debug::print_tracker_summary();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn decode_row(&mut self, row: u32, frame: &mut DecodedFrame) -> Result<()> {
+        let size = self.sps.ctb_size();
+        let origin = row.saturating_sub(1) * size;
+        let delta = origin - self.map_origin;
+        let cb = 1 << self.sps.log2_min_cb_size();
+        let pu = cb / 2;
+        let tb = 1 << self.sps.log2_min_tb_size();
+        super::picture::shift_rows(
+            &mut self.ct_depth_map,
+            (delta / cb * self.ct_depth_map_stride) as usize,
+            0xFF,
+        );
+        super::picture::shift_rows(
+            &mut self.intra_mode_map,
+            (delta / pu * self.intra_mode_map_stride) as usize,
+            IntraPredMode::Dc.as_u8(),
+        );
+        super::picture::shift_rows(
+            &mut self.intra_chroma_mode_map,
+            (delta / pu * self.intra_mode_map_stride) as usize,
+            IntraPredMode::Dc.as_u8(),
+        );
+        super::picture::shift_rows(
+            &mut self.qp_map,
+            (delta / tb * self.qp_map_stride) as usize,
+            self.header.slice_qp_y as i8,
+        );
+        self.map_origin = origin;
+        frame.advance_rows(origin);
+        self.ctb_y = row;
+        for x in 0..self.sps.pic_width_in_ctbs() {
+            self.ctb_x = x;
+            *self.sao_map.get_mut(x, row) = super::sao::SaoInfo::default();
+            self.decode_ctu(x * size, row * size, frame)?;
+            let end = self.cabac.decode_terminate() != 0;
+            self.cabac.check_input()?;
+            let last =
+                row + 1 == self.sps.pic_height_in_ctbs() && x + 1 == self.sps.pic_width_in_ctbs();
+            if end != last {
+                return Err(HevcError::InvalidBitstream("incremental slice termination"));
+            }
         }
         Ok(())
     }
@@ -705,6 +787,9 @@ impl<'a> SliceContext<'a> {
     fn get_ct_depth(&self, x: u32, y: u32) -> u8 {
         let min_cb_size = 1u32 << self.sps.log2_min_cb_size();
         let map_x = x / min_cb_size;
+        let Some(y) = y.checked_sub(self.map_origin) else {
+            return 0xFF;
+        };
         let map_y = y / min_cb_size;
 
         if map_x >= self.ct_depth_map_stride
@@ -723,7 +808,7 @@ impl<'a> SliceContext<'a> {
 
         // Fill the ct_depth_map for this CU region
         let start_x = x0 / min_cb_size;
-        let start_y = y0 / min_cb_size;
+        let start_y = (y0 - self.map_origin) / min_cb_size;
         let num_blocks = cb_size / min_cb_size;
 
         for dy in 0..num_blocks {
@@ -1628,6 +1713,7 @@ impl<'a> SliceContext<'a> {
         let size = 1usize << log2_size;
         let residual = &self.residual_buf;
         let max_val = (1i32 << bit_depth) - 1;
+        let y0 = y0 - frame.plane_origin(c_idx);
         let (plane, stride) = frame.plane_mut(c_idx);
         let last_row_end = (y0 as usize + size - 1) * stride + x0 as usize + size;
         if last_row_end <= plane.len() {
@@ -1838,7 +1924,7 @@ impl<'a> SliceContext<'a> {
         let stride = self.intra_mode_map_stride;
         let count = ((1u32 << log2_size) / min_pu).max(1);
         let start_x = x0 / min_pu;
-        let start_y = y0 / min_pu;
+        let start_y = (y0 - self.map_origin) / min_pu;
         for dy in 0..count {
             for dx in 0..count {
                 let idx = ((start_y + dy) * stride + (start_x + dx)) as usize;
@@ -1855,7 +1941,7 @@ impl<'a> SliceContext<'a> {
         let stride = self.intra_mode_map_stride;
         let count = ((1u32 << log2_size) / min_pu).max(1);
         let start_x = x0 / min_pu;
-        let start_y = y0 / min_pu;
+        let start_y = (y0 - self.map_origin) / min_pu;
         for dy in 0..count {
             for dx in 0..count {
                 let idx = ((start_y + dy) * stride + (start_x + dx)) as usize;
@@ -1870,6 +1956,9 @@ impl<'a> SliceContext<'a> {
     fn get_intra_mode_at(&self, x: u32, y: u32) -> IntraPredMode {
         let min_pu = self.min_pu_size();
         let stride = self.intra_mode_map_stride;
+        let Some(y) = y.checked_sub(self.map_origin) else {
+            return IntraPredMode::Dc;
+        };
         let idx = ((y / min_pu) * stride + (x / min_pu)) as usize;
         if idx < self.intra_mode_map.len() {
             IntraPredMode::from_u8(self.intra_mode_map[idx]).unwrap_or(IntraPredMode::Dc)
@@ -1883,6 +1972,9 @@ impl<'a> SliceContext<'a> {
     fn get_intra_chroma_mode_at(&self, x: u32, y: u32) -> IntraPredMode {
         let min_pu = self.min_pu_size();
         let stride = self.intra_mode_map_stride;
+        let Some(y) = y.checked_sub(self.map_origin) else {
+            return IntraPredMode::Dc;
+        };
         let idx = ((y / min_pu) * stride + (x / min_pu)) as usize;
         if idx < self.intra_chroma_mode_map.len() {
             IntraPredMode::from_u8(self.intra_chroma_mode_map[idx]).unwrap_or(IntraPredMode::Dc)
@@ -1976,6 +2068,9 @@ impl<'a> SliceContext<'a> {
     /// Get QPY at a sample position from the QP map
     fn get_qpy_at(&self, x: u32, y: u32) -> i32 {
         let min_tb = 1u32 << self.sps.log2_min_tb_size();
+        let Some(y) = y.checked_sub(self.map_origin) else {
+            return self.header.slice_qp_y;
+        };
         let idx = ((y / min_tb) * self.qp_map_stride + (x / min_tb)) as usize;
         if idx < self.qp_map.len() {
             self.qp_map[idx] as i32
@@ -1989,7 +2084,7 @@ impl<'a> SliceContext<'a> {
         let min_tb = 1u32 << self.sps.log2_min_tb_size();
         let count = ((1u32 << log2_cb_size) / min_tb).max(1);
         let start_x = x0 / min_tb;
-        let start_y = y0 / min_tb;
+        let start_y = (y0 - self.map_origin) / min_tb;
         for dy in 0..count {
             for dx in 0..count {
                 let idx = ((start_y + dy) * self.qp_map_stride + (start_x + dx)) as usize;

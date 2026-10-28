@@ -77,6 +77,7 @@ pub fn predict_intra(
     }
 
     // Resolve plane once to avoid per-pixel match on c_idx
+    let y = y - frame.plane_origin(c_idx);
     let (plane, stride) = frame.plane_mut(c_idx);
     let max_val = (1i32 << bit_depth) - 1;
 
@@ -259,6 +260,9 @@ fn fill_border_samples(
         }
     };
 
+    let origin = frame.plane_origin(c_idx);
+    let y = y - origin;
+    let frame_h = frame_h - origin;
     let avail_left = x > 0;
     let avail_top = y > 0;
     let avail_top_left = avail_left && avail_top;

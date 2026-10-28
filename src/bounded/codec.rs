@@ -4,6 +4,21 @@ use super::container::Reader;
 use super::{BoundedDecodeError as Error, Result};
 
 pub(super) fn prepare<'a>(config: &'a [u8], payload: &'a [u8]) -> Result<Prepared<'a>> {
+    let (mut nals, length_size) = configuration(config)?;
+    let mut r = Reader::new(payload);
+    while r.pos < payload.len() {
+        let len = r.uint(length_size)? as usize;
+        nals.add(r.take(len)?, true)?;
+    }
+    Ok(Prepared::new(
+        nals.parameters[0].ok_or(Error::Malformed("missing VPS"))?,
+        nals.parameters[1].ok_or(Error::Malformed("missing SPS"))?,
+        nals.parameters[2].ok_or(Error::Malformed("missing PPS"))?,
+        nals.slice.ok_or(Error::Malformed("missing IDR slice"))?,
+    )?)
+}
+
+pub(super) fn configuration(config: &[u8]) -> Result<(Nals<'_>, usize)> {
     let mut r = Reader::new(config);
     let header = r.take(23)?;
     if header[0] != 1 {
@@ -27,28 +42,18 @@ pub(super) fn prepare<'a>(config: &'a [u8], payload: &'a [u8]) -> Result<Prepare
         }
     }
     r.finish()?;
-    let mut r = Reader::new(payload);
-    while r.pos < payload.len() {
-        let len = r.uint(length_size)? as usize;
-        nals.add(r.take(len)?, true)?;
-    }
-    Ok(Prepared::new(
-        nals.parameters[0].ok_or(Error::Malformed("missing VPS"))?,
-        nals.parameters[1].ok_or(Error::Malformed("missing SPS"))?,
-        nals.parameters[2].ok_or(Error::Malformed("missing PPS"))?,
-        nals.slice.ok_or(Error::Malformed("missing IDR slice"))?,
-    )?)
+    Ok((nals, length_size))
 }
 
 #[derive(Default)]
-struct Nals<'a> {
-    parameters: [Option<&'a [u8]>; 3],
+pub(super) struct Nals<'a> {
+    pub(super) parameters: [Option<&'a [u8]>; 3],
     slice: Option<&'a [u8]>,
     count: usize,
 }
 
 impl<'a> Nals<'a> {
-    fn add(&mut self, nal: &'a [u8], in_payload: bool) -> Result<()> {
+    pub(super) fn add(&mut self, nal: &'a [u8], in_payload: bool) -> Result<()> {
         self.count += 1;
         if self.count > 1024 {
             return Err(Error::LimitExceeded("NAL count"));

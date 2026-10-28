@@ -161,3 +161,121 @@ libheif corpus and the ente fixtures.
 
 Generated reports and PNG artifacts are under `.heic-test-runs/`. Use
 `--keep-artifacts` with `verify` when debugging a pixel mismatch.
+
+## Incremental bounded decoder
+
+The opt-in `incremental-experiment` feature is tested separately because
+`--all-features` also enables decoder tracing, which disables bounded decode.
+The standalone allocation test imposes both live-heap and individual-request
+ceilings across decoding and conversion threads. It covers Path/Bytes parity,
+source-height growth, odd crops on both axes, grid clipping, tile color-profile
+inheritance, threaded grid tiles, and early budget rejection. The malformed
+reference fixture uses `.bin` and is tested under a 256 KiB ceiling separately
+from the positive `*.heic` oracle comparisons.
+
+The external primary-image oracle is only a test executable; it adds no native
+dependency to the Rust decoder. After the existing harness builds libheif,
+build and run it with CMake, libpng development files, Ruby, and FFmpeg with
+libx265. No incremental image assets are committed. The generator starts
+from the existing external libheif corpus and creates the geometry, metadata,
+and height-growth cases missing from that corpus in the ignored
+`.heic-test-assets/incremental-corpus` directory. All reference PNGs come from
+live strict libheif decoding. Its manifest records source, oracle, FFmpeg,
+and input identities; encoded bytes can differ across libx265 versions.
+
+```bash
+cmake -S scripts/incremental -B .heic-test-runs/incremental-oracle \
+  -DHEIF_SOURCE_DIR="$PWD/.heic-test-assets/libheif" \
+  -DHEIF_BUILD_DIR="$PWD/.heic-test-runs/validator-build"
+cmake --build .heic-test-runs/incremental-oracle --parallel
+ruby scripts/incremental/generate.rb \
+  .heic-test-runs/incremental-oracle/primary-oracle \
+  .heic-test-assets/libheif/fuzzing/data/corpus/colors-no-alpha.heic
+cargo test --release --locked --features incremental-experiment --lib --bins --test incremental-memory
+cargo test --release --locked --no-default-features --features incremental-experiment --lib --test incremental-memory
+cargo build --release --locked --features incremental-experiment --bins
+ruby scripts/incremental/verify.rb \
+  .heic-test-runs/incremental-oracle/primary-oracle \
+  target/release/incremental-allocation target/release/incremental-compare \
+  .heic-test-assets/incremental-corpus/*.heic
+```
+
+Supply `PNG_PNG_INCLUDE_DIR` and `PNG_LIBRARY` when using a custom libpng,
+as the CI workflow does. The runner compares original-size (up to side 6000)
+and side-65 outputs, writes identities and metrics under
+`.heic-test-runs/incremental`, and fails on any decoder, oracle, geometry, or
+pixel-comparison failure. `INCREMENTAL_TEST_ROOT` overrides the output folder.
+The generator accepts an optional output directory; set
+`INCREMENTAL_FIXTURES_DIR` to that directory for allocation tests. Missing
+generated inputs fail the test with setup instructions rather than skipping it.
+Every supplied input is required to decode; unsupported inputs do not count
+as successful comparisons. CI also exercises the six currently supported
+files in the libheif/stress corpus. The separate normal suite keeps its exact
+RGB/ICC comparisons and existing expected-failure accounting.
+
+The oracle enables libheif strict decoding and rejects warnings. RGB display
+comparisons normalize embedded ICC to sRGB and apply an independent floating
+point area average. The `rgb8-rounding` profile allows at most one value per
+RGB channel per pixel; alpha remains exact. The `exact` profile allows no
+sample changes. Dimensions and raster lengths are always checked. Average
+error, PSNR, signed bias and local error are diagnostics, never substitutes
+for the per-sample gate. These profiles do not authorize different tone
+mapping, resampling filters, or high-bit-depth rounding. Native reconstruction
+must retain exact sample checks against an independent decoder. ICC
+normalization currently shares moxcms with the implementation; separate qcms
+unit tests cover that boundary.
+
+The pinned libheif has a bilinear chroma-border indexing defect. Odd-grid
+regressions retain an interior aperture so they still exercise the final
+chroma neighbor without depending on its erroneous outer-border conversion.
+Every supplied input uses the unmodified live strict oracle; there are no
+stored corrected PNGs or input-specific comparison exceptions. This leaves
+the affected outer-border RGB conversion outside independent libheif coverage.
+Do not raise the global tolerance or silently classify discrepancies as
+oracle defects.
+
+A separate high-frequency odd-crop probe remains outside the passing corpus:
+at side 6000, one green sample is 72 versus the strict oracle's 70, despite
+exact native YUV agreement with FFmpeg. The sample lies inside a band, and
+the display-conversion cause remains unresolved. The one-value RGB gate is
+unchanged; this probe is not counted as a passing input. Preserve it for
+the decoder compatibility follow-up.
+
+For a supplied large supported image, measure allocator requests separately
+from uninstrumented decode timing:
+
+```bash
+target/release/incremental-allocation bounded image.heic 6000 128
+target/release/incremental-allocation bytes image.heic 6000 128
+target/release/incremental-bench bounded image.heic
+target/release/incremental-bench normal image.heic
+```
+
+Run timing trials serially, after warm-up, in alternating order. Normal mode
+returns the full raster; bounded mode includes capped output and reduction.
+No claim of equal work or universal speedup follows from those timings.
+Use a process memory tool separately for RSS. The allocator probe reports
+requested heap bytes and excludes the caller's borrowed input allocation.
+
+`incremental-check` is a deliberately unbounded verification tool comparing
+native reconstructed samples against the full Rust decoder. For an 8-bit
+4:2:0 fixture with no conformance-window crop, provide independently decoded
+planar YUV to require exact independent agreement too:
+
+```bash
+ANNEX_B_OUTPUT=reference.hevc target/release/incremental-check image.heic
+ffmpeg -v error -y -i reference.hevc -frames:v 1 -pix_fmt yuv420p -f rawvideo reference.yuv
+REFERENCE_YUV=reference.yuv target/release/incremental-check image.heic
+```
+
+This verification tool is not part of the bounded path or its memory evidence.
+`capability-inspect` prints coded-item SPS/PPS features. `scripts/incremental/wrap.rb`
+packages a supplied one-IDR Annex-B 8-bit 4:2:0 stream into a direct HEIC or
+repeated-tile grid; its dimensions must match the stream. `CROP`, `ROTATION`
+and `MIRROR` environment variables add fixture transforms without re-encoding.
+`GRID=1` creates a single-tile grid, `CANVAS` clips its visible dimensions,
+`TILE_NCLX` and `PRIMARY_NCLX` set color metadata, and `REFERENCE_COUNT`
+constructs malformed reference-count regression inputs.
+The 200 MP photographic fixture used during development was externally
+sourced and re-encoded as Main Still Picture Level 8.5, with WPP disabled;
+it is not committed and is not a native camera HEIC compatibility claim.
