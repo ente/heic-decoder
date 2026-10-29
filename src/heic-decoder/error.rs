@@ -7,6 +7,7 @@ use core::fmt;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum HevcError {
+    AllocationFailed,
     /// Invalid NAL unit.
     InvalidNalUnit(&'static str),
     /// Invalid bitstream.
@@ -38,6 +39,7 @@ pub enum HevcError {
 impl fmt::Display for HevcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AllocationFailed => write!(f, "allocation failed"),
             Self::InvalidNalUnit(msg) => write!(f, "invalid NAL unit: {msg}"),
             Self::InvalidBitstream(msg) => write!(f, "invalid bitstream: {msg}"),
             Self::MissingParameterSet(kind) => write!(f, "missing {kind}"),
