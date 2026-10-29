@@ -26,6 +26,10 @@ const CMPD_BOX_TYPE: [u8; 4] = *b"cmpd";
 const UNCC_BOX_TYPE: [u8; 4] = *b"uncC";
 const CMPC_BOX_TYPE: [u8; 4] = *b"cmpC";
 const ICEF_BOX_TYPE: [u8; 4] = *b"icef";
+// iloc extent entries can legally be zero bytes wide (all size fields 0), so
+// an extent count cannot always be validated against the payload size; this
+// cap bounds what declared counts may pre-allocate.
+const MAX_ILOC_EXTENTS: usize = 65536;
 const COLR_BOX_TYPE: [u8; 4] = *b"colr";
 const IROT_BOX_TYPE: [u8; 4] = *b"irot";
 const IMIR_BOX_TYPE: [u8; 4] = *b"imir";
@@ -1226,6 +1230,15 @@ pub enum ParseItemLocationBoxError {
         available: usize,
         required: usize,
     },
+    ItemCountTooLarge {
+        offset: u64,
+        item_count: u32,
+        available: usize,
+    },
+    ExtentCountTooLarge {
+        offset: u64,
+        total_extents: usize,
+    },
 }
 
 impl Display for ParseItemLocationBoxError {
@@ -1256,6 +1269,21 @@ impl Display for ParseItemLocationBoxError {
             } => write!(
                 f,
                 "iloc payload too small for {context} at offset {offset} (available: {available} bytes, required: {required})"
+            ),
+            ParseItemLocationBoxError::ItemCountTooLarge {
+                offset,
+                item_count,
+                available,
+            } => write!(
+                f,
+                "iloc box at offset {offset} declares {item_count} items, which cannot fit in the remaining {available} payload bytes"
+            ),
+            ParseItemLocationBoxError::ExtentCountTooLarge {
+                offset,
+                total_extents,
+            } => write!(
+                f,
+                "iloc box at offset {offset} declares {total_extents} extents, exceeding the {MAX_ILOC_EXTENTS}-extent limit"
             ),
         }
     }
@@ -1599,7 +1627,7 @@ impl Display for ParseItemPropertyAssociationBoxError {
                 entry_count,
             } => write!(
                 f,
-                "ipma entry_count {entry_count} cannot be represented at offset {offset}"
+                "ipma entry_count {entry_count} exceeds what the payload at offset {offset} can contain"
             ),
         }
     }
@@ -4044,14 +4072,74 @@ pub(crate) fn extract_avif_item_payload_from_location(
         });
     }
 
-    let total_length = location
-        .extents
-        .iter()
-        .try_fold(0_u64, |acc, extent| acc.checked_add(extent.length))
-        .ok_or(ExtractAvifItemDataError::PayloadTooLarge {
+    // Resolve the extent source up front and validate every declared extent
+    // against it before pre-allocating from the sum of their lengths: each
+    // extent must lie inside the source, and the sum (overlapping extents
+    // included) must not exceed it.
+    let idat_payload: &[u8] = match location.construction_method {
+        0 => &[],
+        1 => {
+            let children = meta
+                .parse_children()
+                .map_err(ExtractAvifItemDataError::MetaChildBoxes)?;
+            let idat_box = find_first_child_box(&children, IDAT_BOX_TYPE)
+                .ok_or(ExtractAvifItemDataError::MissingIdatBox { item_id })?;
+            idat_box.payload
+        }
+        construction_method => {
+            return Err(ExtractAvifItemDataError::UnsupportedConstructionMethod {
+                item_id,
+                construction_method,
+            });
+        }
+    };
+    let available = if location.construction_method == 1 {
+        idat_payload.len() as u64
+    } else if let Some(source) = source.as_ref() {
+        source.len()
+    } else {
+        input.len() as u64
+    };
+    let mut total_length = 0_u64;
+    for extent in &location.extents {
+        let start = location.base_offset.checked_add(extent.offset).ok_or(
+            ExtractAvifItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+        let end = start.checked_add(extent.length).ok_or(
+            ExtractAvifItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+        if end > available {
+            return Err(ExtractAvifItemDataError::ExtentOutOfBounds {
+                item_id,
+                construction_method: location.construction_method,
+                start,
+                length: extent.length,
+                available,
+            });
+        }
+        total_length = total_length.checked_add(extent.length).ok_or(
+            ExtractAvifItemDataError::PayloadTooLarge {
+                item_id,
+                length: u64::MAX,
+            },
+        )?;
+    }
+    if total_length > available {
+        return Err(ExtractAvifItemDataError::PayloadTooLarge {
             item_id,
-            length: u64::MAX,
-        })?;
+            length: total_length,
+        });
+    }
     let payload_capacity =
         usize::try_from(total_length).map_err(|_| ExtractAvifItemDataError::PayloadTooLarge {
             item_id,
@@ -4074,12 +4162,7 @@ pub(crate) fn extract_avif_item_payload_from_location(
             }
         }
         1 => {
-            let children = meta
-                .parse_children()
-                .map_err(ExtractAvifItemDataError::MetaChildBoxes)?;
-            let idat_box = find_first_child_box(&children, IDAT_BOX_TYPE)
-                .ok_or(ExtractAvifItemDataError::MissingIdatBox { item_id })?;
-            append_iloc_extents_to_payload(idat_box.payload, location, item_id, 1, &mut payload)?;
+            append_iloc_extents_to_payload(idat_payload, location, item_id, 1, &mut payload)?;
         }
         construction_method => {
             return Err(ExtractAvifItemDataError::UnsupportedConstructionMethod {
@@ -4171,14 +4254,76 @@ fn extract_primary_uncompressed_item_data_internal(
         );
     }
 
-    let total_length = location
-        .extents
-        .iter()
-        .try_fold(0_u64, |acc, extent| acc.checked_add(extent.length))
-        .ok_or(ExtractUncompressedItemDataError::PayloadTooLarge {
+    // Resolve the extent source up front and validate every declared extent
+    // against it before pre-allocating from the sum of their lengths: each
+    // extent must lie inside the source, and the sum (overlapping extents
+    // included) must not exceed it.
+    let idat_payload: &[u8] = match location.construction_method {
+        0 => &[],
+        1 => {
+            let children = meta
+                .parse_children()
+                .map_err(ExtractUncompressedItemDataError::MetaChildBoxes)?;
+            let idat_box = find_first_child_box(&children, IDAT_BOX_TYPE)
+                .ok_or(ExtractUncompressedItemDataError::MissingIdatBox { item_id })?;
+            idat_box.payload
+        }
+        construction_method => {
+            return Err(
+                ExtractUncompressedItemDataError::UnsupportedConstructionMethod {
+                    item_id,
+                    construction_method,
+                },
+            );
+        }
+    };
+    let available = if location.construction_method == 1 {
+        idat_payload.len() as u64
+    } else if let Some(source) = source.as_ref() {
+        source.len()
+    } else {
+        input.len() as u64
+    };
+    let mut total_length = 0_u64;
+    for extent in &location.extents {
+        let start = location.base_offset.checked_add(extent.offset).ok_or(
+            ExtractUncompressedItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+        let end = start.checked_add(extent.length).ok_or(
+            ExtractUncompressedItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+        if end > available {
+            return Err(ExtractUncompressedItemDataError::ExtentOutOfBounds {
+                item_id,
+                construction_method: location.construction_method,
+                start,
+                length: extent.length,
+                available,
+            });
+        }
+        total_length = total_length.checked_add(extent.length).ok_or(
+            ExtractUncompressedItemDataError::PayloadTooLarge {
+                item_id,
+                length: u64::MAX,
+            },
+        )?;
+    }
+    if total_length > available {
+        return Err(ExtractUncompressedItemDataError::PayloadTooLarge {
             item_id,
-            length: u64::MAX,
-        })?;
+            length: total_length,
+        });
+    }
     let payload_capacity = usize::try_from(total_length).map_err(|_| {
         ExtractUncompressedItemDataError::PayloadTooLarge {
             item_id,
@@ -4208,13 +4353,8 @@ fn extract_primary_uncompressed_item_data_internal(
             }
         }
         1 => {
-            let children = meta
-                .parse_children()
-                .map_err(ExtractUncompressedItemDataError::MetaChildBoxes)?;
-            let idat_box = find_first_child_box(&children, IDAT_BOX_TYPE)
-                .ok_or(ExtractUncompressedItemDataError::MissingIdatBox { item_id })?;
             append_iloc_extents_to_payload_for_uncompressed(
-                idat_box.payload,
+                idat_payload,
                 location,
                 item_id,
                 1,
@@ -4719,14 +4859,74 @@ fn extract_heic_item_payload_from_location(
         });
     }
 
-    let total_length = location
-        .extents
-        .iter()
-        .try_fold(0_u64, |acc, extent| acc.checked_add(extent.length))
-        .ok_or(ExtractHeicItemDataError::PayloadTooLarge {
+    // Resolve the extent source up front and validate every declared extent
+    // against it before pre-allocating from the sum of their lengths: each
+    // extent must lie inside the source, and the sum (overlapping extents
+    // included) must not exceed it.
+    let idat_payload: &[u8] = match location.construction_method {
+        0 => &[],
+        1 => {
+            let children = meta
+                .parse_children()
+                .map_err(ExtractHeicItemDataError::MetaChildBoxes)?;
+            let idat_box = find_first_child_box(&children, IDAT_BOX_TYPE)
+                .ok_or(ExtractHeicItemDataError::MissingIdatBox { item_id })?;
+            idat_box.payload
+        }
+        construction_method => {
+            return Err(ExtractHeicItemDataError::UnsupportedConstructionMethod {
+                item_id,
+                construction_method,
+            });
+        }
+    };
+    let available = if location.construction_method == 1 {
+        idat_payload.len() as u64
+    } else if let Some(source) = source.as_ref() {
+        source.len()
+    } else {
+        input.len() as u64
+    };
+    let mut total_length = 0_u64;
+    for extent in &location.extents {
+        let start = location.base_offset.checked_add(extent.offset).ok_or(
+            ExtractHeicItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+        let end = start.checked_add(extent.length).ok_or(
+            ExtractHeicItemDataError::ExtentOffsetOverflow {
+                item_id,
+                base_offset: location.base_offset,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+            },
+        )?;
+        if end > available {
+            return Err(ExtractHeicItemDataError::ExtentOutOfBounds {
+                item_id,
+                construction_method: location.construction_method,
+                start,
+                length: extent.length,
+                available,
+            });
+        }
+        total_length = total_length.checked_add(extent.length).ok_or(
+            ExtractHeicItemDataError::PayloadTooLarge {
+                item_id,
+                length: u64::MAX,
+            },
+        )?;
+    }
+    if total_length > available {
+        return Err(ExtractHeicItemDataError::PayloadTooLarge {
             item_id,
-            length: u64::MAX,
-        })?;
+            length: total_length,
+        });
+    }
     let payload_capacity =
         usize::try_from(total_length).map_err(|_| ExtractHeicItemDataError::PayloadTooLarge {
             item_id,
@@ -4749,13 +4949,8 @@ fn extract_heic_item_payload_from_location(
             }
         }
         1 => {
-            let children = meta
-                .parse_children()
-                .map_err(ExtractHeicItemDataError::MetaChildBoxes)?;
-            let idat_box = find_first_child_box(&children, IDAT_BOX_TYPE)
-                .ok_or(ExtractHeicItemDataError::MissingIdatBox { item_id })?;
             append_iloc_extents_to_payload_for_heic(
-                idat_box.payload,
+                idat_payload,
                 location,
                 item_id,
                 1,
@@ -4916,6 +5111,15 @@ fn append_iloc_extents_to_payload_from_source(
                 extent_length: extent.length,
             },
         )?;
+        if end > available {
+            return Err(ExtractAvifItemDataError::ExtentOutOfBounds {
+                item_id,
+                construction_method,
+                start,
+                length: extent.length,
+                available,
+            });
+        }
 
         let extent_len = usize::try_from(extent.length).map_err(|_| {
             ExtractAvifItemDataError::PayloadTooLarge {
@@ -5027,6 +5231,15 @@ fn append_iloc_extents_to_payload_for_heic_from_source(
                 extent_length: extent.length,
             },
         )?;
+        if end > available {
+            return Err(ExtractHeicItemDataError::ExtentOutOfBounds {
+                item_id,
+                construction_method,
+                start,
+                length: extent.length,
+                available,
+            });
+        }
 
         let extent_len = usize::try_from(extent.length).map_err(|_| {
             ExtractHeicItemDataError::PayloadTooLarge {
@@ -5141,6 +5354,15 @@ fn append_iloc_extents_to_payload_for_uncompressed_from_source(
                 extent_length: extent.length,
             },
         )?;
+        if end > available {
+            return Err(ExtractUncompressedItemDataError::ExtentOutOfBounds {
+                item_id,
+                construction_method,
+                start,
+                length: extent.length,
+                available,
+            });
+        }
 
         let extent_len = usize::try_from(extent.length).map_err(|_| {
             ExtractUncompressedItemDataError::PayloadTooLarge {
@@ -5310,7 +5532,10 @@ fn parse_hvcc_payload(
             payload_offset,
             "nal_unit_count",
         )?);
-        let mut nal_units = Vec::with_capacity(nal_unit_count);
+        // Clamp the pre-allocation to what the remaining payload can encode
+        // (each unit consumes at least its 2-byte length field).
+        let nal_capacity = nal_unit_count.min((payload.len() - cursor) / 2);
+        let mut nal_units = Vec::with_capacity(nal_capacity);
         for _ in 0..nal_unit_count {
             let nal_unit_length = usize::from(read_u16_cursor_hvcc(
                 payload,
@@ -6035,7 +6260,27 @@ fn parse_iloc_payload(
         read_u32_cursor(iloc_payload, &mut cursor, iloc_payload_offset, "item_count")?
     };
 
+    // Each item record consumes at least its fixed-size fields, so a declared
+    // count the remaining payload cannot encode is rejected before
+    // pre-allocating from it.
+    let item_id_bytes: usize = if full_box.version < 2 { 2 } else { 4 };
+    let construction_method_bytes: usize = if full_box.version >= 1 { 2 } else { 0 };
+    let min_item_bytes = item_id_bytes
+        + construction_method_bytes
+        + size_of::<u16>() // data_reference_index
+        + usize::from(base_offset_size)
+        + size_of::<u16>(); // extent_count
+    let available_item_bytes = iloc_payload.len() - cursor;
+    if u64::from(item_count) * min_item_bytes as u64 > available_item_bytes as u64 {
+        return Err(ParseItemLocationBoxError::ItemCountTooLarge {
+            offset: iloc_payload_offset + cursor as u64,
+            item_count,
+            available: available_item_bytes,
+        });
+    }
+
     let mut items = Vec::with_capacity(item_count as usize);
+    let mut total_extents = 0_usize;
     for _ in 0..item_count {
         let item_id = if full_box.version < 2 {
             u32::from(read_u16_cursor(
@@ -6078,7 +6323,23 @@ fn parse_iloc_payload(
             "extent_count",
         )?;
 
-        let mut extents = Vec::with_capacity(usize::from(extent_count));
+        total_extents += usize::from(extent_count);
+        if total_extents > MAX_ILOC_EXTENTS {
+            return Err(ParseItemLocationBoxError::ExtentCountTooLarge {
+                offset: iloc_payload_offset + cursor as u64,
+                total_extents,
+            });
+        }
+        // Entries can be zero bytes wide (all size fields 0), so the
+        // pre-allocation is clamped to what the payload can actually encode.
+        let per_extent_bytes =
+            usize::from(index_size) + usize::from(offset_size) + usize::from(length_size);
+        let extent_capacity = if per_extent_bytes > 0 {
+            usize::from(extent_count).min((iloc_payload.len() - cursor) / per_extent_bytes)
+        } else {
+            0
+        };
+        let mut extents = Vec::with_capacity(extent_capacity);
         for _ in 0..extent_count {
             let index = if full_box.version >= 1 && index_size > 0 {
                 read_iloc_sized_u64(
@@ -6317,7 +6578,13 @@ fn parse_iref_payload(
             });
         }
 
-        let mut to_item_ids = Vec::with_capacity(usize::from(reference_count));
+        // Clamp the pre-allocation to what the remaining payload can encode
+        // (each referenced ID consumes at least 2 bytes); parsing fails on
+        // truncation regardless, so only the reserve needs bounding.
+        let item_id_bytes: usize = if full_box.version == 0 { 2 } else { 4 };
+        let reference_capacity =
+            usize::from(reference_count).min((child.payload.len() - cursor) / item_id_bytes);
+        let mut to_item_ids = Vec::with_capacity(reference_capacity);
         for _ in 0..reference_count {
             to_item_ids.push(read_item_id_cursor_iref(
                 child.payload,
@@ -6378,6 +6645,19 @@ fn parse_ipma_payload(
         ipma_payload_offset,
         "entry_count",
     )?;
+
+    // Each entry consumes at least item_ID plus association_count bytes, so a
+    // declared count the remaining payload cannot encode is rejected before
+    // pre-allocating from it.
+    let item_id_bytes: usize = if full_box.version == 0 { 2 } else { 4 };
+    let min_entry_bytes = item_id_bytes + 1; // association_count
+    let available_entry_bytes = ipma_payload.len() - cursor;
+    if u64::from(entry_count) * min_entry_bytes as u64 > available_entry_bytes as u64 {
+        return Err(ParseItemPropertyAssociationBoxError::EntryCountTooLarge {
+            offset: ipma_payload_offset + cursor as u64,
+            entry_count,
+        });
+    }
     let entry_capacity = usize::try_from(entry_count).map_err(|_| {
         ParseItemPropertyAssociationBoxError::EntryCountTooLarge {
             offset: ipma_payload_offset,
@@ -7268,6 +7548,22 @@ pub(crate) mod test_support {
         full_box(b"icef", 0, 0, &payload)
     }
 
+    /// iloc v0 with a single item carrying file-absolute extents
+    /// (construction method 0, offset_size 4, length_size 4).
+    pub(crate) fn iloc_multi_extent_box(item_id: u16, extents: &[(u32, u32)]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0x4400_u16.to_be_bytes());
+        payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        payload.extend_from_slice(&item_id.to_be_bytes());
+        payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        payload.extend_from_slice(&u16::try_from(extents.len()).unwrap().to_be_bytes());
+        for (offset, length) in extents {
+            payload.extend_from_slice(&offset.to_be_bytes());
+            payload.extend_from_slice(&length.to_be_bytes());
+        }
+        full_box(b"iloc", 0, 0, &payload)
+    }
+
     /// [`minimal_uncompressed_rgb3_heif`] with the pixel payload replaced by
     /// `compressed_payload` and a cmpC property (`compression_type`,
     /// whole-item units), so the decode path must decompress it.
@@ -7436,12 +7732,16 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        colr_icc_box, colr_nclx_box, hvcc_box, iinf_box, iloc_box, infe_box, iprp_box,
-        iref_dimg_box, meta_file, pitm_box,
+        colr_icc_box, colr_nclx_box, ftyp_box, hvcc_box, iinf_box, iloc_box, iloc_multi_extent_box,
+        infe_box, iprp_box, iref_dimg_box, ispe_box, meta_file, pitm_box, plain_box, uncc_v1_box,
     };
     use super::{
-        FourCc, IccColorProfile, NclxColorProfile, PrimaryItemColorProperties,
-        merge_primary_and_grid_tile_color_properties, primary_heic_color_properties,
+        ExtractUncompressedItemDataError, FourCc, IccColorProfile, NclxColorProfile,
+        ParseItemLocationBoxError, ParseItemPropertyAssociationBoxError,
+        PrimaryItemColorProperties, extract_primary_uncompressed_item_data,
+        extract_primary_uncompressed_item_data_from_source,
+        merge_primary_and_grid_tile_color_properties, parse_iloc_payload, parse_ipma_payload,
+        primary_heic_color_properties,
     };
 
     // -- Container-level colour resolution tests ----------------------------
@@ -7689,5 +7989,136 @@ mod tests {
             profile_type: FourCc::new(*b"prof"),
             profile,
         }
+    }
+
+    // -- Untrusted count / length rejection tests ---------------------------
+
+    #[test]
+    fn iloc_rejects_item_count_the_payload_cannot_encode() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0_u16.to_be_bytes()); // size fields: all zero
+        payload.extend_from_slice(&u32::MAX.to_be_bytes()); // item_count (v2)
+        let box_bytes = super::test_support::full_box(b"iloc", 2, 0, &payload);
+
+        let err = parse_iloc_payload(&box_bytes[8..], 0).expect_err("count must be rejected");
+        assert!(matches!(
+            err,
+            ParseItemLocationBoxError::ItemCountTooLarge {
+                item_count: u32::MAX,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn iloc_rejects_extent_totals_over_the_cap() {
+        // Two zero-width-extent items whose counts sum past the cap; each
+        // item record itself stays justifiable so the item-count check passes.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0_u16.to_be_bytes()); // all extent field sizes zero
+        payload.extend_from_slice(&2_u16.to_be_bytes()); // item_count (v0)
+        for (item_id, extent_count) in [(1_u16, 65535_u16), (2_u16, 2_u16)] {
+            payload.extend_from_slice(&item_id.to_be_bytes());
+            payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+            payload.extend_from_slice(&extent_count.to_be_bytes());
+        }
+        let box_bytes = super::test_support::full_box(b"iloc", 0, 0, &payload);
+
+        let err =
+            parse_iloc_payload(&box_bytes[8..], 0).expect_err("extent total must be rejected");
+        assert!(matches!(
+            err,
+            ParseItemLocationBoxError::ExtentCountTooLarge {
+                total_extents: 65537,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ipma_rejects_entry_count_the_payload_cannot_encode() {
+        let payload = u32::MAX.to_be_bytes();
+        let box_bytes = super::test_support::full_box(b"ipma", 0, 0, &payload);
+
+        let err = parse_ipma_payload(&box_bytes[8..], 0).expect_err("count must be rejected");
+        assert!(matches!(
+            err,
+            ParseItemPropertyAssociationBoxError::EntryCountTooLarge {
+                entry_count: u32::MAX,
+                ..
+            }
+        ));
+    }
+
+    fn uncompressed_rgb3_file_with_extents(extents: &[(u32, u32)], mdat_payload: &[u8]) -> Vec<u8> {
+        let ftyp = ftyp_box(b"mif1");
+        let shifted_extents = |mdat_offset: u32| {
+            extents
+                .iter()
+                .map(|(extent_offset, length)| (mdat_offset + extent_offset, *length))
+                .collect::<Vec<_>>()
+        };
+        let meta_with_offset = |mdat_offset: u32| {
+            meta_file(&[
+                pitm_box(1),
+                iloc_multi_extent_box(1, &shifted_extents(mdat_offset)),
+                iinf_box(&[infe_box(1, b"unci")]),
+                iprp_box(&[ispe_box(2, 1), uncc_v1_box(b"rgb3")], &[(1, &[1, 2])]),
+            ])
+        };
+        // The extent offsets are file-absolute and the iloc box length is
+        // fixed for a fixed extent list, so a placeholder pass yields the
+        // final layout.
+        let meta_len = meta_with_offset(0).len();
+        let mdat_offset = u32::try_from(ftyp.len() + meta_len + 8).unwrap();
+        let meta = meta_with_offset(mdat_offset);
+
+        let mut file = ftyp;
+        file.extend_from_slice(&meta);
+        file.extend_from_slice(&plain_box(b"mdat", mdat_payload));
+        file
+    }
+
+    #[test]
+    fn uncompressed_extract_rejects_out_of_bounds_extents() {
+        let file = uncompressed_rgb3_file_with_extents(&[(0, u32::MAX)], &[1, 2, 3, 4, 5, 6]);
+
+        let err =
+            extract_primary_uncompressed_item_data(&file).expect_err("extent must be rejected");
+        assert!(matches!(
+            err,
+            ExtractUncompressedItemDataError::ExtentOutOfBounds { .. }
+        ));
+    }
+
+    #[test]
+    fn uncompressed_extract_rejects_extent_sums_over_the_source() {
+        // Four in-bounds extents (each inside the large `mdat`) whose declared
+        // lengths together exceed the whole file size: overlapping extents
+        // are malformed, and the sum must be rejected before the payload
+        // pre-allocation.
+        let file = uncompressed_rgb3_file_with_extents(
+            &[(0, 200), (0, 200), (0, 200), (0, 200)],
+            &[7_u8; 300],
+        );
+
+        let err = extract_primary_uncompressed_item_data(&file).expect_err("sum must be rejected");
+        assert!(matches!(
+            err,
+            ExtractUncompressedItemDataError::PayloadTooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn uncompressed_extract_from_source_rejects_out_of_bounds_extents() {
+        let file = uncompressed_rgb3_file_with_extents(&[(0, u32::MAX)], &[1, 2, 3, 4, 5, 6]);
+        let mut source = crate::source::SliceSource::new(&file);
+
+        let err = extract_primary_uncompressed_item_data_from_source(&mut source, &file)
+            .expect_err("extent must be rejected");
+        assert!(matches!(
+            err,
+            ExtractUncompressedItemDataError::ExtentOutOfBounds { .. }
+        ));
     }
 }

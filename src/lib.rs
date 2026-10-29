@@ -7942,10 +7942,38 @@ fn extract_heic_item_payload_with_source(
     meta: &isobmff::MetaBox<'_>,
     location: &isobmff::ItemLocationItem,
 ) -> Option<Vec<u8>> {
-    let total_length = location
-        .extents
-        .iter()
-        .try_fold(0_u64, |acc, extent| acc.checked_add(extent.length))?;
+    // Resolve the extent source up front and validate every declared extent
+    // against it before pre-allocating from the sum of their lengths: each
+    // extent must lie inside the source, and the sum (overlapping extents
+    // included) must not exceed it.
+    let idat_payload: &[u8] = match location.construction_method {
+        0 => &[],
+        1 => {
+            let children = meta.parse_children().ok()?;
+            let idat_box = find_first_box_by_type(&children, IDAT_BOX_TYPE)?;
+            idat_box.payload
+        }
+        _ => return None,
+    };
+    let available = if location.construction_method == 1 {
+        idat_payload.len() as u64
+    } else if let Some(source) = source.as_ref() {
+        source.len()
+    } else {
+        input.len() as u64
+    };
+    let mut total_length = 0_u64;
+    for extent in &location.extents {
+        let start = location.base_offset.checked_add(extent.offset)?;
+        let end = start.checked_add(extent.length)?;
+        if end > available {
+            return None;
+        }
+        total_length = total_length.checked_add(extent.length)?;
+    }
+    if total_length > available {
+        return None;
+    }
     let payload_capacity = usize::try_from(total_length).ok()?;
     let mut payload = Vec::with_capacity(payload_capacity);
 
@@ -7958,9 +7986,7 @@ fn extract_heic_item_payload_with_source(
             }
         }
         1 => {
-            let children = meta.parse_children().ok()?;
-            let idat_box = find_first_box_by_type(&children, IDAT_BOX_TYPE)?;
-            append_heic_item_location_extents(idat_box.payload, location, &mut payload)?;
+            append_heic_item_location_extents(idat_payload, location, &mut payload)?;
         }
         _ => return None,
     }
@@ -7993,9 +8019,13 @@ fn append_heic_item_location_extents_from_source(
     location: &isobmff::ItemLocationItem,
     output: &mut Vec<u8>,
 ) -> Option<()> {
+    let available = source.len();
     for extent in &location.extents {
         let start = location.base_offset.checked_add(extent.offset)?;
-        start.checked_add(extent.length)?;
+        let end = start.checked_add(extent.length)?;
+        if end > available {
+            return None;
+        }
         let extent_len = usize::try_from(extent.length).ok()?;
         let output_start = output.len();
         let output_end = output_start.checked_add(extent_len)?;
