@@ -448,7 +448,10 @@ impl From<DecodeAvifError> for DecodeError {
 
 impl From<DecodeHeicError> for DecodeError {
     fn from(value: DecodeHeicError) -> Self {
-        Self::HeicDecode(value)
+        match value {
+            DecodeHeicError::Guardrail(error) => Self::Guardrail(error),
+            error => Self::HeicDecode(error),
+        }
     }
 }
 
@@ -1051,6 +1054,7 @@ impl From<isobmff::ExtractAvifItemDataError> for DecodeAvifError {
 /// Errors from HEIC primary-item bitstream assembly for decoder handoff.
 #[derive(Debug)]
 pub enum DecodeHeicError {
+    Guardrail(DecodeGuardrailError),
     AllocationFailed {
         stage: &'static str,
     },
@@ -1126,6 +1130,7 @@ impl DecodeHeicError {
     /// Return the stable high-level category for this HEIC decode failure.
     pub fn category(&self) -> DecodeErrorCategory {
         match self {
+            DecodeHeicError::Guardrail(error) => error.category(),
             DecodeHeicError::ParsePrimaryProperties(_)
             | DecodeHeicError::ParsePrimaryTransforms(_)
             | DecodeHeicError::ExtractPrimaryPayload(_) => DecodeErrorCategory::Parse,
@@ -1156,6 +1161,7 @@ impl DecodeHeicError {
 impl Display for DecodeHeicError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            DecodeHeicError::Guardrail(error) => Display::fmt(error, f),
             DecodeHeicError::AllocationFailed { stage } => write!(f, "{stage} allocation failed"),
             DecodeHeicError::ParsePrimaryProperties(err) => write!(f, "{err}"),
             DecodeHeicError::ParsePrimaryTransforms(err) => write!(f, "{err}"),

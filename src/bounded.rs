@@ -91,7 +91,8 @@ impl From<crate::heic_decoder::HevcError> for BoundedDecodeError {
     fn from(value: crate::heic_decoder::HevcError) -> Self {
         match value {
             crate::heic_decoder::HevcError::Unsupported(feature) => Self::Unsupported(feature),
-            crate::heic_decoder::HevcError::DecodingError("allocation failed") => {
+            crate::heic_decoder::HevcError::AllocationFailed
+            | crate::heic_decoder::HevcError::DecodingError("allocation failed") => {
                 Self::AllocationFailed
             }
             other => Self::Decode(other.to_string()),

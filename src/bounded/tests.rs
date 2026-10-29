@@ -259,6 +259,130 @@ fn nal_from_bits(header: &[u8], mut bits: Vec<bool>) -> Vec<u8> {
     result
 }
 
+fn sps_with_ctb_sizes(minimum: u32, difference: u32) -> Vec<u8> {
+    let nals = nal_sets();
+    let sps = crate::heic_decoder::hevc::bitstream::parse_single_nal(&nals[1]).unwrap();
+    let mut bits: Vec<bool> = sps
+        .payload
+        .iter()
+        .flat_map(|byte| (0..8).rev().map(move |i| byte & (1 << i) != 0))
+        .collect();
+    let mut cursor = 104;
+    for _ in 0..4 {
+        read_ue(&bits, &mut cursor);
+    }
+    assert!(!bits[cursor]);
+    cursor += 1;
+    for _ in 0..3 {
+        read_ue(&bits, &mut cursor);
+    }
+    cursor += 1;
+    for _ in 0..3 {
+        read_ue(&bits, &mut cursor);
+    }
+    let start = cursor;
+    read_ue(&bits, &mut cursor);
+    read_ue(&bits, &mut cursor);
+    let mut replacement = Vec::new();
+    write_ue(&mut replacement, minimum);
+    write_ue(&mut replacement, difference);
+    bits.splice(start..cursor, replacement);
+    nal_from_bits(&nals[1][..2], bits)
+}
+
+#[test]
+fn hevc_preflight_rejects_invalid_ctb_fields_without_panicking() {
+    for (minimum, difference) in [(0, 0), (0, 4), (0, 30), (253, 0), (0, 255), (255, 255)] {
+        let config = configuration(&sps_with_ctb_sizes(minimum, difference));
+        let input = fixture(&[config], &nal_sets()[3], &[]);
+        let crate::isobmff::HeicPrimaryItemDataWithGrid::Grid(grid) =
+            crate::isobmff::extract_primary_heic_item_data_with_grid(&input).unwrap()
+        else {
+            panic!("expected grid");
+        };
+        let tile = &grid.tiles[0];
+        let guardrails = crate::DecodeGuardrails::default();
+        for error in [
+            crate::geometry::preflight_grid(&grid, &guardrails).unwrap_err(),
+            crate::geometry::preflight_hevc(&tile.hvcc, &tile.payload, Some((16, 16)), &guardrails)
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.category(), crate::DecodeErrorCategory::MalformedInput);
+        }
+    }
+}
+
+#[test]
+fn hevc_preflight_accepts_legal_ctb_sizes() {
+    for (minimum, difference) in [(0, 1), (0, 2), (0, 3), (3, 0)] {
+        let config = configuration(&sps_with_ctb_sizes(minimum, difference));
+        let input = fixture(&[config], &nal_sets()[3], &[]);
+        let crate::isobmff::HeicPrimaryItemDataWithGrid::Grid(grid) =
+            crate::isobmff::extract_primary_heic_item_data_with_grid(&input).unwrap()
+        else {
+            panic!("expected grid");
+        };
+        let tile = &grid.tiles[0];
+        let guardrails = crate::DecodeGuardrails::default();
+        crate::geometry::preflight_grid(&grid, &guardrails).unwrap();
+        crate::geometry::preflight_hevc(&tile.hvcc, &tile.payload, Some((16, 16)), &guardrails)
+            .unwrap();
+    }
+}
+
+#[test]
+fn oversized_grid_with_invalid_ctb_returns_a_public_error() {
+    let sps =
+        hex("4201010408000003009fa800000300001ea000271084596e83caf2bc05a0200000030020000003032100");
+    let parsed = crate::hevc_sps_from_nal(&sps, 0).unwrap();
+    assert_eq!(parsed.pic_width_in_luma_samples, 20_000);
+    assert_eq!(parsed.log2_ctb_size(), 33);
+    let input = fixture(&[configuration(&sps)], &nal_sets()[3], &[]);
+    for error in [
+        crate::decode_primary_heic_to_image(&input).unwrap_err(),
+        crate::decode_primary_heic_to_metadata(&input).unwrap_err(),
+    ] {
+        assert_eq!(error.category(), crate::DecodeErrorCategory::MalformedInput);
+    }
+}
+
+#[test]
+fn grid_decoded_byte_limit_retains_public_resource_category() {
+    let mut filler = vec![0xff; 24 * 1024 * 1024];
+    filler[..2].copy_from_slice(&[0x4c, 0x01]);
+    *filler.last_mut().unwrap() = 0x80;
+    let input = fixture(&[configuration(&nal_sets()[1])], &filler, &[]);
+    for error in [
+        crate::decode_primary_heic_to_image(&input).unwrap_err(),
+        crate::decode_primary_heic_to_metadata(&input).unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            crate::DecodeHeicError::Guardrail(
+                crate::DecodeGuardrailError::DecodedByteCountExceeded {
+                    stage: "HEVC tile",
+                    ..
+                }
+            )
+        ));
+        assert_eq!(error.category(), crate::DecodeErrorCategory::ResourceLimit);
+        assert!(matches!(
+            crate::DecodeError::from(error),
+            crate::DecodeError::Guardrail(
+                crate::DecodeGuardrailError::DecodedByteCountExceeded { .. }
+            )
+        ));
+    }
+}
+
+#[test]
+fn legacy_hevc_allocation_failure_retains_bounded_error_variant() {
+    let error = BoundedDecodeError::from(crate::heic_decoder::HevcError::DecodingError(
+        "allocation failed",
+    ));
+    assert!(matches!(error, BoundedDecodeError::AllocationFailed));
+}
+
 #[cfg(not(feature = "decoder-tracing"))]
 fn scaling_list_parameter_set(parameter: usize, dc: i32, delta: i32, reference: u32) -> Vec<u8> {
     let nals = nal_sets();

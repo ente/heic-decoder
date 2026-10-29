@@ -29,11 +29,14 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 }
 
 #[test]
-fn hevc_frame_allocation_failure_returns_an_error() {
+fn hevc_frame_allocation_failure_retains_bounded_error_variant() {
     FAIL_ALLOCATION_AT.with(|limit| limit.set(Some(512)));
     let result = HeicFrame::try_with_params(16, 16, 8, 1);
     FAIL_ALLOCATION_AT.with(|limit| limit.set(None));
-    assert!(result.is_err());
+    assert!(matches!(
+        BoundedDecodeError::from(result.unwrap_err()),
+        BoundedDecodeError::AllocationFailed
+    ));
 }
 
 #[test]

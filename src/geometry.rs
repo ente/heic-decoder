@@ -3,6 +3,7 @@ use crate::*;
 pub(super) fn heic_error(error: DecodeError) -> DecodeHeicError {
     match error {
         DecodeError::HeicDecode(error) => error,
+        DecodeError::Guardrail(error) => DecodeHeicError::Guardrail(error),
         error => DecodeHeicError::InvalidDecodedFrame {
             detail: error.to_string(),
         },
@@ -51,6 +52,12 @@ fn check_sps(
     expected: Option<(u32, u32)>,
     guardrails: &DecodeGuardrails,
 ) -> Result<u64, DecodeError> {
+    let log2_ctb_size = u16::from(sps.log2_min_luma_coding_block_size_minus3)
+        + 3
+        + u16::from(sps.log2_diff_max_min_luma_coding_block_size);
+    if !(4..=6).contains(&log2_ctb_size) {
+        return Err(invalid("HEVC CTB exponent must be between 4 and 6"));
+    }
     let metadata = hevc_metadata_from_sps(sps)?;
     guardrails.enforce_pixel_count(
         sps.pic_width_in_luma_samples,
