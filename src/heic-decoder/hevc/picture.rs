@@ -133,6 +133,7 @@ impl DecodedFrame {
     ///
     /// # Panics
     /// Panics if width * height overflows u32.
+    #[cfg(test)]
     pub(crate) fn with_params(width: u32, height: u32, bit_depth: u8, chroma_format: u8) -> Self {
         Self::try_with_params(width, height, bit_depth, chroma_format)
             .expect("frame allocation failed")
@@ -146,7 +147,8 @@ impl DecodedFrame {
     ) -> super::Result<Self> {
         let luma_size = width
             .checked_mul(height)
-            .expect("frame dimensions overflow") as usize;
+            .ok_or(super::HevcError::DecodingError("frame dimensions overflow"))?
+            as usize;
 
         let (chroma_width, chroma_height) = match chroma_format {
             0 => (0, 0),                                  // Monochrome
@@ -156,11 +158,21 @@ impl DecodedFrame {
             _ => (width.div_ceil(2), height.div_ceil(2)),
         };
 
-        let chroma_size = (chroma_width * chroma_height) as usize;
+        let chroma_size =
+            chroma_width
+                .checked_mul(chroma_height)
+                .ok_or(super::HevcError::DecodingError(
+                    "chroma dimensions overflow",
+                ))? as usize;
 
         let deblock_stride = width.div_ceil(4);
         let deblock_height = height.div_ceil(4);
-        let deblock_size = (deblock_stride * deblock_height) as usize;
+        let deblock_size =
+            deblock_stride
+                .checked_mul(deblock_height)
+                .ok_or(super::HevcError::DecodingError(
+                    "deblock dimensions overflow",
+                ))? as usize;
 
         Ok(Self {
             width,

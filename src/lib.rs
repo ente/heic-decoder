@@ -46,7 +46,11 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 
+mod av1_geometry;
 mod bounded;
+mod geometry;
+#[cfg(test)]
+mod geometry_tests;
 #[cfg(feature = "incremental-experiment")]
 pub use bounded::incremental::decode as decode_incremental_experiment;
 #[path = "heic-decoder/mod.rs"]
@@ -105,6 +109,11 @@ pub enum DecodeGuardrailError {
         actual_pixels: u64,
         max_pixels: u64,
     },
+    DecodedByteCountExceeded {
+        stage: &'static str,
+        actual_bytes: u64,
+        max_decoded_bytes: u64,
+    },
     TempSpoolLimitExceeded {
         attempted_bytes: u64,
         max_temp_spool_bytes: u64,
@@ -143,6 +152,14 @@ impl Display for DecodeGuardrailError {
             } => write!(
                 f,
                 "decoded image exceeds configured max_pixels: got {actual_pixels} pixels ({width}x{height}), max is {max_pixels}"
+            ),
+            DecodeGuardrailError::DecodedByteCountExceeded {
+                stage,
+                actual_bytes,
+                max_decoded_bytes,
+            } => write!(
+                f,
+                "{stage} estimated decoded storage exceeds limit: got {actual_bytes} bytes, max is {max_decoded_bytes}"
             ),
             DecodeGuardrailError::TempSpoolLimitExceeded {
                 attempted_bytes,
@@ -422,7 +439,10 @@ impl From<DecodeGuardrailError> for DecodeError {
 
 impl From<DecodeAvifError> for DecodeError {
     fn from(value: DecodeAvifError) -> Self {
-        Self::AvifDecode(value)
+        match value {
+            DecodeAvifError::Guardrail(error) => Self::Guardrail(error),
+            error => Self::AvifDecode(error),
+        }
     }
 }
 
@@ -801,6 +821,7 @@ impl<'a> LengthPrefixedHevcNalUnit<'a> {
 /// Errors from the AVIF decode path and internal image model conversion.
 #[derive(Debug)]
 pub enum DecodeAvifError {
+    Guardrail(DecodeGuardrailError),
     ParsePrimaryProperties(isobmff::ParsePrimaryAvifPropertiesError),
     ParsePrimaryTransforms(isobmff::ParsePrimaryItemTransformPropertiesError),
     ExtractPrimaryPayload(isobmff::ExtractAvifItemDataError),
@@ -873,6 +894,7 @@ impl DecodeAvifError {
     /// Return the stable high-level category for this AVIF decode failure.
     pub fn category(&self) -> DecodeErrorCategory {
         match self {
+            DecodeAvifError::Guardrail(error) => error.category(),
             DecodeAvifError::ParsePrimaryProperties(_)
             | DecodeAvifError::ParsePrimaryTransforms(_)
             | DecodeAvifError::ExtractPrimaryPayload(_) => DecodeErrorCategory::Parse,
@@ -901,6 +923,7 @@ impl DecodeAvifError {
 impl Display for DecodeAvifError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            DecodeAvifError::Guardrail(error) => write!(f, "{error}"),
             DecodeAvifError::ParsePrimaryProperties(err) => write!(f, "{err}"),
             DecodeAvifError::ParsePrimaryTransforms(err) => write!(f, "{err}"),
             DecodeAvifError::ExtractPrimaryPayload(err) => write!(f, "{err}"),
@@ -1028,6 +1051,9 @@ impl From<isobmff::ExtractAvifItemDataError> for DecodeAvifError {
 /// Errors from HEIC primary-item bitstream assembly for decoder handoff.
 #[derive(Debug)]
 pub enum DecodeHeicError {
+    AllocationFailed {
+        stage: &'static str,
+    },
     ParsePrimaryProperties(isobmff::ParsePrimaryHeicPropertiesError),
     ParsePrimaryTransforms(isobmff::ParsePrimaryItemTransformPropertiesError),
     ExtractPrimaryPayload(isobmff::ExtractHeicItemDataError),
@@ -1104,6 +1130,7 @@ impl DecodeHeicError {
             | DecodeHeicError::ParsePrimaryTransforms(_)
             | DecodeHeicError::ExtractPrimaryPayload(_) => DecodeErrorCategory::Parse,
             DecodeHeicError::BackendDecodeFailed { .. } => DecodeErrorCategory::DecoderBackend,
+            DecodeHeicError::AllocationFailed { .. } => DecodeErrorCategory::ResourceLimit,
             DecodeHeicError::UnsupportedMatrixCoefficients { .. } => {
                 DecodeErrorCategory::UnsupportedFeature
             }
@@ -1129,6 +1156,7 @@ impl DecodeHeicError {
 impl Display for DecodeHeicError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            DecodeHeicError::AllocationFailed { stage } => write!(f, "{stage} allocation failed"),
             DecodeHeicError::ParsePrimaryProperties(err) => write!(f, "{err}"),
             DecodeHeicError::ParsePrimaryTransforms(err) => write!(f, "{err}"),
             DecodeHeicError::ExtractPrimaryPayload(err) => write!(f, "{err}"),
@@ -1325,7 +1353,7 @@ fn decode_primary_avif_to_image_internal(
     source: &mut Option<&mut dyn RandomAccessSource>,
 ) -> Result<DecodedAvifImage, DecodeAvifError> {
     let (meta, resolved) = isobmff::resolve_primary_avif_item_graph(input)?;
-    decode_primary_avif_to_image_from_resolved_graph(input, source, &meta, &resolved)
+    decode_primary_avif_to_image_from_resolved_graph(input, source, &meta, &resolved, None)
 }
 
 fn decode_primary_avif_to_image_from_resolved_graph(
@@ -1333,6 +1361,7 @@ fn decode_primary_avif_to_image_from_resolved_graph(
     source: &mut Option<&mut dyn RandomAccessSource>,
     meta: &isobmff::MetaBox<'_>,
     resolved: &isobmff::ResolvedPrimaryItemGraph<'_>,
+    max_pixels: Option<u64>,
 ) -> Result<DecodedAvifImage, DecodeAvifError> {
     // Provenance: mirrors libheif configuration+payload bitstream assembly in
     // libheif/libheif/codecs/decoder.cc:Decoder::get_compressed_data and
@@ -1367,7 +1396,11 @@ fn decode_primary_avif_to_image_from_resolved_graph(
     let mut elementary_stream = properties.av1c.config_obus;
     elementary_stream.extend_from_slice(&payload);
 
-    let mut decoded = decode_av1_bitstream_to_image(&elementary_stream)?;
+    let mut decoded = decode_av1_bitstream_to_image(
+        &elementary_stream,
+        Some((properties.ispe.width, properties.ispe.height)),
+        max_pixels,
+    )?;
     decoded.ycbcr_range = ycbcr_range;
     decoded.ycbcr_matrix = ycbcr_matrix;
     if decoded.width != properties.ispe.width || decoded.height != properties.ispe.height {
@@ -1386,6 +1419,7 @@ fn decode_primary_avif_to_image_from_resolved_graph(
         resolved,
         decoded.width,
         decoded.height,
+        max_pixels,
     );
 
     Ok(decoded)
@@ -4092,6 +4126,8 @@ fn decode_primary_heic_coded_item_with_alpha(
     item_data: &isobmff::HeicPrimaryItemData,
     guardrails: &DecodeGuardrails,
 ) -> Result<(DecodedHeicImage, Option<HeicAuxiliaryAlphaPlane>), DecodeError> {
+    let properties = parse_and_validate_heic_coded_item_preflight(input, item_data)?;
+    geometry::preflight_hevc(&properties.hvcc, &item_data.payload, None, guardrails)?;
     let decoded = decode_primary_heic_coded_item_to_image(input, item_data)?;
     guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
     let auxiliary_alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
@@ -4099,7 +4135,8 @@ fn decode_primary_heic_coded_item_with_alpha(
         source,
         decoded.width,
         decoded.height,
-    );
+        guardrails,
+    )?;
     Ok((decoded, auxiliary_alpha))
 }
 
@@ -4111,16 +4148,15 @@ fn decode_primary_heic_grid_auxiliary_alpha(
     grid_data: &isobmff::HeicGridPrimaryItemData,
     guardrails: &DecodeGuardrails,
 ) -> Result<Option<HeicAuxiliaryAlphaPlane>, DecodeError> {
-    guardrails.enforce_pixel_count(
-        grid_data.descriptor.output_width,
-        grid_data.descriptor.output_height,
-    )?;
-    Ok(decode_primary_heic_auxiliary_alpha_plane_internal(
+    geometry::preflight_grid(grid_data, guardrails)?;
+    decode_primary_heic_auxiliary_alpha_plane_internal(
         input,
         source,
         grid_data.descriptor.output_width,
         grid_data.descriptor.output_height,
-    ))
+        guardrails,
+    )
+    .map_err(DecodeError::from)
 }
 
 fn decoded_heic_image_to_metadata(decoded: &DecodedHeicImage) -> DecodedHeicImageMetadata {
@@ -4182,6 +4218,8 @@ fn decode_primary_heic_grid_to_image(
         });
     }
 
+    geometry::preflight_grid(grid_data, &DecodeGuardrails::default())
+        .map_err(geometry::heic_error)?;
     let first_tile = decode_heic_grid_tile_to_image(&grid_data.tiles[0])?;
     let tile_width = first_tile.width;
     let tile_height = first_tile.height;
@@ -4206,10 +4244,8 @@ fn decode_primary_heic_grid_to_image(
 
 #[cfg(feature = "parallel-grid")]
 const MAX_GRID_TILE_DECODE_THREADS: usize = 8;
-#[cfg(feature = "parallel-grid")]
 const GRID_TILE_DECODE_MEMORY_BUDGET: u64 = 64 * 1024 * 1024;
 
-#[cfg(feature = "parallel-grid")]
 #[derive(Default)]
 struct HeicGridTileStreamMemoryEstimate {
     normalized_stream_bytes: u64,
@@ -4218,7 +4254,6 @@ struct HeicGridTileStreamMemoryEstimate {
     nal_count: u64,
 }
 
-#[cfg(feature = "parallel-grid")]
 impl HeicGridTileStreamMemoryEstimate {
     fn add_nal(&mut self, nal_unit: &[u8]) -> Result<(), DecodeHeicError> {
         let nal_size =
@@ -4273,7 +4308,6 @@ impl HeicGridTileStreamMemoryEstimate {
     }
 }
 
-#[cfg(feature = "parallel-grid")]
 fn conservative_vec_storage_bytes(element_count: u64, element_size: usize) -> u64 {
     if element_count == 0 {
         return 0;
@@ -4284,7 +4318,6 @@ fn conservative_vec_storage_bytes(element_count: u64, element_size: usize) -> u6
         .saturating_mul(element_size as u64)
 }
 
-#[cfg(feature = "parallel-grid")]
 fn count_hevc_emulation_prevention_bytes(bytes: &[u8]) -> u64 {
     let mut count = 0_u64;
     let mut cursor = 0_usize;
@@ -4303,7 +4336,6 @@ fn count_hevc_emulation_prevention_bytes(bytes: &[u8]) -> u64 {
     count
 }
 
-#[cfg(feature = "parallel-grid")]
 fn estimate_heic_grid_sps_decode_bytes(
     sps: &heic_decoder::hevc::params::Sps,
 ) -> Result<u64, DecodeHeicError> {
@@ -4884,6 +4916,8 @@ fn decode_and_validate_heic_grid_first_tile(
             .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
                 detail: "grid tile list cannot be empty".to_string(),
             })?;
+    geometry::preflight_grid(grid_data, &DecodeGuardrails::default())
+        .map_err(geometry::heic_error)?;
     let first_tile = decode_heic_grid_tile_to_image(first_tile_data)?;
     validate_decoded_heic_grid_first_tile(&grid_data.descriptor, &first_tile)?;
     let source_bit_depth = heic_bit_depth_for_png_conversion(&first_tile)?;
@@ -6648,10 +6682,14 @@ fn decode_hevc_stream_to_image(stream: &[u8]) -> Result<DecodedHeicImage, Decode
         return Err(DecodeHeicError::MissingVclNalUnit);
     }
 
-    let decoded =
-        heic_decoder::hevc::decode(stream).map_err(|err| DecodeHeicError::BackendDecodeFailed {
+    let decoded = heic_decoder::hevc::decode(stream).map_err(|err| match err {
+        heic_decoder::HevcError::AllocationFailed => DecodeHeicError::AllocationFailed {
+            stage: "HEVC frame",
+        },
+        err => DecodeHeicError::BackendDecodeFailed {
             detail: err.to_string(),
-        })?;
+        },
+    })?;
     heic_frame_to_internal_image(decoded)
 }
 
@@ -6850,7 +6888,10 @@ fn extract_cropped_heic_plane(
             detail: format!("{plane} plane sample count overflow for {width_usize}x{height_usize}"),
         }
     })?;
-    let mut samples = Vec::with_capacity(expected_samples);
+    let mut samples = Vec::new();
+    samples
+        .try_reserve_exact(expected_samples)
+        .map_err(|_| DecodeHeicError::AllocationFailed { stage: plane })?;
 
     for row in 0..height_usize {
         let src_row = crop_top_usize.checked_add(row).ok_or_else(|| {
@@ -7062,7 +7103,6 @@ fn hevc_sps_from_hvcc_nal_arrays(
 
 /// Visit hvcC and in-stream NAL units in the same order used to assemble the
 /// decoder stream. Returning `true` stops the walk after the current unit.
-#[cfg(feature = "parallel-grid")]
 fn walk_hevc_nals_from_hvcc_or_payload(
     hvcc: &isobmff::HevcDecoderConfigurationBox,
     payload: &[u8],
@@ -7628,6 +7668,7 @@ fn decode_primary_avif_auxiliary_alpha_plane(
     resolved: &isobmff::ResolvedPrimaryItemGraph<'_>,
     expected_width: u32,
     expected_height: u32,
+    max_pixels: Option<u64>,
 ) -> Option<AvifAuxiliaryAlphaPlane> {
     // Provenance: mirrors libheif auxiliary alpha linkage in
     // libheif/libheif/context.cc (`auxl` reference direction and aux-type
@@ -7650,6 +7691,8 @@ fn decode_primary_avif_auxiliary_alpha_plane(
             meta,
             resolved,
             reference.from_item_id,
+            (expected_width, expected_height),
+            max_pixels,
         ) else {
             continue;
         };
@@ -7668,7 +7711,10 @@ fn decode_auxiliary_alpha_avif_item_candidate<'a>(
     meta: &isobmff::MetaBox<'a>,
     resolved: &isobmff::ResolvedPrimaryItemGraph<'a>,
     item_id: u32,
+    expected: (u32, u32),
+    max_pixels: Option<u64>,
 ) -> Option<AvifAuxiliaryAlphaPlane> {
+    let (expected_width, expected_height) = expected;
     let item_info = resolved
         .iinf
         .entries
@@ -7689,6 +7735,15 @@ fn decode_auxiliary_alpha_avif_item_candidate<'a>(
     }
 
     let properties = resolved_item_properties_for_item(resolved, item_id)?;
+    if let Some(property) = properties
+        .iter()
+        .find(|property| property.header.box_type.as_bytes() == *b"ispe")
+    {
+        let ispe = property.parse_ispe().ok()?;
+        if (ispe.width, ispe.height) != (expected_width, expected_height) {
+            return None;
+        }
+    }
     if !properties
         .iter()
         .any(property_is_alpha_auxiliary_type_property)
@@ -7705,7 +7760,12 @@ fn decode_auxiliary_alpha_avif_item_candidate<'a>(
     let mut elementary_stream = av1c.config_obus;
     elementary_stream.extend_from_slice(&payload);
 
-    let decoded = decode_av1_bitstream_to_image(&elementary_stream).ok()?;
+    let decoded = decode_av1_bitstream_to_image(
+        &elementary_stream,
+        Some((expected_width, expected_height)),
+        max_pixels,
+    )
+    .ok()?;
     let expected_alpha_samples = sample_count(decoded.width, decoded.height, "alpha").ok()?;
     let alpha_samples = decoded.y_plane.samples;
     let actual_alpha_samples = match &alpha_samples {
@@ -7737,15 +7797,26 @@ fn decode_primary_heic_auxiliary_alpha_plane_internal(
     source: &mut Option<&mut dyn RandomAccessSource>,
     expected_width: u32,
     expected_height: u32,
-) -> Option<HeicAuxiliaryAlphaPlane> {
+    guardrails: &DecodeGuardrails,
+) -> Result<Option<HeicAuxiliaryAlphaPlane>, DecodeHeicError> {
     // Provenance: mirrors libheif auxiliary alpha linkage in
     // libheif/libheif/context.cc (auxl reference direction, auxC alpha-type
     // filtering) and auxC payload parsing in libheif/libheif/box.cc:Box_auxC::parse.
-    let top_level = isobmff::parse_boxes(input).ok()?;
-    let meta_box = find_first_box_by_type(&top_level, META_BOX_TYPE)?;
-    let meta = meta_box.parse_meta().ok()?;
-    let resolved = meta.resolve_primary_item().ok()?;
-    let iref = resolved.iref.as_ref()?;
+    let Ok(top_level) = isobmff::parse_boxes(input) else {
+        return Ok(None);
+    };
+    let Some(meta_box) = find_first_box_by_type(&top_level, META_BOX_TYPE) else {
+        return Ok(None);
+    };
+    let Ok(meta) = meta_box.parse_meta() else {
+        return Ok(None);
+    };
+    let Ok(resolved) = meta.resolve_primary_item() else {
+        return Ok(None);
+    };
+    let Some(iref) = resolved.iref.as_ref() else {
+        return Ok(None);
+    };
     let primary_item_id = resolved.primary_item.item_id;
 
     for reference in &iref.references {
@@ -7762,17 +7833,20 @@ fn decode_primary_heic_auxiliary_alpha_plane_internal(
             &meta,
             &resolved,
             reference.from_item_id,
-        ) else {
+            (expected_width, expected_height),
+            guardrails,
+        )?
+        else {
             continue;
         };
 
         if alpha_plane.width != expected_width || alpha_plane.height != expected_height {
             continue;
         }
-        return Some(alpha_plane);
+        return Ok(Some(alpha_plane));
     }
 
-    None
+    Ok(None)
 }
 
 fn decode_auxiliary_alpha_item_candidate<'a>(
@@ -7781,7 +7855,44 @@ fn decode_auxiliary_alpha_item_candidate<'a>(
     meta: &isobmff::MetaBox<'a>,
     resolved: &isobmff::ResolvedPrimaryItemGraph<'a>,
     item_id: u32,
-) -> Option<HeicAuxiliaryAlphaPlane> {
+    expected: (u32, u32),
+    guardrails: &DecodeGuardrails,
+) -> Result<Option<HeicAuxiliaryAlphaPlane>, DecodeHeicError> {
+    let Some(stream) = prepare_auxiliary_alpha_hevc_stream(
+        input, source, meta, resolved, item_id, expected, guardrails,
+    ) else {
+        return Ok(None);
+    };
+    let decoded = match decode_hevc_stream_to_image(&stream) {
+        Ok(decoded) => decoded,
+        Err(error @ DecodeHeicError::AllocationFailed { .. }) => return Err(error),
+        Err(_) => return Ok(None),
+    };
+    let Some(expected_samples) = heic_sample_count(decoded.width, decoded.height, "alpha").ok()
+    else {
+        return Ok(None);
+    };
+    if decoded.y_plane.samples.len() != expected_samples {
+        return Ok(None);
+    }
+    Ok(Some(HeicAuxiliaryAlphaPlane {
+        width: decoded.width,
+        height: decoded.height,
+        bit_depth: decoded.bit_depth_luma,
+        samples: decoded.y_plane.samples,
+    }))
+}
+
+fn prepare_auxiliary_alpha_hevc_stream<'a>(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+    meta: &isobmff::MetaBox<'a>,
+    resolved: &isobmff::ResolvedPrimaryItemGraph<'a>,
+    item_id: u32,
+    expected: (u32, u32),
+    guardrails: &DecodeGuardrails,
+) -> Option<Vec<u8>> {
+    let (expected_width, expected_height) = expected;
     let item_info = resolved
         .iinf
         .entries
@@ -7815,20 +7926,25 @@ fn decode_auxiliary_alpha_item_candidate<'a>(
         .parse_hvcc()
         .ok()?;
 
-    let payload = extract_heic_item_payload_with_source(input, source, meta, location)?;
-    let stream = assemble_heic_hevc_stream_from_components(&hvcc, &payload).ok()?;
-    let decoded = decode_hevc_stream_to_image(&stream).ok()?;
-    let expected_alpha_samples = heic_sample_count(decoded.width, decoded.height, "alpha").ok()?;
-    if decoded.y_plane.samples.len() != expected_alpha_samples {
-        return None;
+    if let Some(property) = properties
+        .iter()
+        .find(|property| property.header.box_type.as_bytes() == *b"ispe")
+    {
+        let ispe = property.parse_ispe().ok()?;
+        if (ispe.width, ispe.height) != (expected_width, expected_height) {
+            return None;
+        }
     }
-
-    Some(HeicAuxiliaryAlphaPlane {
-        width: decoded.width,
-        height: decoded.height,
-        bit_depth: decoded.bit_depth_luma,
-        samples: decoded.y_plane.samples,
-    })
+    let payload = extract_heic_item_payload_with_source(input, source, meta, location)?;
+    geometry::preflight_hevc(
+        &hvcc,
+        &payload,
+        Some((expected_width, expected_height)),
+        guardrails,
+    )
+    .ok()?;
+    let stream = assemble_heic_hevc_stream_from_components(&hvcc, &payload).ok()?;
+    Some(stream)
 }
 
 fn resolved_item_properties_for_item<'a>(
@@ -7996,7 +8112,13 @@ fn decode_avif_to_rgba_from_resolved_graph(
     let transforms = isobmff::parse_primary_item_transform_properties_from_resolved_graph(resolved)
         .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
     let icc_profile = primary_icc_profile_from_resolved_avif_graph(resolved);
-    let decoded = decode_primary_avif_to_image_from_resolved_graph(input, source, meta, resolved)?;
+    let decoded = decode_primary_avif_to_image_from_resolved_graph(
+        input,
+        source,
+        meta,
+        resolved,
+        guardrails.max_pixels,
+    )?;
     guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
     decoded_avif_to_rgba_image(&decoded, &transforms.transforms, icc_profile)
 }
@@ -8134,6 +8256,7 @@ fn decode_primary_heic_to_rgb8_from_resolved_input(
                 grid_data.descriptor.output_width,
                 grid_data.descriptor.output_height,
             )?;
+            geometry::preflight_grid(&grid_data, &guardrails)?;
             decode_primary_heic_grid_to_rgb8_image(&grid_data, transforms, icc_profile)
         }
         isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
@@ -9121,8 +9244,13 @@ fn decode_avif_bytes_to_rgba8_slice(
         isobmff::parse_primary_item_transform_properties_from_resolved_graph(&resolved)
             .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
     let mut source: Option<&mut dyn RandomAccessSource> = None;
-    let decoded =
-        decode_primary_avif_to_image_from_resolved_graph(input, &mut source, &meta, &resolved)?;
+    let decoded = decode_primary_avif_to_image_from_resolved_graph(
+        input,
+        &mut source,
+        &meta,
+        &resolved,
+        guardrails.max_pixels,
+    )?;
     guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
     decoded_avif_to_rgba8_slice(&decoded, &transforms.transforms, out)
 }
@@ -9139,8 +9267,13 @@ fn decode_avif_bytes_to_rgba16_native_endian_bytes(
         isobmff::parse_primary_item_transform_properties_from_resolved_graph(&resolved)
             .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
     let mut source: Option<&mut dyn RandomAccessSource> = None;
-    let decoded =
-        decode_primary_avif_to_image_from_resolved_graph(input, &mut source, &meta, &resolved)?;
+    let decoded = decode_primary_avif_to_image_from_resolved_graph(
+        input,
+        &mut source,
+        &meta,
+        &resolved,
+        guardrails.max_pixels,
+    )?;
     guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
     let mut output = NativeEndianRgba16Output(out);
     decoded_avif_to_rgba16_output(&decoded, &transforms.transforms, &mut output)
@@ -13226,7 +13359,44 @@ fn avif_probe_source_bit_depth(
     av1_sequence_header_bit_depth(&payload).ok_or(DecodeAvifError::MissingSequenceHeader)
 }
 
-fn decode_av1_bitstream_to_image(bitstream: &[u8]) -> Result<DecodedAvifImage, DecodeAvifError> {
+fn decode_av1_bitstream_to_image(
+    bitstream: &[u8],
+    expected: Option<(u32, u32)>,
+    max_pixels: Option<u64>,
+) -> Result<DecodedAvifImage, DecodeAvifError> {
+    let enforce_pixels = |width: u32, height: u32| {
+        let actual_pixels = u64::from(width) * u64::from(height);
+        if let Some(max_pixels) = max_pixels
+            && actual_pixels > max_pixels
+        {
+            return Err(DecodeAvifError::Guardrail(
+                DecodeGuardrailError::PixelCountExceeded {
+                    width,
+                    height,
+                    actual_pixels,
+                    max_pixels,
+                },
+            ));
+        }
+        Ok(())
+    };
+    if let Some((width, height)) = expected {
+        enforce_pixels(width, height)?;
+    }
+    if let Some((width, height)) = av1_geometry::coded_dimensions(bitstream)? {
+        enforce_pixels(width, height)?;
+        if let Some((expected_width, expected_height)) = expected
+            && (width, height) != (expected_width, expected_height)
+        {
+            return Err(DecodeAvifError::DecodedGeometryMismatch {
+                expected_width,
+                expected_height,
+                actual_width: width,
+                actual_height: height,
+            });
+        }
+    }
+
     let mut settings = MaybeUninit::<Dav1dSettings>::uninit();
     // SAFETY: `dav1d_default_settings` writes a full valid `Dav1dSettings`.
     unsafe { dav1d_default_settings(NonNull::new_unchecked(settings.as_mut_ptr())) };
@@ -13234,6 +13404,13 @@ fn decode_av1_bitstream_to_image(bitstream: &[u8]) -> Result<DecodedAvifImage, D
     let mut settings = unsafe { settings.assume_init() };
     settings.n_threads = 1;
     settings.max_frame_delay = 1;
+    let expected_pixels = expected.map(|(width, height)| u64::from(width) * u64::from(height));
+    let frame_limit = max_pixels
+        .into_iter()
+        .chain(expected_pixels)
+        .min()
+        .unwrap_or(u64::from(u32::MAX));
+    settings.frame_size_limit = frame_limit.clamp(1, u64::from(u32::MAX)) as u32;
 
     let mut context = DecoderContextGuard::default();
     let open_result = unsafe {

@@ -97,12 +97,12 @@ fn decode_nal_units(nal_units: &[bitstream::NalUnit<'_>]) -> Result<DecodedFrame
     }
 
     // Create frame buffer with actual bit depth and chroma format from SPS
-    let mut frame = DecodedFrame::with_params(
+    let mut frame = DecodedFrame::try_with_params(
         sps.pic_width_in_luma_samples,
         sps.pic_height_in_luma_samples,
         sps.bit_depth_y(),
         sps.chroma_format_idc,
-    );
+    )?;
     frame.full_range = sps.video_full_range_flag;
     frame.matrix_coeffs = sps.matrix_coeffs;
     frame.colour_primaries = sps.colour_primaries;
