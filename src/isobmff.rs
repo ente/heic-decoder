@@ -7250,6 +7250,66 @@ pub(crate) mod test_support {
         full_box(b"uncC", 1, 0, profile)
     }
 
+    /// cmpC v0: compression FourCC plus compressed_unit_type.
+    pub(crate) fn cmpc_box(compression_type: &[u8; 4], compressed_unit_type: u8) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(compression_type);
+        payload.push(compressed_unit_type);
+        full_box(b"cmpC", 0, 0, &payload)
+    }
+
+    /// icef v0 with implied cumulative offsets and 8-bit unit sizes: one
+    /// `[size]` byte per unit.
+    pub(crate) fn icef_implied_box(unit_sizes: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(0); // codes: offset code 0 (implied), size code 0 (8-bit)
+        payload.extend_from_slice(&u32::try_from(unit_sizes.len()).unwrap().to_be_bytes());
+        payload.extend_from_slice(unit_sizes);
+        full_box(b"icef", 0, 0, &payload)
+    }
+
+    /// [`minimal_uncompressed_rgb3_heif`] with the pixel payload replaced by
+    /// `compressed_payload` and a cmpC property (`compression_type`,
+    /// whole-item units), so the decode path must decompress it.
+    pub(crate) fn minimal_uncompressed_rgb3_heif_generic_compression(
+        compression_type: &[u8; 4],
+        compressed_payload: &[u8],
+    ) -> Vec<u8> {
+        let ftyp = ftyp_box(b"mif1");
+        let meta_with_payload_offset = |payload_offset: u32| {
+            meta_file(&[
+                pitm_box(1),
+                iloc_with_extent_box(&[(
+                    1,
+                    payload_offset,
+                    u32::try_from(compressed_payload.len()).unwrap(),
+                )]),
+                iinf_box(&[infe_box(1, b"unci")]),
+                iprp_box(
+                    &[
+                        ispe_box(2, 1),
+                        uncc_v1_box(b"rgb3"),
+                        cmpc_box(compression_type, 0),
+                    ],
+                    &[(1, &[1, 2, 3])],
+                ),
+            ])
+        };
+        // The iloc extent offset is file-absolute and all iloc fields are
+        // fixed-size, so a first pass with a placeholder offset yields the
+        // final layout to compute the real offset from.
+        let meta_len = meta_with_payload_offset(0).len();
+        let mdat_header_len = 8;
+        let payload_offset = u32::try_from(ftyp.len() + meta_len + mdat_header_len).unwrap();
+        let meta = meta_with_payload_offset(payload_offset);
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&meta);
+        file.extend_from_slice(&plain_box(b"mdat", compressed_payload));
+        file
+    }
+
     /// A complete, decodable uncompressed HEIF file: `mif1` brand, a 2x1
     /// `unci` primary item with the version-1 `rgb3` (8-bit interleaved RGB)
     /// profile, and the pixel payload in a trailing `mdat`.
