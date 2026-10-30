@@ -26,9 +26,6 @@ const CMPD_BOX_TYPE: [u8; 4] = *b"cmpd";
 const UNCC_BOX_TYPE: [u8; 4] = *b"uncC";
 const CMPC_BOX_TYPE: [u8; 4] = *b"cmpC";
 const ICEF_BOX_TYPE: [u8; 4] = *b"icef";
-// iloc extent entries can legally be zero bytes wide (all size fields 0), so
-// an extent count cannot always be validated against the payload size; this
-// cap bounds what declared counts may pre-allocate.
 const MAX_ILOC_EXTENTS: usize = 65536;
 const COLR_BOX_TYPE: [u8; 4] = *b"colr";
 const IROT_BOX_TYPE: [u8; 4] = *b"irot";
@@ -4072,10 +4069,6 @@ pub(crate) fn extract_avif_item_payload_from_location(
         });
     }
 
-    // Resolve the extent source up front and validate every declared extent
-    // against it before pre-allocating from the sum of their lengths: each
-    // extent must lie inside the source, and the sum (overlapping extents
-    // included) must not exceed it.
     let idat_payload: &[u8] = match location.construction_method {
         0 => &[],
         1 => {
@@ -4254,10 +4247,6 @@ fn extract_primary_uncompressed_item_data_internal(
         );
     }
 
-    // Resolve the extent source up front and validate every declared extent
-    // against it before pre-allocating from the sum of their lengths: each
-    // extent must lie inside the source, and the sum (overlapping extents
-    // included) must not exceed it.
     let idat_payload: &[u8] = match location.construction_method {
         0 => &[],
         1 => {
@@ -4859,10 +4848,6 @@ fn extract_heic_item_payload_from_location(
         });
     }
 
-    // Resolve the extent source up front and validate every declared extent
-    // against it before pre-allocating from the sum of their lengths: each
-    // extent must lie inside the source, and the sum (overlapping extents
-    // included) must not exceed it.
     let idat_payload: &[u8] = match location.construction_method {
         0 => &[],
         1 => {
@@ -5532,8 +5517,6 @@ fn parse_hvcc_payload(
             payload_offset,
             "nal_unit_count",
         )?);
-        // Clamp the pre-allocation to what the remaining payload can encode
-        // (each unit consumes at least its 2-byte length field).
         let nal_capacity = nal_unit_count.min((payload.len() - cursor) / 2);
         let mut nal_units = Vec::with_capacity(nal_capacity);
         for _ in 0..nal_unit_count {
@@ -6260,16 +6243,13 @@ fn parse_iloc_payload(
         read_u32_cursor(iloc_payload, &mut cursor, iloc_payload_offset, "item_count")?
     };
 
-    // Each item record consumes at least its fixed-size fields, so a declared
-    // count the remaining payload cannot encode is rejected before
-    // pre-allocating from it.
     let item_id_bytes: usize = if full_box.version < 2 { 2 } else { 4 };
     let construction_method_bytes: usize = if full_box.version >= 1 { 2 } else { 0 };
     let min_item_bytes = item_id_bytes
         + construction_method_bytes
-        + size_of::<u16>() // data_reference_index
+        + size_of::<u16>()
         + usize::from(base_offset_size)
-        + size_of::<u16>(); // extent_count
+        + size_of::<u16>();
     let available_item_bytes = iloc_payload.len() - cursor;
     if u64::from(item_count) * min_item_bytes as u64 > available_item_bytes as u64 {
         return Err(ParseItemLocationBoxError::ItemCountTooLarge {
@@ -6330,8 +6310,6 @@ fn parse_iloc_payload(
                 total_extents,
             });
         }
-        // Entries can be zero bytes wide (all size fields 0), so the
-        // pre-allocation is clamped to what the payload can actually encode.
         let per_extent_bytes =
             usize::from(index_size) + usize::from(offset_size) + usize::from(length_size);
         let extent_capacity = if per_extent_bytes > 0 {
@@ -6578,9 +6556,6 @@ fn parse_iref_payload(
             });
         }
 
-        // Clamp the pre-allocation to what the remaining payload can encode
-        // (each referenced ID consumes at least 2 bytes); parsing fails on
-        // truncation regardless, so only the reserve needs bounding.
         let item_id_bytes: usize = if full_box.version == 0 { 2 } else { 4 };
         let reference_capacity =
             usize::from(reference_count).min((child.payload.len() - cursor) / item_id_bytes);
@@ -6646,11 +6621,8 @@ fn parse_ipma_payload(
         "entry_count",
     )?;
 
-    // Each entry consumes at least item_ID plus association_count bytes, so a
-    // declared count the remaining payload cannot encode is rejected before
-    // pre-allocating from it.
     let item_id_bytes: usize = if full_box.version == 0 { 2 } else { 4 };
-    let min_entry_bytes = item_id_bytes + 1; // association_count
+    let min_entry_bytes = item_id_bytes + 1;
     let available_entry_bytes = ipma_payload.len() - cursor;
     if u64::from(entry_count) * min_entry_bytes as u64 > available_entry_bytes as u64 {
         return Err(ParseItemPropertyAssociationBoxError::EntryCountTooLarge {
@@ -7530,7 +7502,6 @@ pub(crate) mod test_support {
         full_box(b"uncC", 1, 0, profile)
     }
 
-    /// cmpC v0: compression FourCC plus compressed_unit_type.
     pub(crate) fn cmpc_box(compression_type: &[u8; 4], compressed_unit_type: u8) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(compression_type);
@@ -7538,24 +7509,20 @@ pub(crate) mod test_support {
         full_box(b"cmpC", 0, 0, &payload)
     }
 
-    /// icef v0 with implied cumulative offsets and 8-bit unit sizes: one
-    /// `[size]` byte per unit.
     pub(crate) fn icef_implied_box(unit_sizes: &[u8]) -> Vec<u8> {
         let mut payload = Vec::new();
-        payload.push(0); // codes: offset code 0 (implied), size code 0 (8-bit)
+        payload.push(0);
         payload.extend_from_slice(&u32::try_from(unit_sizes.len()).unwrap().to_be_bytes());
         payload.extend_from_slice(unit_sizes);
         full_box(b"icef", 0, 0, &payload)
     }
 
-    /// iloc v0 with a single item carrying file-absolute extents
-    /// (construction method 0, offset_size 4, length_size 4).
     pub(crate) fn iloc_multi_extent_box(item_id: u16, extents: &[(u32, u32)]) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&0x4400_u16.to_be_bytes());
-        payload.extend_from_slice(&1_u16.to_be_bytes()); // item_count
+        payload.extend_from_slice(&1_u16.to_be_bytes());
         payload.extend_from_slice(&item_id.to_be_bytes());
-        payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+        payload.extend_from_slice(&0_u16.to_be_bytes());
         payload.extend_from_slice(&u16::try_from(extents.len()).unwrap().to_be_bytes());
         for (offset, length) in extents {
             payload.extend_from_slice(&offset.to_be_bytes());
@@ -7564,9 +7531,6 @@ pub(crate) mod test_support {
         full_box(b"iloc", 0, 0, &payload)
     }
 
-    /// [`minimal_uncompressed_rgb3_heif`] with the pixel payload replaced by
-    /// `compressed_payload` and a cmpC property (`compression_type`,
-    /// whole-item units), so the decode path must decompress it.
     pub(crate) fn minimal_uncompressed_rgb3_heif_generic_compression(
         compression_type: &[u8; 4],
         compressed_payload: &[u8],
@@ -7591,9 +7555,6 @@ pub(crate) mod test_support {
                 ),
             ])
         };
-        // The iloc extent offset is file-absolute and all iloc fields are
-        // fixed-size, so a first pass with a placeholder offset yields the
-        // final layout to compute the real offset from.
         let meta_len = meta_with_payload_offset(0).len();
         let mdat_header_len = 8;
         let payload_offset = u32::try_from(ftyp.len() + meta_len + mdat_header_len).unwrap();
@@ -7991,13 +7952,11 @@ mod tests {
         }
     }
 
-    // -- Untrusted count / length rejection tests ---------------------------
-
     #[test]
     fn iloc_rejects_item_count_the_payload_cannot_encode() {
         let mut payload = Vec::new();
-        payload.extend_from_slice(&0_u16.to_be_bytes()); // size fields: all zero
-        payload.extend_from_slice(&u32::MAX.to_be_bytes()); // item_count (v2)
+        payload.extend_from_slice(&0_u16.to_be_bytes());
+        payload.extend_from_slice(&u32::MAX.to_be_bytes());
         let box_bytes = super::test_support::full_box(b"iloc", 2, 0, &payload);
 
         let err = parse_iloc_payload(&box_bytes[8..], 0).expect_err("count must be rejected");
@@ -8012,14 +7971,12 @@ mod tests {
 
     #[test]
     fn iloc_rejects_extent_totals_over_the_cap() {
-        // Two zero-width-extent items whose counts sum past the cap; each
-        // item record itself stays justifiable so the item-count check passes.
         let mut payload = Vec::new();
-        payload.extend_from_slice(&0_u16.to_be_bytes()); // all extent field sizes zero
-        payload.extend_from_slice(&2_u16.to_be_bytes()); // item_count (v0)
+        payload.extend_from_slice(&0_u16.to_be_bytes());
+        payload.extend_from_slice(&2_u16.to_be_bytes());
         for (item_id, extent_count) in [(1_u16, 65535_u16), (2_u16, 2_u16)] {
             payload.extend_from_slice(&item_id.to_be_bytes());
-            payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
+            payload.extend_from_slice(&0_u16.to_be_bytes());
             payload.extend_from_slice(&extent_count.to_be_bytes());
         }
         let box_bytes = super::test_support::full_box(b"iloc", 0, 0, &payload);
@@ -8066,9 +8023,6 @@ mod tests {
                 iprp_box(&[ispe_box(2, 1), uncc_v1_box(b"rgb3")], &[(1, &[1, 2])]),
             ])
         };
-        // The extent offsets are file-absolute and the iloc box length is
-        // fixed for a fixed extent list, so a placeholder pass yields the
-        // final layout.
         let meta_len = meta_with_offset(0).len();
         let mdat_offset = u32::try_from(ftyp.len() + meta_len + 8).unwrap();
         let meta = meta_with_offset(mdat_offset);
@@ -8093,10 +8047,6 @@ mod tests {
 
     #[test]
     fn uncompressed_extract_rejects_extent_sums_over_the_source() {
-        // Four in-bounds extents (each inside the large `mdat`) whose declared
-        // lengths together exceed the whole file size: overlapping extents
-        // are malformed, and the sum must be rejected before the payload
-        // pre-allocation.
         let file = uncompressed_rgb3_file_with_extents(
             &[(0, 200), (0, 200), (0, 200), (0, 200)],
             &[7_u8; 300],

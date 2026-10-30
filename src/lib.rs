@@ -3981,11 +3981,6 @@ fn read_icef_uint(
     Ok(value)
 }
 
-/// Upper bounds for decompressing generic-compressed (`cmpC`/`icef`) units.
-///
-/// The compressed formats carry no declared output size, so these caps keep a
-/// few bytes of attacker-supplied input from forcing unbounded allocation or
-/// CPU during decompression; legitimate `unci` payloads sit far below them.
 #[derive(Clone, Copy)]
 struct GenericCompressionLimits {
     max_unit_bytes: usize,
@@ -4040,9 +4035,6 @@ fn read_decompressed_to_limit<R: Read>(
     max_unit_bytes: usize,
 ) -> Result<Vec<u8>, DecodeUncompressedError> {
     let mut decompressed = Vec::new();
-    // Reading one byte past the cap lets read_to_end finish cleanly while
-    // still proving the unit exceeds it; `take` halts the decompressor at
-    // the cap either way, bounding CPU as well as memory.
     decoder
         .take(max_unit_bytes as u64 + 1)
         .read_to_end(&mut decompressed)
@@ -7942,10 +7934,6 @@ fn extract_heic_item_payload_with_source(
     meta: &isobmff::MetaBox<'_>,
     location: &isobmff::ItemLocationItem,
 ) -> Option<Vec<u8>> {
-    // Resolve the extent source up front and validate every declared extent
-    // against it before pre-allocating from the sum of their lengths: each
-    // extent must lie inside the source, and the sum (overlapping extents
-    // included) must not exceed it.
     let idat_payload: &[u8] = match location.construction_method {
         0 => &[],
         1 => {
@@ -14944,8 +14932,6 @@ mod tests {
 
     #[test]
     fn generic_compression_unit_bomb_is_rejected() {
-        // A zlib stream of zeros that decompresses past the per-unit cap: the
-        // decode must fail closed instead of allocating to completion.
         let target = super::GENERIC_COMPRESSION_LIMITS.max_unit_bytes + 64 * 1024;
         let zeros = [0_u8; 64 * 1024];
         let mut encoder =
@@ -14976,8 +14962,6 @@ mod tests {
 
     #[test]
     fn generic_compression_total_cap_spans_units() {
-        // Two units that individually fit a small per-unit cap but together
-        // exceed the total cap must be rejected after both decompress.
         let limits = super::GenericCompressionLimits {
             max_unit_bytes: 1024,
             max_total_bytes: 1024,
@@ -14995,7 +14979,7 @@ mod tests {
         ]);
 
         let mut cmpc_payload = Vec::new();
-        cmpc_payload.extend_from_slice(&[0_u8; 4]); // version/flags
+        cmpc_payload.extend_from_slice(&[0_u8; 4]);
         cmpc_payload.extend_from_slice(b"zlib");
         cmpc_payload.push(super::GENERIC_COMPRESSED_UNIT_FULL_ITEM);
 
@@ -15026,8 +15010,6 @@ mod tests {
 
     #[test]
     fn generic_compression_unit_count_cap() {
-        // An icef table with more units than the cap must be rejected before
-        // any unit decompresses.
         let limits = super::GenericCompressionLimits {
             max_unit_bytes: 1024,
             max_total_bytes: 65536,
@@ -15037,7 +15019,7 @@ mod tests {
         let icef_box = isobmff::test_support::icef_implied_box(&[1, 1]);
 
         let mut cmpc_payload = Vec::new();
-        cmpc_payload.extend_from_slice(&[0_u8; 4]); // version/flags
+        cmpc_payload.extend_from_slice(&[0_u8; 4]);
         cmpc_payload.extend_from_slice(b"zlib");
         cmpc_payload.push(super::GENERIC_COMPRESSED_UNIT_FULL_ITEM);
 
