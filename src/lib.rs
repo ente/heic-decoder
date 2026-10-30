@@ -2436,6 +2436,7 @@ fn decode_primary_uncompressed_to_channels_internal(
         item_data.item_id,
         &item_data.generic_compression_properties,
         &item_data.payload,
+        GENERIC_COMPRESSION_LIMITS,
     )?;
     if interleave_type == UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT {
         let tile_layout = UncompressedTileDecodeLayout {
@@ -3662,6 +3663,7 @@ fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
     item_id: u32,
     generic_compression_properties: &isobmff::UncompressedGenericCompressionProperties,
     payload: &'a [u8],
+    limits: GenericCompressionLimits,
 ) -> Result<Cow<'a, [u8]>, DecodeUncompressedError> {
     // Provenance: generic compression handling mirrors libheif
     // uncompressed decode flow and cmpC/icef semantics in
@@ -3723,7 +3725,18 @@ fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
         Cow::Borrowed(&generic_compression.units)
     };
 
+    if units.len() > limits.max_units {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "generic-compressed payload declares {} units, exceeding the {}-unit limit",
+                units.len(),
+                limits.max_units
+            ),
+        });
+    }
+
     let mut decompressed = Vec::new();
+    let mut total_decompressed_bytes = 0_usize;
     for (unit_index, unit) in units.iter().enumerate() {
         let start = usize::try_from(unit.offset).map_err(|_| {
             DecodeUncompressedError::InvalidInput {
@@ -3766,7 +3779,18 @@ fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
             generic_compression.config.compression_type,
             unit_payload,
             unit_index,
+            limits.max_unit_bytes,
         )?;
+        total_decompressed_bytes = total_decompressed_bytes
+            .checked_add(unit_data.len())
+            .filter(|total| *total <= limits.max_total_bytes)
+            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "generic-compressed payload decompresses to more than {} bytes across units, exceeding the {}-byte limit",
+                    total_decompressed_bytes.saturating_add(unit_data.len()),
+                    limits.max_total_bytes
+                ),
+            })?;
         decompressed.extend_from_slice(&unit_data);
     }
 
@@ -3997,53 +4021,76 @@ fn read_icef_uint(
     Ok(value)
 }
 
+#[derive(Clone, Copy)]
+struct GenericCompressionLimits {
+    max_unit_bytes: usize,
+    max_total_bytes: usize,
+    max_units: usize,
+}
+
+const GENERIC_COMPRESSION_LIMITS: GenericCompressionLimits = GenericCompressionLimits {
+    max_unit_bytes: 256 * 1024 * 1024,
+    max_total_bytes: 1024 * 1024 * 1024,
+    max_units: 65536,
+};
+
 fn decompress_generic_compressed_unit(
     compression_type: [u8; 4],
     compressed_data: &[u8],
     unit_index: usize,
+    max_unit_bytes: usize,
 ) -> Result<Vec<u8>, DecodeUncompressedError> {
-    let mut decompressed = Vec::new();
     let compression_label = String::from_utf8_lossy(&compression_type).into_owned();
     match compression_type {
-        GENERIC_COMPRESSION_TYPE_BROTLI => {
-            let mut decoder = BrotliDecompressor::new(compressed_data, 4096);
-            decoder.read_to_end(&mut decompressed).map_err(|err| {
-                DecodeUncompressedError::InvalidInput {
-                    detail: format!(
-                        "failed to decompress brotli generic-compressed unit {unit_index}: {err}"
-                    ),
-                }
-            })?;
-        }
-        GENERIC_COMPRESSION_TYPE_ZLIB => {
-            let mut decoder = ZlibDecoder::new(compressed_data);
-            decoder.read_to_end(&mut decompressed).map_err(|err| {
-                DecodeUncompressedError::InvalidInput {
-                    detail: format!(
-                        "failed to decompress zlib generic-compressed unit {unit_index}: {err}"
-                    ),
-                }
-            })?;
-        }
-        GENERIC_COMPRESSION_TYPE_DEFLATE => {
-            let mut decoder = DeflateDecoder::new(compressed_data);
-            decoder.read_to_end(&mut decompressed).map_err(|err| {
-                DecodeUncompressedError::InvalidInput {
-                    detail: format!(
-                        "failed to decompress deflate generic-compressed unit {unit_index}: {err}"
-                    ),
-                }
-            })?;
-        }
-        _ => {
-            return Err(DecodeUncompressedError::UnsupportedFeature {
-                detail: format!(
-                    "unsupported cmpC compression_type {compression_label} for generic-compressed uncompressed (`unci`) payload"
-                ),
-            });
-        }
+        GENERIC_COMPRESSION_TYPE_BROTLI => read_decompressed_to_limit(
+            BrotliDecompressor::new(compressed_data, 4096),
+            unit_index,
+            "brotli",
+            max_unit_bytes,
+        ),
+        GENERIC_COMPRESSION_TYPE_ZLIB => read_decompressed_to_limit(
+            ZlibDecoder::new(compressed_data),
+            unit_index,
+            "zlib",
+            max_unit_bytes,
+        ),
+        GENERIC_COMPRESSION_TYPE_DEFLATE => read_decompressed_to_limit(
+            DeflateDecoder::new(compressed_data),
+            unit_index,
+            "deflate",
+            max_unit_bytes,
+        ),
+        _ => Err(DecodeUncompressedError::UnsupportedFeature {
+            detail: format!(
+                "unsupported cmpC compression_type {compression_label} for generic-compressed uncompressed (`unci`) payload"
+            ),
+        }),
     }
+}
 
+fn read_decompressed_to_limit<R: Read>(
+    decoder: R,
+    unit_index: usize,
+    codec: &str,
+    max_unit_bytes: usize,
+) -> Result<Vec<u8>, DecodeUncompressedError> {
+    let mut decompressed = Vec::new();
+    decoder
+        .take(max_unit_bytes as u64 + 1)
+        .read_to_end(&mut decompressed)
+        .map_err(|err| DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "failed to decompress {codec} generic-compressed unit {unit_index}: {err}"
+            ),
+        })?;
+    if decompressed.len() > max_unit_bytes {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "{codec} generic-compressed unit {unit_index} decompresses to {} bytes, exceeding the {max_unit_bytes}-byte limit",
+                decompressed.len()
+            ),
+        });
+    }
     Ok(decompressed)
 }
 
@@ -8009,10 +8056,34 @@ fn extract_heic_item_payload_with_source(
     meta: &isobmff::MetaBox<'_>,
     location: &isobmff::ItemLocationItem,
 ) -> Option<Vec<u8>> {
-    let total_length = location
-        .extents
-        .iter()
-        .try_fold(0_u64, |acc, extent| acc.checked_add(extent.length))?;
+    let idat_payload: &[u8] = match location.construction_method {
+        0 => &[],
+        1 => {
+            let children = meta.parse_children().ok()?;
+            let idat_box = find_first_box_by_type(&children, IDAT_BOX_TYPE)?;
+            idat_box.payload
+        }
+        _ => return None,
+    };
+    let available = if location.construction_method == 1 {
+        idat_payload.len() as u64
+    } else if let Some(source) = source.as_ref() {
+        source.len()
+    } else {
+        input.len() as u64
+    };
+    let mut total_length = 0_u64;
+    for extent in &location.extents {
+        let start = location.base_offset.checked_add(extent.offset)?;
+        let end = start.checked_add(extent.length)?;
+        if end > available {
+            return None;
+        }
+        total_length = total_length.checked_add(extent.length)?;
+    }
+    if total_length > available {
+        return None;
+    }
     let payload_capacity = usize::try_from(total_length).ok()?;
     let mut payload = Vec::with_capacity(payload_capacity);
 
@@ -8025,9 +8096,7 @@ fn extract_heic_item_payload_with_source(
             }
         }
         1 => {
-            let children = meta.parse_children().ok()?;
-            let idat_box = find_first_box_by_type(&children, IDAT_BOX_TYPE)?;
-            append_heic_item_location_extents(idat_box.payload, location, &mut payload)?;
+            append_heic_item_location_extents(idat_payload, location, &mut payload)?;
         }
         _ => return None,
     }
@@ -8060,9 +8129,13 @@ fn append_heic_item_location_extents_from_source(
     location: &isobmff::ItemLocationItem,
     output: &mut Vec<u8>,
 ) -> Option<()> {
+    let available = source.len();
     for extent in &location.extents {
         let start = location.base_offset.checked_add(extent.offset)?;
-        start.checked_add(extent.length)?;
+        let end = start.checked_add(extent.length)?;
+        if end > available {
+            return None;
+        }
         let extent_len = usize::try_from(extent.length).ok()?;
         let output_start = output.len();
         let output_end = output_start.checked_add(extent_len)?;
@@ -15012,6 +15085,150 @@ mod tests {
         let decoded = super::decode_bytes_to_rgba(&file).expect("eager decode should succeed");
         assert_eq!((decoded.width, decoded.height), (2, 1));
         assert_eq!(decoded.pixels, super::DecodedRgbaPixels::U8(expected_rgba));
+    }
+
+    fn zlib_compress(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).expect("zlib encode");
+        encoder.finish().expect("zlib finish")
+    }
+
+    #[test]
+    fn eager_decode_supports_zlib_generic_compressed_uncompressed_heif() {
+        let pixels_rgb: [u8; 6] = [10, 20, 30, 200, 150, 100];
+        let compressed = zlib_compress(&pixels_rgb);
+        let file = isobmff::test_support::minimal_uncompressed_rgb3_heif_generic_compression(
+            b"zlib",
+            &compressed,
+        );
+
+        let decoded = super::decode_bytes_to_rgba(&file).expect("eager decode should succeed");
+        assert_eq!((decoded.width, decoded.height), (2, 1));
+        assert_eq!(
+            decoded.pixels,
+            super::DecodedRgbaPixels::U8(vec![10, 20, 30, 255, 200, 150, 100, 255])
+        );
+    }
+
+    #[test]
+    fn generic_compression_unit_bomb_is_rejected() {
+        let target = super::GENERIC_COMPRESSION_LIMITS.max_unit_bytes + 64 * 1024;
+        let zeros = [0_u8; 64 * 1024];
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            use std::io::Write as _;
+
+            let mut remaining = target;
+            while remaining > 0 {
+                let chunk = remaining.min(zeros.len());
+                encoder.write_all(&zeros[..chunk]).expect("bomb encode");
+                remaining -= chunk;
+            }
+        }
+        let compressed = encoder.finish().expect("bomb finish");
+        let file = isobmff::test_support::minimal_uncompressed_rgb3_heif_generic_compression(
+            b"zlib",
+            &compressed,
+        );
+
+        let err = super::decode_bytes_to_rgba(&file).expect_err("bomb must be rejected");
+        let detail = err.to_string();
+        assert!(
+            detail.contains("exceeding the"),
+            "expected a decompression-limit error, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn generic_compression_total_cap_spans_units() {
+        let limits = super::GenericCompressionLimits {
+            max_unit_bytes: 1024,
+            max_total_bytes: 1024,
+            max_units: 65536,
+        };
+        let unit_a = zlib_compress(&[7_u8; 600]);
+        let unit_b = zlib_compress(&[9_u8; 600]);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&unit_a);
+        payload.extend_from_slice(&unit_b);
+
+        let icef_box = isobmff::test_support::icef_implied_box(&[
+            u8::try_from(unit_a.len()).expect("unit a fits a size byte"),
+            u8::try_from(unit_b.len()).expect("unit b fits a size byte"),
+        ]);
+
+        let mut cmpc_payload = Vec::new();
+        cmpc_payload.extend_from_slice(&[0_u8; 4]);
+        cmpc_payload.extend_from_slice(b"zlib");
+        cmpc_payload.push(super::GENERIC_COMPRESSED_UNIT_FULL_ITEM);
+
+        let properties = isobmff::UncompressedGenericCompressionProperties {
+            cmpc: vec![isobmff::GenericCompressionPropertyPayload {
+                offset: 0,
+                payload: cmpc_payload,
+            }],
+            icef: vec![isobmff::GenericCompressionPropertyPayload {
+                offset: 0,
+                payload: icef_box[8..].to_vec(),
+            }],
+        };
+
+        let err = super::maybe_decode_primary_uncompressed_generic_compression_payload(
+            1,
+            &properties,
+            &payload,
+            limits,
+        )
+        .expect_err("total cap must reject");
+        let detail = err.to_string();
+        assert!(
+            detail.contains("across units"),
+            "expected a cumulative-limit error, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn generic_compression_unit_count_cap() {
+        let limits = super::GenericCompressionLimits {
+            max_unit_bytes: 1024,
+            max_total_bytes: 65536,
+            max_units: 1,
+        };
+        let payload = vec![0_u8, 0];
+        let icef_box = isobmff::test_support::icef_implied_box(&[1, 1]);
+
+        let mut cmpc_payload = Vec::new();
+        cmpc_payload.extend_from_slice(&[0_u8; 4]);
+        cmpc_payload.extend_from_slice(b"zlib");
+        cmpc_payload.push(super::GENERIC_COMPRESSED_UNIT_FULL_ITEM);
+
+        let properties = isobmff::UncompressedGenericCompressionProperties {
+            cmpc: vec![isobmff::GenericCompressionPropertyPayload {
+                offset: 0,
+                payload: cmpc_payload,
+            }],
+            icef: vec![isobmff::GenericCompressionPropertyPayload {
+                offset: 0,
+                payload: icef_box[8..].to_vec(),
+            }],
+        };
+
+        let err = super::maybe_decode_primary_uncompressed_generic_compression_payload(
+            1,
+            &properties,
+            &payload,
+            limits,
+        )
+        .expect_err("unit-count cap must reject");
+        let detail = err.to_string();
+        assert!(
+            detail.contains("units"),
+            "expected a unit-count-limit error, got: {detail}"
+        );
     }
 
     #[cfg(feature = "image-integration")]
