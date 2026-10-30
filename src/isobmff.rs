@@ -7797,7 +7797,79 @@ pub(crate) mod test_support {
     /// profile, and the pixel payload in a trailing `mdat`.
     ///
     /// Returns the file bytes and the RGBA8 pixels a decode must produce.
+    pub(crate) fn cmpd_box(component_types: &[u16]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32::try_from(component_types.len()).unwrap().to_be_bytes());
+        for component_type in component_types {
+            payload.extend_from_slice(&component_type.to_be_bytes());
+        }
+        plain_box(b"cmpd", &payload)
+    }
+
+    pub(crate) fn uncc_v0_box(
+        components: &[(u16, u8)],
+        sampling_type: u8,
+        interleave_type: u8,
+    ) -> Vec<u8> {
+        let mut payload = vec![0_u8; 4];
+        payload.extend_from_slice(&u32::try_from(components.len()).unwrap().to_be_bytes());
+        for (component_index, component_bit_depth_minus_one) in components {
+            payload.extend_from_slice(&component_index.to_be_bytes());
+            payload.push(*component_bit_depth_minus_one);
+            payload.push(0);
+            payload.push(0);
+        }
+        payload.push(sampling_type);
+        payload.push(interleave_type);
+        payload.push(0);
+        payload.push(0);
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        full_box(b"uncC", 0, 0, &payload)
+    }
+
+    pub(crate) fn minimal_uncompressed_multi_y_heif() -> (Vec<u8>, Vec<u8>) {
+        let pixels = [40_u8, 240, 60, 110];
+
+        let ftyp = ftyp_box(b"mif1");
+        let meta_with_pixel_offset = |pixel_offset: u32| {
+            meta_file(&[
+                pitm_box(1),
+                iloc_with_extent_box(&[(1, pixel_offset, u32::try_from(pixels.len()).unwrap())]),
+                iinf_box(&[infe_box(1, b"unci")]),
+                iprp_box(
+                    &[
+                        ispe_box(2, 1),
+                        cmpd_box(&[1, 2, 3]),
+                        uncc_v0_box(&[(0, 7), (1, 7), (0, 7), (2, 7)], 1, 5),
+                    ],
+                    &[(1, &[1, 2, 3])],
+                ),
+            ])
+        };
+        let meta_len = meta_with_pixel_offset(0).len();
+        let mdat_header_len = 8;
+        let pixel_offset = u32::try_from(ftyp.len() + meta_len + mdat_header_len).unwrap();
+        let meta = meta_with_pixel_offset(pixel_offset);
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&meta);
+        file.extend_from_slice(&plain_box(b"mdat", &pixels));
+        (file, pixels.to_vec())
+    }
+
     pub(crate) fn minimal_uncompressed_rgb3_heif() -> (Vec<u8>, Vec<u8>) {
+        minimal_uncompressed_rgb3_heif_with_dimensions(2, 1)
+    }
+
+    pub(crate) fn minimal_uncompressed_rgb3_heif_with_dimensions(
+        width: u32,
+        height: u32,
+    ) -> (Vec<u8>, Vec<u8>) {
         let pixels_rgb: [u8; 6] = [10, 20, 30, 200, 150, 100];
         let expected_rgba: Vec<u8> = vec![10, 20, 30, 255, 200, 150, 100, 255];
 
@@ -7811,7 +7883,10 @@ pub(crate) mod test_support {
                     u32::try_from(pixels_rgb.len()).unwrap(),
                 )]),
                 iinf_box(&[infe_box(1, b"unci")]),
-                iprp_box(&[ispe_box(2, 1), uncc_v1_box(b"rgb3")], &[(1, &[1, 2])]),
+                iprp_box(
+                    &[ispe_box(width, height), uncc_v1_box(b"rgb3")],
+                    &[(1, &[1, 2])],
+                ),
             ])
         };
         // The iloc extent offset is file-absolute and all iloc fields are
