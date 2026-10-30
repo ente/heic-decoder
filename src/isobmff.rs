@@ -1,5 +1,6 @@
 use crate::source::RandomAccessSource;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::mem::size_of;
@@ -4837,9 +4838,9 @@ fn resolve_grid_tile_hvcc_colr_and_transforms_indexed(
                 },
             );
         }
-        if !property_cache.contains_key(&property_index) {
+        if let Entry::Vacant(entry) = property_cache.entry(property_index) {
             let parsed = parse_grid_tile_property(item_id, tile_item_id, property)?;
-            property_cache.insert(property_index, parsed);
+            entry.insert(parsed);
         }
         match &property_cache[&property_index] {
             CachedGridProperty::Hvcc(parsed) => hvcc = Some(parsed.clone()),
