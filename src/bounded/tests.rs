@@ -290,6 +290,47 @@ fn sps_with_ctb_sizes(minimum: u32, difference: u32) -> Vec<u8> {
     nal_from_bits(&nals[1][..2], bits)
 }
 
+fn sps_with_bit_depths(luma: u32, chroma: u32) -> Vec<u8> {
+    let nals = nal_sets();
+    let sps = crate::heic_decoder::hevc::bitstream::parse_single_nal(&nals[1]).unwrap();
+    let mut bits: Vec<bool> = sps
+        .payload
+        .iter()
+        .flat_map(|byte| (0..8).rev().map(move |i| byte & (1 << i) != 0))
+        .collect();
+    let mut cursor = 104;
+    for _ in 0..4 {
+        read_ue(&bits, &mut cursor);
+    }
+    assert!(!bits[cursor]);
+    cursor += 1;
+    let start = cursor;
+    read_ue(&bits, &mut cursor);
+    read_ue(&bits, &mut cursor);
+    let mut replacement = Vec::new();
+    write_ue(&mut replacement, luma);
+    write_ue(&mut replacement, chroma);
+    bits.splice(start..cursor, replacement);
+    nal_from_bits(&nals[1][..2], bits)
+}
+
+#[test]
+fn hevc_sps_rejects_unsupported_bit_depths() {
+    for (luma, chroma) in [(9, 0), (0, 9), (300, 0), (u32::MAX - 1, 0)] {
+        let sps = sps_with_bit_depths(luma, chroma);
+        let nal = crate::heic_decoder::hevc::bitstream::parse_single_nal(&sps).unwrap();
+        assert!(
+            crate::heic_decoder::hevc::params::parse_sps(&nal.payload).is_err(),
+            "bit depths ({luma}, {chroma}) must be rejected"
+        );
+    }
+    let sps = sps_with_bit_depths(8, 8);
+    let nal = crate::heic_decoder::hevc::bitstream::parse_single_nal(&sps).unwrap();
+    let parsed = crate::heic_decoder::hevc::params::parse_sps(&nal.payload).unwrap();
+    assert_eq!(parsed.bit_depth_y(), 16);
+    assert_eq!(parsed.bit_depth_c(), 16);
+}
+
 #[test]
 fn hevc_preflight_rejects_invalid_ctb_fields_without_panicking() {
     for (minimum, difference) in [(0, 0), (0, 4), (0, 30), (253, 0), (0, 255), (255, 255)] {

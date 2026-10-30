@@ -519,8 +519,15 @@ fn parse_sps_impl(data: &[u8], bounded: bool) -> Result<Sps> {
         (0, 0, 0, 0)
     };
 
-    let bit_depth_luma_minus8 = bounded_ue_u8(&mut reader, bounded)?;
-    let bit_depth_chroma_minus8 = bounded_ue_u8(&mut reader, bounded)?;
+    let bit_depth_luma_minus8 = reader.read_ue()?;
+    let bit_depth_chroma_minus8 = reader.read_ue()?;
+    if bit_depth_luma_minus8 > 8 || bit_depth_chroma_minus8 > 8 {
+        return Err(HevcError::InvalidBitstream(
+            "SPS bit_depth_minus8 must be within 0..=8",
+        ));
+    }
+    let bit_depth_luma_minus8 = bit_depth_luma_minus8 as u8;
+    let bit_depth_chroma_minus8 = bit_depth_chroma_minus8 as u8;
     let log2_max_pic_order_cnt_lsb_minus4 = bounded_ue_u8(&mut reader, bounded)?;
     if bounded && log2_max_pic_order_cnt_lsb_minus4 > 12 {
         return Err(HevcError::Unsupported("bounded POC width"));
