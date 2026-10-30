@@ -1,4 +1,6 @@
 use crate::source::RandomAccessSource;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::mem::size_of;
@@ -27,6 +29,8 @@ const UNCC_BOX_TYPE: [u8; 4] = *b"uncC";
 const CMPC_BOX_TYPE: [u8; 4] = *b"cmpC";
 const ICEF_BOX_TYPE: [u8; 4] = *b"icef";
 const MAX_ILOC_EXTENTS: usize = 65536;
+const MAX_GRID_TILE_PAYLOAD_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_GRID_TILE_ASSOCIATIONS: usize = 65536;
 const COLR_BOX_TYPE: [u8; 4] = *b"colr";
 const IROT_BOX_TYPE: [u8; 4] = *b"irot";
 const IMIR_BOX_TYPE: [u8; 4] = *b"imir";
@@ -2943,6 +2947,10 @@ pub enum ExtractHeicItemDataError {
         item_id: u32,
         tile_item_id: u32,
     },
+    GridTileAssociationCountTooLarge {
+        item_id: u32,
+        total: usize,
+    },
     GridTileCodecConfiguration {
         item_id: u32,
         tile_item_id: u32,
@@ -3103,6 +3111,12 @@ impl Display for ExtractHeicItemDataError {
                 f,
                 "primary grid item_ID {item_id} tile item_ID {tile_item_id} has multiple hvcC properties"
             ),
+            ExtractHeicItemDataError::GridTileAssociationCountTooLarge { item_id, total } => {
+                write!(
+                    f,
+                    "primary grid item_ID {item_id} exceeds the {MAX_GRID_TILE_ASSOCIATIONS} tile property association limit with {total} associations"
+                )
+            }
             ExtractHeicItemDataError::GridTileCodecConfiguration {
                 item_id,
                 tile_item_id,
@@ -4540,17 +4554,67 @@ fn extract_primary_heic_item_data_with_grid_internal(
         flattened_properties.extend(property_container.properties.iter().cloned());
     }
 
+    let mut iinf_index: BTreeMap<u32, usize> = BTreeMap::new();
+    for (index, entry) in resolved.iinf.entries.iter().enumerate() {
+        iinf_index.entry(entry.item_id).or_insert(index);
+    }
+    let mut iloc_index: BTreeMap<u32, usize> = BTreeMap::new();
+    for (index, item) in resolved.iloc.items.iter().enumerate() {
+        iloc_index.entry(item.item_id).or_insert(index);
+    }
+    let mut distinct_tile_ids: Vec<u32> = tile_item_ids.clone();
+    distinct_tile_ids.sort_unstable();
+    distinct_tile_ids.dedup();
+    let mut associations_by_item: BTreeMap<u32, Vec<&ItemPropertyAssociation>> = BTreeMap::new();
+    for &distinct_tile_id in &distinct_tile_ids {
+        associations_by_item.insert(distinct_tile_id, Vec::new());
+    }
+    let mut total_tile_associations = 0_usize;
+    for association_box in &resolved.iprp.associations {
+        for entry in &association_box.entries {
+            let Some(tile_associations) = associations_by_item.get_mut(&entry.item_id) else {
+                continue;
+            };
+            total_tile_associations += entry.associations.len();
+            if total_tile_associations > MAX_GRID_TILE_ASSOCIATIONS {
+                return Err(ExtractHeicItemDataError::GridTileAssociationCountTooLarge {
+                    item_id,
+                    total: total_tile_associations,
+                });
+            }
+            tile_associations.extend(entry.associations.iter());
+        }
+    }
+    let tiles_use_idat = tile_item_ids.iter().any(|&tile_item_id| {
+        matches!(
+            iloc_index.get(&tile_item_id),
+            Some(&index) if resolved.iloc.items[index].construction_method == 1
+        )
+    });
+    let shared_idat_payload: Option<&[u8]> = if tiles_use_idat {
+        let children = meta
+            .parse_children()
+            .map_err(ExtractHeicItemDataError::MetaChildBoxes)?;
+        find_first_child_box(&children, IDAT_BOX_TYPE).map(|idat_box| idat_box.payload)
+    } else {
+        None
+    };
+    let mut property_cache = BTreeMap::new();
+    let tile_payload_budget = source
+        .as_ref()
+        .map_or(input.len() as u64, |source| source.len())
+        .saturating_mul(4)
+        .max(MAX_GRID_TILE_PAYLOAD_BYTES);
+    let mut total_tile_payload_bytes = 0_u64;
+
     let mut tiles = Vec::with_capacity(tile_item_ids.len());
     for &tile_item_id in &tile_item_ids {
-        let tile_item_info = resolved
-            .iinf
-            .entries
-            .iter()
-            .find(|entry| entry.item_id == tile_item_id)
-            .ok_or(ExtractHeicItemDataError::MissingGridTileItemInfo {
+        let tile_item_info = &resolved.iinf.entries[*iinf_index.get(&tile_item_id).ok_or(
+            ExtractHeicItemDataError::MissingGridTileItemInfo {
                 item_id,
                 tile_item_id,
-            })?;
+            },
+        )?];
         let tile_item_type =
             tile_item_info
                 .item_type
@@ -4568,29 +4632,46 @@ fn extract_primary_heic_item_data_with_grid_internal(
             });
         }
 
-        let (tile_hvcc, tile_colr, tile_transforms) = resolve_grid_tile_hvcc_colr_and_transforms(
-            item_id,
-            tile_item_id,
-            &resolved.iprp.associations,
-            &flattened_properties,
-        )?;
-
-        let tile_location = resolved
-            .iloc
-            .items
-            .iter()
-            .find(|item| item.item_id == tile_item_id)
-            .ok_or(ExtractHeicItemDataError::MissingGridTileLocation {
+        let tile_associations = associations_by_item
+            .get(&tile_item_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let (tile_hvcc, tile_colr, tile_transforms) =
+            resolve_grid_tile_hvcc_colr_and_transforms_indexed(
                 item_id,
                 tile_item_id,
+                tile_associations,
+                &flattened_properties,
+                &mut property_cache,
+            )?;
+
+        let tile_location = &resolved.iloc.items[*iloc_index.get(&tile_item_id).ok_or(
+            ExtractHeicItemDataError::MissingGridTileLocation {
+                item_id,
+                tile_item_id,
+            },
+        )?];
+        let (tile_construction_method, payload) =
+            extract_heic_item_payload_from_location_with_idat(
+                input,
+                source,
+                &meta,
+                tile_location,
+                tile_item_id,
+                shared_idat_payload,
+            )?;
+        total_tile_payload_bytes = total_tile_payload_bytes
+            .checked_add(payload.len() as u64)
+            .ok_or(ExtractHeicItemDataError::PayloadTooLarge {
+                item_id,
+                length: u64::MAX,
             })?;
-        let (tile_construction_method, payload) = extract_heic_item_payload_from_location(
-            input,
-            source,
-            &meta,
-            tile_location,
-            tile_item_id,
-        )?;
+        if total_tile_payload_bytes > tile_payload_budget {
+            return Err(ExtractHeicItemDataError::PayloadTooLarge {
+                item_id,
+                length: total_tile_payload_bytes,
+            });
+        }
         tiles.push(HeicGridTileItemData {
             item_id: tile_item_id,
             construction_method: tile_construction_method,
@@ -4611,6 +4692,73 @@ fn extract_primary_heic_item_data_with_grid_internal(
     }))
 }
 
+#[derive(Clone)]
+enum CachedGridProperty {
+    Hvcc(HevcDecoderConfigurationBox),
+    Colr(ColorInformationProperty),
+    Transform(PrimaryItemTransformProperty),
+    Ignored,
+}
+
+fn parse_grid_tile_property(
+    item_id: u32,
+    tile_item_id: u32,
+    property: &ParsedBox<'_>,
+) -> Result<CachedGridProperty, ExtractHeicItemDataError> {
+    if property.header.box_type.as_bytes() == HVCC_BOX_TYPE {
+        return Ok(CachedGridProperty::Hvcc(property.parse_hvcc().map_err(
+            |source| ExtractHeicItemDataError::GridTileCodecConfiguration {
+                item_id,
+                tile_item_id,
+                source,
+            },
+        )?));
+    }
+    if property.header.box_type.as_bytes() == COLR_BOX_TYPE {
+        return Ok(CachedGridProperty::Colr(property.parse_colr().map_err(
+            |source| ExtractHeicItemDataError::GridTileColorInformation {
+                item_id,
+                tile_item_id,
+                source,
+            },
+        )?));
+    }
+    if property.header.box_type.as_bytes() == CLAP_BOX_TYPE {
+        return Ok(CachedGridProperty::Transform(
+            PrimaryItemTransformProperty::CleanAperture(property.parse_clap().map_err(
+                |source| ExtractHeicItemDataError::GridTileCleanAperture {
+                    item_id,
+                    tile_item_id,
+                    source,
+                },
+            )?),
+        ));
+    }
+    if property.header.box_type.as_bytes() == IROT_BOX_TYPE {
+        return Ok(CachedGridProperty::Transform(
+            PrimaryItemTransformProperty::Rotation(property.parse_irot().map_err(|source| {
+                ExtractHeicItemDataError::GridTileRotation {
+                    item_id,
+                    tile_item_id,
+                    source,
+                }
+            })?),
+        ));
+    }
+    if property.header.box_type.as_bytes() == IMIR_BOX_TYPE {
+        return Ok(CachedGridProperty::Transform(
+            PrimaryItemTransformProperty::Mirror(property.parse_imir().map_err(|source| {
+                ExtractHeicItemDataError::GridTileMirror {
+                    item_id,
+                    tile_item_id,
+                    source,
+                }
+            })?),
+        ));
+    }
+    Ok(CachedGridProperty::Ignored)
+}
+
 fn resolve_grid_tile_hvcc_colr_and_transforms(
     item_id: u32,
     tile_item_id: u32,
@@ -4624,100 +4772,99 @@ fn resolve_grid_tile_hvcc_colr_and_transforms(
     ),
     ExtractHeicItemDataError,
 > {
-    let mut hvcc = None;
-    let mut colr = PrimaryItemColorProperties::default();
-    let mut transforms = Vec::new();
-
+    let mut tile_associations = Vec::new();
     for association_box in associations {
         for entry in &association_box.entries {
-            if entry.item_id != tile_item_id {
-                continue;
-            }
-
-            for association in &entry.associations {
-                if association.property_index == 0 {
-                    continue;
-                }
-
-                let property_index = usize::from(association.property_index - 1);
-                if property_index >= flattened_properties.len() {
-                    return Err(ExtractHeicItemDataError::GridTilePropertyIndexOutOfRange {
+            if entry.item_id == tile_item_id {
+                tile_associations.extend(entry.associations.iter());
+                if tile_associations.len() > MAX_GRID_TILE_ASSOCIATIONS {
+                    return Err(ExtractHeicItemDataError::GridTileAssociationCountTooLarge {
                         item_id,
-                        tile_item_id,
-                        property_index: association.property_index,
-                        available: flattened_properties.len(),
+                        total: tile_associations.len(),
                     });
                 }
-                let property = &flattened_properties[property_index];
-                if property.header.box_type.as_bytes() != HVCC_BOX_TYPE {
-                    if property.header.box_type.as_bytes() == COLR_BOX_TYPE {
-                        let parsed_colr = property.parse_colr().map_err(|source| {
-                            ExtractHeicItemDataError::GridTileColorInformation {
-                                item_id,
-                                tile_item_id,
-                                source,
-                            }
-                        })?;
-                        match parsed_colr.information {
-                            ColorInformation::Nclx(profile) => {
-                                colr.nclx = Some(profile);
-                            }
-                            ColorInformation::Icc(profile) => {
-                                colr.icc = Some(profile);
-                            }
-                        }
-                    } else if property.header.box_type.as_bytes() == CLAP_BOX_TYPE {
-                        transforms.push(PrimaryItemTransformProperty::CleanAperture(
-                            property.parse_clap().map_err(|source| {
-                                ExtractHeicItemDataError::GridTileCleanAperture {
-                                    item_id,
-                                    tile_item_id,
-                                    source,
-                                }
-                            })?,
-                        ));
-                    } else if property.header.box_type.as_bytes() == IROT_BOX_TYPE {
-                        transforms.push(PrimaryItemTransformProperty::Rotation(
-                            property.parse_irot().map_err(|source| {
-                                ExtractHeicItemDataError::GridTileRotation {
-                                    item_id,
-                                    tile_item_id,
-                                    source,
-                                }
-                            })?,
-                        ));
-                    } else if property.header.box_type.as_bytes() == IMIR_BOX_TYPE {
-                        transforms.push(PrimaryItemTransformProperty::Mirror(
-                            property.parse_imir().map_err(|source| {
-                                ExtractHeicItemDataError::GridTileMirror {
-                                    item_id,
-                                    tile_item_id,
-                                    source,
-                                }
-                            })?,
-                        ));
-                    }
-                    continue;
-                }
-
-                if hvcc.is_some() {
-                    return Err(
-                        ExtractHeicItemDataError::DuplicateGridTileCodecConfiguration {
-                            item_id,
-                            tile_item_id,
-                        },
-                    );
-                }
-
-                hvcc = Some(property.parse_hvcc().map_err(|source| {
-                    ExtractHeicItemDataError::GridTileCodecConfiguration {
-                        item_id,
-                        tile_item_id,
-                        source,
-                    }
-                })?);
             }
         }
+    }
+    let mut property_cache = BTreeMap::new();
+    resolve_grid_tile_hvcc_colr_and_transforms_indexed(
+        item_id,
+        tile_item_id,
+        &tile_associations,
+        flattened_properties,
+        &mut property_cache,
+    )
+}
+
+fn resolve_grid_tile_hvcc_colr_and_transforms_indexed(
+    item_id: u32,
+    tile_item_id: u32,
+    associations: &[&ItemPropertyAssociation],
+    flattened_properties: &[ParsedBox<'_>],
+    property_cache: &mut BTreeMap<usize, CachedGridProperty>,
+) -> Result<
+    (
+        HevcDecoderConfigurationBox,
+        PrimaryItemColorProperties,
+        Vec<PrimaryItemTransformProperty>,
+    ),
+    ExtractHeicItemDataError,
+> {
+    let mut hvcc = None;
+    let mut last_nclx = None;
+    let mut last_icc = None;
+    let mut transforms = Vec::new();
+
+    for association in associations {
+        if association.property_index == 0 {
+            continue;
+        }
+
+        let property_index = usize::from(association.property_index - 1);
+        if property_index >= flattened_properties.len() {
+            return Err(ExtractHeicItemDataError::GridTilePropertyIndexOutOfRange {
+                item_id,
+                tile_item_id,
+                property_index: association.property_index,
+                available: flattened_properties.len(),
+            });
+        }
+        let property = &flattened_properties[property_index];
+        if property.header.box_type.as_bytes() == HVCC_BOX_TYPE && hvcc.is_some() {
+            return Err(
+                ExtractHeicItemDataError::DuplicateGridTileCodecConfiguration {
+                    item_id,
+                    tile_item_id,
+                },
+            );
+        }
+        if let Entry::Vacant(entry) = property_cache.entry(property_index) {
+            let parsed = parse_grid_tile_property(item_id, tile_item_id, property)?;
+            entry.insert(parsed);
+        }
+        match &property_cache[&property_index] {
+            CachedGridProperty::Hvcc(parsed) => hvcc = Some(parsed.clone()),
+            CachedGridProperty::Colr(parsed) => match &parsed.information {
+                ColorInformation::Nclx(_) => last_nclx = Some(property_index),
+                ColorInformation::Icc(_) => last_icc = Some(property_index),
+            },
+            CachedGridProperty::Transform(transform) => transforms.push(*transform),
+            CachedGridProperty::Ignored => {}
+        }
+    }
+
+    let mut colr = PrimaryItemColorProperties::default();
+    if let Some(index) = last_nclx
+        && let Some(CachedGridProperty::Colr(parsed)) = property_cache.get(&index)
+        && let ColorInformation::Nclx(profile) = &parsed.information
+    {
+        colr.nclx = Some(profile.clone());
+    }
+    if let Some(index) = last_icc
+        && let Some(CachedGridProperty::Colr(parsed)) = property_cache.get(&index)
+        && let ColorInformation::Icc(profile) = &parsed.information
+    {
+        colr.icc = Some(profile.clone());
     }
 
     let hvcc = hvcc.ok_or(
@@ -4841,6 +4988,17 @@ fn extract_heic_item_payload_from_location(
     location: &ItemLocationItem,
     item_id: u32,
 ) -> Result<(u8, Vec<u8>), ExtractHeicItemDataError> {
+    extract_heic_item_payload_from_location_with_idat(input, source, meta, location, item_id, None)
+}
+
+fn extract_heic_item_payload_from_location_with_idat(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+    meta: &MetaBox<'_>,
+    location: &ItemLocationItem,
+    item_id: u32,
+    idat: Option<&[u8]>,
+) -> Result<(u8, Vec<u8>), ExtractHeicItemDataError> {
     if location.data_reference_index != 0 {
         return Err(ExtractHeicItemDataError::UnsupportedDataReferenceIndex {
             item_id,
@@ -4851,12 +5009,16 @@ fn extract_heic_item_payload_from_location(
     let idat_payload: &[u8] = match location.construction_method {
         0 => &[],
         1 => {
-            let children = meta
-                .parse_children()
-                .map_err(ExtractHeicItemDataError::MetaChildBoxes)?;
-            let idat_box = find_first_child_box(&children, IDAT_BOX_TYPE)
-                .ok_or(ExtractHeicItemDataError::MissingIdatBox { item_id })?;
-            idat_box.payload
+            if let Some(idat) = idat {
+                idat
+            } else {
+                let children = meta
+                    .parse_children()
+                    .map_err(ExtractHeicItemDataError::MetaChildBoxes)?;
+                find_first_child_box(&children, IDAT_BOX_TYPE)
+                    .ok_or(ExtractHeicItemDataError::MissingIdatBox { item_id })?
+                    .payload
+            }
         }
         construction_method => {
             return Err(ExtractHeicItemDataError::UnsupportedConstructionMethod {
@@ -7531,6 +7693,69 @@ pub(crate) mod test_support {
         full_box(b"iloc", 0, 0, &payload)
     }
 
+    pub(crate) fn minimal_heic_grid_file(
+        grid_dims: (u16, u16),
+        output_dims: (u16, u16),
+        tile_ids: &[u16],
+        tile_payload: &[u8],
+        properties: &[Vec<u8>],
+        tile_property_indices: &[u8],
+        extra_ipma_entries: &[(u16, &[u8])],
+    ) -> Vec<u8> {
+        let (rows, columns) = grid_dims;
+        let (output_width, output_height) = output_dims;
+        let mut descriptor = Vec::new();
+        descriptor.extend_from_slice(&[0, 0, (rows - 1) as u8, (columns - 1) as u8]);
+        descriptor.extend_from_slice(&output_width.to_be_bytes());
+        descriptor.extend_from_slice(&output_height.to_be_bytes());
+
+        let mut distinct_tile_ids = tile_ids.to_vec();
+        distinct_tile_ids.sort_unstable();
+        distinct_tile_ids.dedup();
+
+        let ftyp = ftyp_box(b"mif1");
+        let meta_with_offsets = |descriptor_offset: u32, tile_offset: u32| {
+            let mut iloc_items = vec![(
+                1_u16,
+                descriptor_offset,
+                u32::try_from(descriptor.len()).unwrap(),
+            )];
+            for tile_id in &distinct_tile_ids {
+                iloc_items.push((
+                    *tile_id,
+                    tile_offset,
+                    u32::try_from(tile_payload.len()).unwrap(),
+                ));
+            }
+            let mut infe_entries = vec![infe_box(1, b"grid")];
+            let mut ipma_entries: Vec<(u16, &[u8])> = Vec::new();
+            for tile_id in &distinct_tile_ids {
+                infe_entries.push(infe_box(*tile_id, b"hvc1"));
+                ipma_entries.push((*tile_id, tile_property_indices));
+            }
+            ipma_entries.extend_from_slice(extra_ipma_entries);
+            meta_file(&[
+                pitm_box(1),
+                iloc_with_extent_box(&iloc_items),
+                iinf_box(&infe_entries),
+                iref_dimg_box(1, tile_ids),
+                iprp_box(properties, &ipma_entries),
+            ])
+        };
+        let meta_len = meta_with_offsets(0, 0).len();
+        let mdat_header_len = 8;
+        let descriptor_offset = u32::try_from(ftyp.len() + meta_len + mdat_header_len).unwrap();
+        let tile_offset = descriptor_offset + u32::try_from(descriptor.len()).unwrap();
+        let meta = meta_with_offsets(descriptor_offset, tile_offset);
+
+        let mut file = ftyp;
+        file.extend_from_slice(&meta);
+        let mut mdat_payload = descriptor;
+        mdat_payload.extend_from_slice(tile_payload);
+        file.extend_from_slice(&plain_box(b"mdat", &mdat_payload));
+        file
+    }
+
     pub(crate) fn minimal_uncompressed_rgb3_heif_generic_compression(
         compression_type: &[u8; 4],
         compressed_payload: &[u8],
@@ -7694,13 +7919,16 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{
         colr_icc_box, colr_nclx_box, ftyp_box, hvcc_box, iinf_box, iloc_box, iloc_multi_extent_box,
-        infe_box, iprp_box, iref_dimg_box, ispe_box, meta_file, pitm_box, plain_box, uncc_v1_box,
+        infe_box, iprp_box, iref_dimg_box, ispe_box, meta_file, minimal_heic_grid_file, pitm_box,
+        plain_box, uncc_v1_box,
     };
     use super::{
-        ExtractUncompressedItemDataError, FourCc, IccColorProfile, NclxColorProfile,
-        ParseItemLocationBoxError, ParseItemPropertyAssociationBoxError,
-        PrimaryItemColorProperties, extract_primary_uncompressed_item_data,
-        extract_primary_uncompressed_item_data_from_source,
+        ExtractHeicItemDataError, ExtractUncompressedItemDataError, FourCc,
+        HeicPrimaryItemDataWithGrid, IccColorProfile, NclxColorProfile, ParseItemLocationBoxError,
+        ParseItemPropertyAssociationBoxError, PrimaryItemColorProperties,
+        extract_primary_heic_item_data_with_grid,
+        extract_primary_heic_item_data_with_grid_from_source,
+        extract_primary_uncompressed_item_data, extract_primary_uncompressed_item_data_from_source,
         merge_primary_and_grid_tile_color_properties, parse_iloc_payload, parse_ipma_payload,
         primary_heic_color_properties,
     };
@@ -8069,6 +8297,220 @@ mod tests {
         assert!(matches!(
             err,
             ExtractUncompressedItemDataError::ExtentOutOfBounds { .. }
+        ));
+    }
+
+    #[test]
+    fn grid_tile_payloads_are_budgeted_across_duplicate_references() {
+        let tile_payload = vec![0xAB_u8; 3 * 1024 * 1024];
+        let tile_ids = vec![2_u16; 64];
+
+        let file = minimal_heic_grid_file(
+            (8, 8),
+            (512, 512),
+            &tile_ids,
+            &tile_payload,
+            &[hvcc_box()],
+            &[1],
+            &[],
+        );
+
+        let err = extract_primary_heic_item_data_with_grid(&file)
+            .expect_err("duplicate payloads must be budgeted");
+        assert!(matches!(
+            err,
+            ExtractHeicItemDataError::PayloadTooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn grid_tile_payload_reuse_within_budget_still_resolves() {
+        let tile_payload = vec![0xAB_u8; 3 * 1024 * 1024];
+        let tile_ids = vec![2_u16; 8];
+
+        let file = minimal_heic_grid_file(
+            (1, 8),
+            (512, 64),
+            &tile_ids,
+            &tile_payload,
+            &[hvcc_box()],
+            &[1],
+            &[],
+        );
+
+        let HeicPrimaryItemDataWithGrid::Grid(grid) =
+            extract_primary_heic_item_data_with_grid(&file).expect("grid should resolve")
+        else {
+            panic!("expected grid");
+        };
+        assert_eq!(grid.tiles.len(), 8);
+    }
+
+    #[test]
+    fn grid_resolution_handles_many_decoy_associations() {
+        let decoys: Vec<(u16, &[u8])> = (0..3000)
+            .map(|index| (1000 + index as u16, &[1_u8][..]))
+            .collect();
+
+        let file = minimal_heic_grid_file(
+            (1, 2),
+            (64, 64),
+            &[2, 3],
+            &[0x11; 1024],
+            &[hvcc_box(), colr_nclx_box(12, 13, 6, true)],
+            &[1, 2],
+            &decoys,
+        );
+
+        let HeicPrimaryItemDataWithGrid::Grid(grid) =
+            extract_primary_heic_item_data_with_grid(&file).expect("grid should resolve")
+        else {
+            panic!("expected grid");
+        };
+        assert_eq!(grid.tiles.len(), 2);
+        assert_eq!(grid.tiles[0].hvcc, grid.tiles[1].hvcc);
+        assert_eq!(
+            grid.tiles[0].colr.nclx.as_ref().unwrap().colour_primaries,
+            12
+        );
+    }
+
+    #[test]
+    fn grid_tile_colr_last_association_wins() {
+        let file = minimal_heic_grid_file(
+            (1, 1),
+            (64, 64),
+            &[2],
+            &[0x11; 64],
+            &[
+                hvcc_box(),
+                colr_nclx_box(12, 13, 6, true),
+                colr_nclx_box(1, 13, 1, true),
+            ],
+            &[1, 2, 3],
+            &[],
+        );
+
+        let HeicPrimaryItemDataWithGrid::Grid(grid) =
+            extract_primary_heic_item_data_with_grid(&file).expect("grid should resolve")
+        else {
+            panic!("expected grid");
+        };
+        assert_eq!(
+            grid.tiles[0].colr.nclx.as_ref().unwrap().colour_primaries,
+            1
+        );
+    }
+
+    #[test]
+    fn grid_tile_duplicate_codec_configuration_is_rejected() {
+        let file = minimal_heic_grid_file(
+            (1, 1),
+            (64, 64),
+            &[2],
+            &[0x11; 64],
+            &[hvcc_box(), hvcc_box()],
+            &[1, 2],
+            &[],
+        );
+
+        let err = extract_primary_heic_item_data_with_grid(&file)
+            .expect_err("duplicate hvcC must be rejected");
+        assert!(matches!(
+            err,
+            ExtractHeicItemDataError::DuplicateGridTileCodecConfiguration { .. }
+        ));
+    }
+
+    #[test]
+    fn grid_tile_property_index_out_of_range_is_rejected() {
+        let file = minimal_heic_grid_file(
+            (1, 1),
+            (64, 64),
+            &[2],
+            &[0x11; 64],
+            &[hvcc_box()],
+            &[9],
+            &[],
+        );
+
+        let err = extract_primary_heic_item_data_with_grid(&file)
+            .expect_err("out-of-range index must be rejected");
+        assert!(matches!(
+            err,
+            ExtractHeicItemDataError::GridTilePropertyIndexOutOfRange { .. }
+        ));
+    }
+
+    #[test]
+    fn grid_tile_payload_budget_scales_with_the_source_length() {
+        let tile_payload = vec![0xAB_u8; 129 * 1024 * 1024];
+        let file = minimal_heic_grid_file(
+            (1, 1),
+            (64, 64),
+            &[2],
+            &tile_payload,
+            &[hvcc_box()],
+            &[1],
+            &[],
+        );
+        let prefix_len = file.len() - tile_payload.len() - 16;
+
+        let mut source = crate::source::SliceSource::new(&file);
+        let HeicPrimaryItemDataWithGrid::Grid(grid) =
+            extract_primary_heic_item_data_with_grid_from_source(&mut source, &file[..prefix_len])
+                .expect("large source-backed grid should resolve")
+        else {
+            panic!("expected grid");
+        };
+        assert_eq!(grid.tiles.len(), 1);
+        assert_eq!(grid.tiles[0].payload.len(), tile_payload.len());
+    }
+
+    #[test]
+    fn grid_resolution_skips_millions_of_decoy_association_entries() {
+        let decoys: Vec<(u16, &[u8])> = (0..1_000_000)
+            .map(|index| (1000 + (index % 30_000) as u16, &[1_u8][..]))
+            .collect();
+
+        let file = minimal_heic_grid_file(
+            (1, 2),
+            (64, 64),
+            &[2, 3],
+            &[0x11; 1024],
+            &[hvcc_box()],
+            &[1],
+            &decoys,
+        );
+
+        let HeicPrimaryItemDataWithGrid::Grid(grid) =
+            extract_primary_heic_item_data_with_grid(&file).expect("grid should resolve")
+        else {
+            panic!("expected grid");
+        };
+        assert_eq!(grid.tiles.len(), 2);
+    }
+
+    #[test]
+    fn grid_tile_association_flood_is_rejected() {
+        let flood_associations: &[u8] = &[1_u8; 220];
+        let flood: Vec<(u16, &[u8])> = (0..300).map(|_| (2_u16, flood_associations)).collect();
+
+        let file = minimal_heic_grid_file(
+            (1, 1),
+            (64, 64),
+            &[2],
+            &[0x11; 64],
+            &[hvcc_box()],
+            &[1],
+            &flood,
+        );
+
+        let err = extract_primary_heic_item_data_with_grid(&file)
+            .expect_err("association flood must be rejected");
+        assert!(matches!(
+            err,
+            ExtractHeicItemDataError::GridTileAssociationCountTooLarge { .. }
         ));
     }
 }
