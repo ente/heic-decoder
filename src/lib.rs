@@ -2419,14 +2419,6 @@ fn decode_primary_uncompressed_to_channels_internal(
         }
     }
 
-    let mut channel_samples: [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT] =
-        std::array::from_fn(|_| None);
-    for channel_index in 0..UNCOMPRESSED_CHANNEL_COUNT {
-        if has_channel[channel_index] {
-            channel_samples[channel_index] = Some(vec![0_u16; pixel_count]);
-        }
-    }
-
     let item_data = if let Some(source) = source.as_mut() {
         isobmff::extract_primary_uncompressed_item_data_from_source(source, input)?
     } else {
@@ -2438,6 +2430,52 @@ fn decode_primary_uncompressed_to_channels_internal(
         &item_data.payload,
         GENERIC_COMPRESSION_LIMITS,
     )?;
+    let mut minimum_payload_bits = 0_u64;
+    for spec in &component_specs {
+        if spec.bit_depth == 0 || spec.bit_depth > 16 {
+            return Err(DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "uncC component bit depth {} is outside the supported 1..=16 range",
+                    spec.bit_depth
+                ),
+            });
+        }
+        let (subsample_x, subsample_y) = if interleave_type == UNCOMPRESSED_INTERLEAVE_MULTI_Y {
+            (2_usize, 1_usize)
+        } else {
+            uncompressed_component_subsampling(spec.role, sampling_type)?
+        };
+        minimum_payload_bits = minimum_payload_bits.saturating_add(
+            (width_usize.div_ceil(subsample_x) as u64)
+                .saturating_mul(height_usize.div_ceil(subsample_y) as u64)
+                .saturating_mul(u64::from(spec.bit_depth)),
+        );
+    }
+    if (payload.len() as u64).saturating_mul(8) < minimum_payload_bits {
+        return Err(DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "uncompressed payload of {} bytes cannot supply the {} bits required by the declared image geometry",
+                payload.len(),
+                minimum_payload_bits
+            ),
+        });
+    }
+    let mut channel_samples: [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT] =
+        std::array::from_fn(|_| None);
+    for channel_index in 0..UNCOMPRESSED_CHANNEL_COUNT {
+        if has_channel[channel_index] {
+            let mut samples = Vec::new();
+            samples.try_reserve_exact(pixel_count).map_err(|_| {
+                DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "uncompressed channel allocation of {pixel_count} u16 samples failed"
+                    ),
+                }
+            })?;
+            samples.resize(pixel_count, 0);
+            channel_samples[channel_index] = Some(samples);
+        }
+    }
     if interleave_type == UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT {
         let tile_layout = UncompressedTileDecodeLayout {
             tile_rows: tile_rows_usize,
@@ -15189,6 +15227,27 @@ mod tests {
             detail.contains("across units"),
             "expected a cumulative-limit error, got: {detail}"
         );
+    }
+
+    #[test]
+    fn uncompressed_channel_allocation_requires_matching_payload() {
+        let (file, _) =
+            isobmff::test_support::minimal_uncompressed_rgb3_heif_with_dimensions(65_535, 65_535);
+
+        let err = super::decode_bytes_to_rgba(&file).expect_err("lying ispe must be rejected");
+        let detail = err.to_string();
+        assert!(
+            detail.contains("cannot supply"),
+            "expected a payload-geometry mismatch error, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn uncompressed_multi_y_minimum_payload_is_not_overcounted() {
+        let (file, _) = isobmff::test_support::minimal_uncompressed_multi_y_heif();
+
+        let decoded = super::decode_bytes_to_rgba(&file).expect("multi-y decode should succeed");
+        assert_eq!((decoded.width, decoded.height), (2, 1));
     }
 
     #[test]
