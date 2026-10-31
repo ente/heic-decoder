@@ -2419,6 +2419,27 @@ fn decode_primary_uncompressed_to_channels_internal(
         }
     }
 
+    let tile_layout = UncompressedTileDecodeLayout {
+        tile_rows: tile_rows_usize,
+        tile_cols: tile_cols_usize,
+        tile_width: tile_width_usize,
+        tile_height: tile_height_usize,
+        image_width: width_usize,
+        row_align_size: properties.unc_c.row_align_size,
+        tile_align_size: properties.unc_c.tile_align_size,
+    };
+    let generic_compression_limits = GenericCompressionLimits {
+        max_total_bytes: GENERIC_COMPRESSION_LIMITS.max_total_bytes.min(
+            uncompressed_payload_upper_bound_bytes(
+                &component_specs,
+                sampling_type,
+                interleave_type,
+                &tile_layout,
+                properties.unc_c.pixel_size,
+            )?,
+        ),
+        max_units: GENERIC_COMPRESSION_LIMITS.max_units,
+    };
     let item_data = if let Some(source) = source.as_mut() {
         isobmff::extract_primary_uncompressed_item_data_from_source(source, input)?
     } else {
@@ -2428,7 +2449,7 @@ fn decode_primary_uncompressed_to_channels_internal(
         item_data.item_id,
         &item_data.generic_compression_properties,
         &item_data.payload,
-        GENERIC_COMPRESSION_LIMITS,
+        generic_compression_limits,
     )?;
     let mut minimum_payload_bits = 0_u64;
     for spec in &component_specs {
@@ -2477,15 +2498,6 @@ fn decode_primary_uncompressed_to_channels_internal(
         }
     }
     if interleave_type == UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT {
-        let tile_layout = UncompressedTileDecodeLayout {
-            tile_rows: tile_rows_usize,
-            tile_cols: tile_cols_usize,
-            tile_width: tile_width_usize,
-            tile_height: tile_height_usize,
-            image_width: width_usize,
-            row_align_size: properties.unc_c.row_align_size,
-            tile_align_size: properties.unc_c.tile_align_size,
-        };
         decode_uncompressed_tile_component_interleave(
             &payload,
             &component_specs,
@@ -3284,6 +3296,24 @@ fn decode_uncompressed_tile_component_interleave(
     Ok(())
 }
 
+fn uncompressed_component_sample_bits(
+    spec: UncompressedComponentDecodeSpec,
+) -> Result<usize, DecodeUncompressedError> {
+    let mut bits_per_component = usize::from(spec.bit_depth);
+    if spec.component_align_size != 0 {
+        let component_alignment = usize::from(spec.component_align_size);
+        let component_bytes = bits_per_component.div_ceil(8);
+        let aligned_component_bytes =
+            align_up_uncompressed_bytes(component_bytes, component_alignment, "component")?;
+        bits_per_component = aligned_component_bytes.checked_mul(8).ok_or_else(|| {
+            DecodeUncompressedError::InvalidInput {
+                detail: "component bit-size overflow after alignment expansion".to_string(),
+            }
+        })?;
+    }
+    Ok(bits_per_component)
+}
+
 fn uncompressed_component_tile_size_bytes(
     spec: UncompressedComponentDecodeSpec,
     tile_width: usize,
@@ -3308,25 +3338,7 @@ fn uncompressed_component_tile_size_bytes(
     let component_tile_width = tile_width / subsample_x;
     let component_tile_height = tile_height / subsample_y;
 
-    let mut bits_per_component = usize::from(spec.bit_depth);
-    if spec.component_align_size != 0 {
-        let component_alignment = usize::from(spec.component_align_size);
-        let component_bytes = bits_per_component.checked_add(7).ok_or_else(|| {
-            DecodeUncompressedError::InvalidInput {
-                detail: format!(
-                    "component bit-size overflow while computing alignment for {}-bit uncompressed samples",
-                    spec.bit_depth
-                ),
-            }
-        })? / 8;
-        let aligned_component_bytes =
-            align_up_uncompressed_bytes(component_bytes, component_alignment, "component")?;
-        bits_per_component = aligned_component_bytes.checked_mul(8).ok_or_else(|| {
-            DecodeUncompressedError::InvalidInput {
-                detail: "component bit-size overflow after alignment expansion".to_string(),
-            }
-        })?;
-    }
+    let bits_per_component = uncompressed_component_sample_bits(spec)?;
 
     let bits_per_row = bits_per_component
         .checked_mul(component_tile_width)
@@ -3393,6 +3405,112 @@ fn align_up_uncompressed_bytes(
                 "{target} alignment overflow while aligning {value} bytes to {alignment} bytes"
             ),
         })
+}
+
+fn uncompressed_payload_upper_bound_bytes(
+    specs: &[UncompressedComponentDecodeSpec],
+    sampling_type: u8,
+    interleave_type: u8,
+    tile_layout: &UncompressedTileDecodeLayout,
+    pixel_size: u32,
+) -> Result<usize, DecodeUncompressedError> {
+    let tile_count = tile_layout
+        .tile_rows
+        .checked_mul(tile_layout.tile_cols)
+        .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "uncompressed tile-count overflow for grid {}x{}",
+                tile_layout.tile_cols, tile_layout.tile_rows
+            ),
+        })?;
+    let per_tile_bytes = match interleave_type {
+        UNCOMPRESSED_INTERLEAVE_PIXEL | UNCOMPRESSED_INTERLEAVE_MULTI_Y => {
+            let groups_per_row = if interleave_type == UNCOMPRESSED_INTERLEAVE_MULTI_Y {
+                tile_layout.tile_width / 2
+            } else {
+                tile_layout.tile_width
+            };
+            let mut group_bits = 0_usize;
+            for spec in specs {
+                group_bits = group_bits
+                    .checked_add(uncompressed_component_sample_bits(*spec)?)
+                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                        detail: "uncompressed pixel-group bit-size overflow".to_string(),
+                    })?;
+            }
+            let tight_group_bytes = group_bits.div_ceil(8);
+            let pixel_size_bytes =
+                usize::try_from(pixel_size).map_err(|_| DecodeUncompressedError::InvalidInput {
+                    detail: format!("uncC pixel_size {pixel_size} cannot be represented"),
+                })?;
+            let group_bytes = pixel_size_bytes.max(tight_group_bytes);
+            let row_bytes = group_bytes.checked_mul(groups_per_row).ok_or_else(|| {
+                DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "uncompressed pixel-group row byte-size overflow for {groups_per_row} groups of {group_bytes} bytes"
+                    ),
+                }
+            })?;
+            let row_alignment = if tile_layout.row_align_size == 0 {
+                1
+            } else {
+                usize::try_from(tile_layout.row_align_size).map_err(|_| {
+                    DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "uncC row_align_size {} cannot be represented",
+                            tile_layout.row_align_size
+                        ),
+                    }
+                })?
+            };
+            let aligned_row_bytes = align_up_uncompressed_bytes(row_bytes, row_alignment, "row")?;
+            let tile_bytes = aligned_row_bytes
+                .checked_mul(tile_layout.tile_height)
+                .ok_or_else(|| {
+                    DecodeUncompressedError::InvalidInput {
+                        detail: format!(
+                            "uncompressed pixel-group tile byte-size overflow for {} rows of {aligned_row_bytes} bytes",
+                            tile_layout.tile_height
+                        ),
+                    }
+                })?;
+            let tile_alignment = usize::try_from(tile_layout.tile_align_size).map_err(|_| {
+                DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "uncC tile_align_size {} cannot be represented",
+                        tile_layout.tile_align_size
+                    ),
+                }
+            })?;
+            align_up_uncompressed_bytes(tile_bytes, tile_alignment, "tile")?
+        }
+        _ => {
+            let mut per_tile_bytes = 0_usize;
+            for spec in specs {
+                per_tile_bytes = per_tile_bytes
+                    .checked_add(uncompressed_component_tile_size_bytes(
+                        *spec,
+                        tile_layout.tile_width,
+                        tile_layout.tile_height,
+                        tile_layout.row_align_size,
+                        tile_layout.tile_align_size,
+                        sampling_type,
+                    )?)
+                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                        detail: "uncompressed tile byte-size overflow across components"
+                            .to_string(),
+                    })?;
+            }
+            per_tile_bytes
+        }
+    };
+    per_tile_bytes.checked_mul(tile_count).ok_or_else(|| {
+        DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "uncompressed payload byte-size overflow for {tile_count} tiles of {per_tile_bytes} bytes"
+            ),
+        }
+    })
 }
 
 fn decode_uncompressed_pixel_interleave(
@@ -3774,7 +3892,14 @@ fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
     }
 
     let mut decompressed = Vec::new();
-    let mut total_decompressed_bytes = 0_usize;
+    decompressed
+        .try_reserve_exact(limits.max_total_bytes)
+        .map_err(|_| DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "generic-compressed payload allocation of the {}-byte output budget failed",
+                limits.max_total_bytes
+            ),
+        })?;
     for (unit_index, unit) in units.iter().enumerate() {
         let start = usize::try_from(unit.offset).map_err(|_| {
             DecodeUncompressedError::InvalidInput {
@@ -3813,23 +3938,13 @@ fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
         }
 
         let unit_payload = &payload[start..end];
-        let unit_data = decompress_generic_compressed_unit(
+        decompress_generic_compressed_unit_into(
             generic_compression.config.compression_type,
             unit_payload,
             unit_index,
-            limits.max_unit_bytes,
+            &mut decompressed,
+            limits.max_total_bytes,
         )?;
-        total_decompressed_bytes = total_decompressed_bytes
-            .checked_add(unit_data.len())
-            .filter(|total| *total <= limits.max_total_bytes)
-            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-                detail: format!(
-                    "generic-compressed payload decompresses to more than {} bytes across units, exceeding the {}-byte limit",
-                    total_decompressed_bytes.saturating_add(unit_data.len()),
-                    limits.max_total_bytes
-                ),
-            })?;
-        decompressed.extend_from_slice(&unit_data);
     }
 
     Ok(Cow::Owned(decompressed))
@@ -4061,42 +4176,44 @@ fn read_icef_uint(
 
 #[derive(Clone, Copy)]
 struct GenericCompressionLimits {
-    max_unit_bytes: usize,
     max_total_bytes: usize,
     max_units: usize,
 }
 
 const GENERIC_COMPRESSION_LIMITS: GenericCompressionLimits = GenericCompressionLimits {
-    max_unit_bytes: 256 * 1024 * 1024,
     max_total_bytes: 1024 * 1024 * 1024,
     max_units: 65536,
 };
 
-fn decompress_generic_compressed_unit(
+fn decompress_generic_compressed_unit_into(
     compression_type: [u8; 4],
     compressed_data: &[u8],
     unit_index: usize,
-    max_unit_bytes: usize,
-) -> Result<Vec<u8>, DecodeUncompressedError> {
+    output: &mut Vec<u8>,
+    max_total_bytes: usize,
+) -> Result<(), DecodeUncompressedError> {
     let compression_label = String::from_utf8_lossy(&compression_type).into_owned();
     match compression_type {
-        GENERIC_COMPRESSION_TYPE_BROTLI => read_decompressed_to_limit(
+        GENERIC_COMPRESSION_TYPE_BROTLI => read_unit_into_budget(
             BrotliDecompressor::new(compressed_data, 4096),
             unit_index,
             "brotli",
-            max_unit_bytes,
+            output,
+            max_total_bytes,
         ),
-        GENERIC_COMPRESSION_TYPE_ZLIB => read_decompressed_to_limit(
+        GENERIC_COMPRESSION_TYPE_ZLIB => read_unit_into_budget(
             ZlibDecoder::new(compressed_data),
             unit_index,
             "zlib",
-            max_unit_bytes,
+            output,
+            max_total_bytes,
         ),
-        GENERIC_COMPRESSION_TYPE_DEFLATE => read_decompressed_to_limit(
+        GENERIC_COMPRESSION_TYPE_DEFLATE => read_unit_into_budget(
             DeflateDecoder::new(compressed_data),
             unit_index,
             "deflate",
-            max_unit_bytes,
+            output,
+            max_total_bytes,
         ),
         _ => Err(DecodeUncompressedError::UnsupportedFeature {
             detail: format!(
@@ -4106,30 +4223,46 @@ fn decompress_generic_compressed_unit(
     }
 }
 
-fn read_decompressed_to_limit<R: Read>(
-    decoder: R,
+fn read_unit_into_budget<R: Read>(
+    mut decoder: R,
     unit_index: usize,
     codec: &str,
-    max_unit_bytes: usize,
-) -> Result<Vec<u8>, DecodeUncompressedError> {
-    let mut decompressed = Vec::new();
-    decoder
-        .take(max_unit_bytes as u64 + 1)
-        .read_to_end(&mut decompressed)
-        .map_err(|err| DecodeUncompressedError::InvalidInput {
-            detail: format!(
-                "failed to decompress {codec} generic-compressed unit {unit_index}: {err}"
-            ),
-        })?;
-    if decompressed.len() > max_unit_bytes {
-        return Err(DecodeUncompressedError::InvalidInput {
-            detail: format!(
-                "{codec} generic-compressed unit {unit_index} decompresses to {} bytes, exceeding the {max_unit_bytes}-byte limit",
-                decompressed.len()
-            ),
-        });
+    output: &mut Vec<u8>,
+    max_total_bytes: usize,
+) -> Result<(), DecodeUncompressedError> {
+    let unit_start = output.len();
+    let budget_remaining = max_total_bytes.saturating_sub(unit_start);
+    {
+        let mut limited = decoder.by_ref().take(budget_remaining as u64);
+        limited
+            .read_to_end(output)
+            .map_err(|err| DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "failed to decompress {codec} generic-compressed unit {unit_index}: {err}"
+                ),
+            })?;
     }
-    Ok(decompressed)
+    if output.len() - unit_start == budget_remaining {
+        let mut overflow_probe = [0_u8; 1];
+        match decoder.read(&mut overflow_probe) {
+            Ok(0) => {}
+            Ok(_) => {
+                return Err(DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "{codec} generic-compressed unit {unit_index} decompresses to more than the {max_total_bytes}-byte output budget, exceeding the limit across units"
+                    ),
+                });
+            }
+            Err(err) => {
+                return Err(DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "failed to decompress {codec} generic-compressed unit {unit_index}: {err}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn uncompressed_channel_name(channel_index: usize) -> &'static str {
@@ -15153,7 +15286,7 @@ mod tests {
 
     #[test]
     fn generic_compression_unit_bomb_is_rejected() {
-        let target = super::GENERIC_COMPRESSION_LIMITS.max_unit_bytes + 64 * 1024;
+        let target = 64 * 1024;
         let zeros = [0_u8; 64 * 1024];
         let mut encoder =
             flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
@@ -15182,9 +15315,72 @@ mod tests {
     }
 
     #[test]
+    fn generic_compression_expansion_beyond_geometry_is_rejected_before_decode() {
+        let mut pixels_rgb = vec![10_u8, 20, 30, 200, 150, 100];
+        pixels_rgb.push(0);
+        let compressed = zlib_compress(&pixels_rgb);
+        let file = isobmff::test_support::minimal_uncompressed_rgb3_heif_generic_compression(
+            b"zlib",
+            &compressed,
+        );
+
+        let err =
+            super::decode_bytes_to_rgba(&file).expect_err("excess expansion must be rejected");
+        let detail = err.to_string();
+        assert!(
+            detail.contains("output budget"),
+            "expected a geometry-budget error, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn generic_compression_exact_budget_multi_unit_decodes() {
+        let unit_a = zlib_compress(&[10_u8, 20, 30]);
+        let unit_b = zlib_compress(&[200_u8, 150, 100]);
+        let file = isobmff::test_support::minimal_uncompressed_rgb3_heif_generic_compression_units(
+            b"zlib",
+            &[unit_a, unit_b],
+        );
+
+        let decoded = super::decode_bytes_to_rgba(&file).expect("multi-unit decode should succeed");
+        assert_eq!((decoded.width, decoded.height), (2, 1));
+        assert_eq!(
+            decoded.pixels,
+            super::DecodedRgbaPixels::U8(vec![10, 20, 30, 255, 200, 150, 100, 255])
+        );
+    }
+
+    #[test]
+    fn generic_compression_multi_y_respects_geometry_budget() {
+        let pixels = [40_u8, 240, 60, 110];
+        let exact = zlib_compress(&pixels);
+        let exact_file =
+            isobmff::test_support::minimal_uncompressed_multi_y_heif_generic_compression(
+                b"zlib", &exact,
+            );
+        let decoded =
+            super::decode_bytes_to_rgba(&exact_file).expect("multi-y decode should succeed");
+        assert_eq!((decoded.width, decoded.height), (2, 1));
+
+        let mut padded = pixels.to_vec();
+        padded.push(0);
+        let overflow = zlib_compress(&padded);
+        let overflow_file =
+            isobmff::test_support::minimal_uncompressed_multi_y_heif_generic_compression(
+                b"zlib", &overflow,
+            );
+        let err = super::decode_bytes_to_rgba(&overflow_file)
+            .expect_err("multi-y expansion beyond geometry must be rejected");
+        let detail = err.to_string();
+        assert!(
+            detail.contains("output budget"),
+            "expected a geometry-budget error, got: {detail}"
+        );
+    }
+
+    #[test]
     fn generic_compression_total_cap_spans_units() {
         let limits = super::GenericCompressionLimits {
-            max_unit_bytes: 1024,
             max_total_bytes: 1024,
             max_units: 65536,
         };
@@ -15253,7 +15449,6 @@ mod tests {
     #[test]
     fn generic_compression_unit_count_cap() {
         let limits = super::GenericCompressionLimits {
-            max_unit_bytes: 1024,
             max_total_bytes: 65536,
             max_units: 1,
         };
