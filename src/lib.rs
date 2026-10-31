@@ -3431,9 +3431,29 @@ fn uncompressed_payload_upper_bound_bytes(
                 tile_layout.tile_width
             };
             let mut group_bits = 0_usize;
+            let mut aligned_components = 0_usize;
             for spec in specs {
                 group_bits = group_bits
                     .checked_add(uncompressed_component_sample_bits(*spec)?)
+                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                        detail: "uncompressed pixel-group bit-size overflow".to_string(),
+                    })?;
+                if spec.component_align_size != 0 {
+                    aligned_components = aligned_components.checked_add(1).ok_or_else(|| {
+                        DecodeUncompressedError::InvalidInput {
+                            detail: "uncompressed pixel-group aligned-component-count overflow"
+                                .to_string(),
+                        }
+                    })?;
+                }
+            }
+            if aligned_components > 0 {
+                group_bits = group_bits
+                    .checked_add(aligned_components.checked_mul(7).ok_or_else(|| {
+                        DecodeUncompressedError::InvalidInput {
+                            detail: "uncompressed pixel-group bit-size overflow".to_string(),
+                        }
+                    })?)
                     .ok_or_else(|| DecodeUncompressedError::InvalidInput {
                         detail: "uncompressed pixel-group bit-size overflow".to_string(),
                     })?;
@@ -3451,18 +3471,14 @@ fn uncompressed_payload_upper_bound_bytes(
                     ),
                 }
             })?;
-            let row_alignment = if tile_layout.row_align_size == 0 {
-                1
-            } else {
-                usize::try_from(tile_layout.row_align_size).map_err(|_| {
-                    DecodeUncompressedError::InvalidInput {
-                        detail: format!(
-                            "uncC row_align_size {} cannot be represented",
-                            tile_layout.row_align_size
-                        ),
-                    }
-                })?
-            };
+            let row_alignment = usize::try_from(tile_layout.row_align_size).map_err(|_| {
+                DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "uncC row_align_size {} cannot be represented",
+                        tile_layout.row_align_size
+                    ),
+                }
+            })?;
             let aligned_row_bytes = align_up_uncompressed_bytes(row_bytes, row_alignment, "row")?;
             let tile_bytes = aligned_row_bytes
                 .checked_mul(tile_layout.tile_height)
@@ -3483,6 +3499,103 @@ fn uncompressed_payload_upper_bound_bytes(
                 }
             })?;
             align_up_uncompressed_bytes(tile_bytes, tile_alignment, "tile")?
+        }
+        UNCOMPRESSED_INTERLEAVE_MIXED => {
+            let mut per_tile_bytes = 0_usize;
+            let mut chroma_pair_counted = false;
+            for spec in specs {
+                match spec.role {
+                    UncompressedChannelRole::ChromaBlue | UncompressedChannelRole::ChromaRed => {
+                        if chroma_pair_counted {
+                            continue;
+                        }
+                        chroma_pair_counted = true;
+                        let other_role = match spec.role {
+                            UncompressedChannelRole::ChromaBlue => {
+                                UncompressedChannelRole::ChromaRed
+                            }
+                            UncompressedChannelRole::ChromaRed => {
+                                UncompressedChannelRole::ChromaBlue
+                            }
+                            _ => unreachable!(),
+                        };
+                        let Some(other_spec) = specs
+                            .iter()
+                            .copied()
+                            .find(|candidate| candidate.role == other_role)
+                        else {
+                            return Err(DecodeUncompressedError::InvalidInput {
+                                detail:
+                                    "uncC mixed interleave is missing a complementary Cb/Cr channel"
+                                        .to_string(),
+                            });
+                        };
+                        let (subsample_x, subsample_y) =
+                            uncompressed_component_subsampling(spec.role, sampling_type)?;
+                        let pair_width = tile_layout.tile_width / subsample_x;
+                        let pair_height = tile_layout.tile_height / subsample_y;
+                        let mut pair_bits = uncompressed_component_sample_bits(*spec)?
+                            .checked_add(uncompressed_component_sample_bits(other_spec)?)
+                            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                                detail: "uncompressed mixed chroma-pair bit-size overflow"
+                                    .to_string(),
+                            })?;
+                        if spec.component_align_size != 0 {
+                            pair_bits = pair_bits.checked_add(7).ok_or_else(|| {
+                                DecodeUncompressedError::InvalidInput {
+                                    detail: "uncompressed mixed chroma-pair bit-size overflow"
+                                        .to_string(),
+                                }
+                            })?;
+                        }
+                        if other_spec.component_align_size != 0 {
+                            pair_bits = pair_bits.checked_add(7).ok_or_else(|| {
+                                DecodeUncompressedError::InvalidInput {
+                                    detail: "uncompressed mixed chroma-pair bit-size overflow"
+                                        .to_string(),
+                                }
+                            })?;
+                        }
+                        let row_bits = pair_bits.checked_mul(pair_width).ok_or_else(|| {
+                            DecodeUncompressedError::InvalidInput {
+                                detail: format!(
+                                    "uncompressed mixed chroma row bit-size overflow for {pair_width} pairs"
+                                ),
+                            }
+                        })?;
+                        let chroma_bytes = row_bits
+                            .div_ceil(8)
+                            .checked_mul(pair_height)
+                            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                                detail: "uncompressed mixed chroma byte-size overflow".to_string(),
+                            })?;
+                        per_tile_bytes =
+                            per_tile_bytes.checked_add(chroma_bytes).ok_or_else(|| {
+                                DecodeUncompressedError::InvalidInput {
+                                    detail:
+                                        "uncompressed tile byte-size overflow across components"
+                                            .to_string(),
+                                }
+                            })?;
+                    }
+                    _ => {
+                        per_tile_bytes = per_tile_bytes
+                            .checked_add(uncompressed_component_tile_size_bytes(
+                                *spec,
+                                tile_layout.tile_width,
+                                tile_layout.tile_height,
+                                tile_layout.row_align_size,
+                                tile_layout.tile_align_size,
+                                sampling_type,
+                            )?)
+                            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                                detail: "uncompressed tile byte-size overflow across components"
+                                    .to_string(),
+                            })?;
+                    }
+                }
+            }
+            per_tile_bytes
         }
         _ => {
             let mut per_tile_bytes = 0_usize;
@@ -3865,6 +3978,20 @@ fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
         });
     }
 
+    if !matches!(
+        generic_compression.config.compression_type,
+        GENERIC_COMPRESSION_TYPE_BROTLI
+            | GENERIC_COMPRESSION_TYPE_ZLIB
+            | GENERIC_COMPRESSION_TYPE_DEFLATE
+    ) {
+        return Err(DecodeUncompressedError::UnsupportedFeature {
+            detail: format!(
+                "unsupported cmpC compression_type {} for generic-compressed uncompressed (`unci`) payload",
+                String::from_utf8_lossy(&generic_compression.config.compression_type)
+            ),
+        });
+    }
+
     let fallback_size =
         u64::try_from(payload.len()).map_err(|_| DecodeUncompressedError::InvalidInput {
             detail: format!(
@@ -4232,15 +4359,12 @@ fn read_unit_into_budget<R: Read>(
 ) -> Result<(), DecodeUncompressedError> {
     let unit_start = output.len();
     let budget_remaining = max_total_bytes.saturating_sub(unit_start);
+    let decompress_error = |err: std::io::Error| DecodeUncompressedError::InvalidInput {
+        detail: format!("failed to decompress {codec} generic-compressed unit {unit_index}: {err}"),
+    };
     {
         let mut limited = decoder.by_ref().take(budget_remaining as u64);
-        limited
-            .read_to_end(output)
-            .map_err(|err| DecodeUncompressedError::InvalidInput {
-                detail: format!(
-                    "failed to decompress {codec} generic-compressed unit {unit_index}: {err}"
-                ),
-            })?;
+        limited.read_to_end(output).map_err(decompress_error)?;
     }
     if output.len() - unit_start == budget_remaining {
         let mut overflow_probe = [0_u8; 1];
@@ -4253,13 +4377,7 @@ fn read_unit_into_budget<R: Read>(
                     ),
                 });
             }
-            Err(err) => {
-                return Err(DecodeUncompressedError::InvalidInput {
-                    detail: format!(
-                        "failed to decompress {codec} generic-compressed unit {unit_index}: {err}"
-                    ),
-                });
-            }
+            Err(err) => return Err(decompress_error(err)),
         }
     }
     Ok(())
@@ -15286,21 +15404,7 @@ mod tests {
 
     #[test]
     fn generic_compression_unit_bomb_is_rejected() {
-        let target = 64 * 1024;
-        let zeros = [0_u8; 64 * 1024];
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        {
-            use std::io::Write as _;
-
-            let mut remaining = target;
-            while remaining > 0 {
-                let chunk = remaining.min(zeros.len());
-                encoder.write_all(&zeros[..chunk]).expect("bomb encode");
-                remaining -= chunk;
-            }
-        }
-        let compressed = encoder.finish().expect("bomb finish");
+        let compressed = zlib_compress(&[0_u8; 64 * 1024]);
         let file = isobmff::test_support::minimal_uncompressed_rgb3_heif_generic_compression(
             b"zlib",
             &compressed,
@@ -15376,6 +15480,130 @@ mod tests {
             detail.contains("output budget"),
             "expected a geometry-budget error, got: {detail}"
         );
+    }
+
+    fn deflate_compress(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).expect("deflate encode");
+        encoder.finish().expect("deflate finish")
+    }
+
+    fn brotli_compress(data: &[u8]) -> Vec<u8> {
+        let params = brotli::enc::BrotliEncoderParams {
+            quality: 1,
+            ..Default::default()
+        };
+        let mut reader = std::io::Cursor::new(data);
+        let mut writer = Vec::new();
+        brotli::enc::BrotliCompress(&mut reader, &mut writer, &params).expect("brotli encode");
+        writer
+    }
+
+    #[test]
+    fn generic_compression_brotli_exact_budget_decodes() {
+        let pixels_rgb: [u8; 6] = [10, 20, 30, 200, 150, 100];
+        let compressed = brotli_compress(&pixels_rgb);
+        let file = isobmff::test_support::minimal_uncompressed_rgb3_heif_generic_compression(
+            b"brot",
+            &compressed,
+        );
+
+        let decoded = super::decode_bytes_to_rgba(&file).expect("brotli decode should succeed");
+        assert_eq!((decoded.width, decoded.height), (2, 1));
+        assert_eq!(
+            decoded.pixels,
+            super::DecodedRgbaPixels::U8(vec![10, 20, 30, 255, 200, 150, 100, 255])
+        );
+    }
+
+    #[test]
+    fn generic_compression_deflate_exact_budget_decodes() {
+        let pixels_rgb: [u8; 6] = [10, 20, 30, 200, 150, 100];
+        let compressed = deflate_compress(&pixels_rgb);
+        let file = isobmff::test_support::minimal_uncompressed_rgb3_heif_generic_compression(
+            b"defl",
+            &compressed,
+        );
+
+        let decoded = super::decode_bytes_to_rgba(&file).expect("deflate decode should succeed");
+        assert_eq!((decoded.width, decoded.height), (2, 1));
+        assert_eq!(
+            decoded.pixels,
+            super::DecodedRgbaPixels::U8(vec![10, 20, 30, 255, 200, 150, 100, 255])
+        );
+    }
+
+    #[test]
+    fn generic_compression_mixed_alignment_pixel_layout_decodes() {
+        let pixels = [0xA0_u8, 0xBB, 0xC0, 0xDD];
+        let properties = |cmpc: Option<Vec<u8>>| {
+            let mut properties = vec![
+                isobmff::test_support::ispe_box(1, 1),
+                isobmff::test_support::cmpd_box(&[4, 5, 6, 7]),
+                isobmff::test_support::uncc_v0_box_with_aligns(
+                    &[(0, 3, 0), (1, 7, 1), (2, 3, 0), (3, 7, 1)],
+                    0,
+                    super::UNCOMPRESSED_INTERLEAVE_PIXEL,
+                ),
+            ];
+            if let Some(cmpc) = cmpc {
+                properties.push(cmpc);
+            }
+            properties
+        };
+        let compressed_file = isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+            &properties(Some(isobmff::test_support::cmpc_box(b"zlib", 0))),
+            &zlib_compress(&pixels),
+        );
+        let control_file = isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+            &properties(None),
+            &pixels,
+        );
+
+        let decoded = super::decode_bytes_to_rgba(&compressed_file)
+            .expect("compressed decode should succeed");
+        let control = super::decode_bytes_to_rgba(&control_file)
+            .expect("uncompressed control should succeed");
+        assert_eq!((decoded.width, decoded.height), (1, 1));
+        assert_eq!(decoded.pixels, control.pixels);
+    }
+
+    #[test]
+    fn generic_compression_mixed_interleave_aligned_chroma_decodes() {
+        let pixels = [0_u8; 8];
+        let properties = |cmpc: Option<Vec<u8>>| {
+            let mut properties = vec![
+                isobmff::test_support::ispe_box(4, 1),
+                isobmff::test_support::cmpd_box(&[1, 2, 3]),
+                isobmff::test_support::uncc_v0_box_with_aligns(
+                    &[(0, 7, 0), (1, 7, 1), (2, 0, 0)],
+                    1,
+                    super::UNCOMPRESSED_INTERLEAVE_MIXED,
+                ),
+            ];
+            if let Some(cmpc) = cmpc {
+                properties.push(cmpc);
+            }
+            properties
+        };
+        let compressed_file = isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+            &properties(Some(isobmff::test_support::cmpc_box(b"zlib", 0))),
+            &zlib_compress(&pixels),
+        );
+        let control_file = isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+            &properties(None),
+            &pixels,
+        );
+
+        let decoded = super::decode_bytes_to_rgba(&compressed_file)
+            .expect("compressed decode should succeed");
+        let control = super::decode_bytes_to_rgba(&control_file)
+            .expect("uncompressed control should succeed");
+        assert_eq!((decoded.width, decoded.height), (4, 1));
+        assert_eq!(decoded.pixels, control.pixels);
     }
 
     #[test]
