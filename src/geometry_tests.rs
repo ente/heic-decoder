@@ -932,3 +932,46 @@ fn grid_tile_streams_with_hidden_parameter_sets_decode_strictly() {
         "hidden tile parameter sets allocated {largest} bytes"
     );
 }
+
+#[test]
+fn rgb8_coded_route_rejects_visible_oversized_sps_before_allocation() {
+    let oversized = image_fixture(
+        b"hvc1",
+        (16, 16),
+        hevc_configuration(hidden_geometry_sps()),
+        hevc_payload(),
+        None,
+    );
+    let guardrails = DecodeGuardrails {
+        max_pixels: Some(1024),
+        ..DecodeGuardrails::default()
+    };
+    let (result, largest) =
+        tracked(|| decode_bytes_to_rgb8_with_guardrails(&oversized, guardrails));
+    assert!(matches!(
+        result,
+        Err(DecodeError::Guardrail(
+            DecodeGuardrailError::PixelCountExceeded { .. }
+        ))
+    ));
+    assert!(
+        largest < 1024 * 1024,
+        "oversized coded frame allocated {largest} bytes before the pixel limit"
+    );
+    let clean = image_fixture(
+        b"hvc1",
+        (16, 16),
+        hevc_configuration(small_hevc_sps()),
+        hevc_payload(),
+        None,
+    );
+    let decoded = decode_bytes_to_rgb8_with_guardrails(
+        &clean,
+        DecodeGuardrails {
+            max_pixels: Some(1024),
+            ..DecodeGuardrails::default()
+        },
+    )
+    .unwrap();
+    assert_eq!((decoded.width, decoded.height), (16, 16));
+}

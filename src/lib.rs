@@ -8632,6 +8632,8 @@ fn decode_primary_heic_to_rgb8_from_resolved_input(
             decode_primary_heic_grid_to_rgb8_image(&grid_data, transforms, icc_profile)
         }
         isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
+            let properties = parse_and_validate_heic_coded_item_preflight(input, &item_data)?;
+            geometry::preflight_hevc(&properties.hvcc, &item_data.payload, None, &guardrails)?;
             let decoded = decode_primary_heic_coded_item_to_image(input, &item_data)?;
             guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
             decoded_heic_to_rgb8_image(decoded, transforms, icc_profile)
