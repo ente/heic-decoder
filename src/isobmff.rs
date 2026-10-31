@@ -7899,13 +7899,15 @@ pub(crate) mod test_support {
                 (*component_index, *component_bit_depth_minus_one, 0)
             })
             .collect();
-        uncc_v0_box_with_aligns(&with_aligns, sampling_type, interleave_type)
+        uncc_v0_box_with_aligns(&with_aligns, sampling_type, interleave_type, 0, 0)
     }
 
     pub(crate) fn uncc_v0_box_with_aligns(
         components: &[(u16, u8, u8)],
         sampling_type: u8,
         interleave_type: u8,
+        row_align_size: u32,
+        tile_align_size: u32,
     ) -> Vec<u8> {
         let mut payload = vec![0_u8; 4];
         payload.extend_from_slice(&u32::try_from(components.len()).unwrap().to_be_bytes());
@@ -7920,8 +7922,8 @@ pub(crate) mod test_support {
         payload.push(0);
         payload.push(0);
         payload.extend_from_slice(&0_u32.to_be_bytes());
-        payload.extend_from_slice(&0_u32.to_be_bytes());
-        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(&row_align_size.to_be_bytes());
+        payload.extend_from_slice(&tile_align_size.to_be_bytes());
         payload.extend_from_slice(&0_u32.to_be_bytes());
         payload.extend_from_slice(&0_u32.to_be_bytes());
         full_box(b"uncC", 0, 0, &payload)

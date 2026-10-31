@@ -3447,7 +3447,7 @@ fn uncompressed_payload_upper_bound_bytes(
                     })?;
                 }
             }
-            if aligned_components > 0 {
+            if aligned_components > 0 && aligned_components < specs.len() {
                 group_bits = group_bits
                     .checked_add(aligned_components.checked_mul(7).ok_or_else(|| {
                         DecodeUncompressedError::InvalidInput {
@@ -3540,15 +3540,9 @@ fn uncompressed_payload_upper_bound_bytes(
                                 detail: "uncompressed mixed chroma-pair bit-size overflow"
                                     .to_string(),
                             })?;
-                        if spec.component_align_size != 0 {
-                            pair_bits = pair_bits.checked_add(7).ok_or_else(|| {
-                                DecodeUncompressedError::InvalidInput {
-                                    detail: "uncompressed mixed chroma-pair bit-size overflow"
-                                        .to_string(),
-                                }
-                            })?;
-                        }
-                        if other_spec.component_align_size != 0 {
+                        if (spec.component_align_size != 0)
+                            != (other_spec.component_align_size != 0)
+                        {
                             pair_bits = pair_bits.checked_add(7).ok_or_else(|| {
                                 DecodeUncompressedError::InvalidInput {
                                     detail: "uncompressed mixed chroma-pair bit-size overflow"
@@ -3595,7 +3589,15 @@ fn uncompressed_payload_upper_bound_bytes(
                     }
                 }
             }
-            per_tile_bytes
+            let tile_alignment = usize::try_from(tile_layout.tile_align_size).map_err(|_| {
+                DecodeUncompressedError::InvalidInput {
+                    detail: format!(
+                        "uncC tile_align_size {} cannot be represented",
+                        tile_layout.tile_align_size
+                    ),
+                }
+            })?;
+            align_up_uncompressed_bytes(per_tile_bytes, tile_alignment, "tile")?
         }
         _ => {
             let mut per_tile_bytes = 0_usize;
@@ -15547,6 +15549,8 @@ mod tests {
                     &[(0, 3, 0), (1, 7, 1), (2, 3, 0), (3, 7, 1)],
                     0,
                     super::UNCOMPRESSED_INTERLEAVE_PIXEL,
+                    0,
+                    0,
                 ),
             ];
             if let Some(cmpc) = cmpc {
@@ -15582,6 +15586,45 @@ mod tests {
                     &[(0, 7, 0), (1, 7, 1), (2, 0, 0)],
                     1,
                     super::UNCOMPRESSED_INTERLEAVE_MIXED,
+                    0,
+                    0,
+                ),
+            ];
+            if let Some(cmpc) = cmpc {
+                properties.push(cmpc);
+            }
+            properties
+        };
+        let compressed_file = isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+            &properties(Some(isobmff::test_support::cmpc_box(b"zlib", 0))),
+            &zlib_compress(&pixels),
+        );
+        let control_file = isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+            &properties(None),
+            &pixels,
+        );
+
+        let decoded = super::decode_bytes_to_rgba(&compressed_file)
+            .expect("compressed decode should succeed");
+        let control = super::decode_bytes_to_rgba(&control_file)
+            .expect("uncompressed control should succeed");
+        assert_eq!((decoded.width, decoded.height), (4, 1));
+        assert_eq!(decoded.pixels, control.pixels);
+    }
+
+    #[test]
+    fn generic_compression_mixed_interleave_tile_alignment_decodes() {
+        let pixels = [0_u8; 16];
+        let properties = |cmpc: Option<Vec<u8>>| {
+            let mut properties = vec![
+                isobmff::test_support::ispe_box(4, 1),
+                isobmff::test_support::cmpd_box(&[1, 2, 3]),
+                isobmff::test_support::uncc_v0_box_with_aligns(
+                    &[(0, 15, 0), (1, 7, 0), (2, 7, 0)],
+                    1,
+                    super::UNCOMPRESSED_INTERLEAVE_MIXED,
+                    0,
+                    8,
                 ),
             ];
             if let Some(cmpc) = cmpc {
