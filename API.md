@@ -94,6 +94,15 @@ Also note:
 - These low-level APIs expose more container/codec details and have a larger
   surface for malformed-input handling.
 
+### Framing note
+
+Assembled HEVC streams are decoded with fixed four-byte length-prefixed
+framing. Streams whose first NAL unit is 1 byte or 256-511 bytes long were
+previously re-detected as Annex B start-code data, which could decode hidden
+parameter sets embedded anywhere in the stream and bypass pixel limits; such
+streams now decode strictly by their length prefixes and either decode their
+visible parameter sets or fail cleanly.
+
 ## Input Path Selection
 
 Use this decision order:

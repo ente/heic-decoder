@@ -681,3 +681,254 @@ fn avif_coded_geometry_mismatch_is_checked_without_a_pixel_limit() {
     ));
     assert!(largest < 256 * 2048);
 }
+
+fn bit_reader_ue(bits: &[bool], position: &mut usize) -> u32 {
+    let mut zeros = 0;
+    while !bits[*position] {
+        zeros += 1;
+        *position += 1;
+    }
+    *position += 1;
+    let mut value = 1;
+    for _ in 0..zeros {
+        value = (value << 1) | u32::from(bits[*position]);
+        *position += 1;
+    }
+    value - 1
+}
+
+fn bit_writer_ue(bits: &mut Vec<bool>, value: u32) {
+    let value = value + 1;
+    let width = 32 - value.leading_zeros();
+    bits.extend(std::iter::repeat_n(false, (width - 1) as usize));
+    for i in (0..width).rev() {
+        bits.push(value & (1 << i) != 0);
+    }
+}
+
+fn hidden_geometry_sps() -> Vec<u8> {
+    let base = small_hevc_sps();
+    let sps = crate::heic_decoder::hevc::bitstream::parse_single_nal(&base).unwrap();
+    let mut bits: Vec<bool> = sps
+        .payload
+        .iter()
+        .flat_map(|byte| (0..8).rev().map(move |i| byte & (1 << i) != 0))
+        .collect();
+    let mut cursor = 104;
+    bit_reader_ue(&bits, &mut cursor);
+    assert_eq!(bit_reader_ue(&bits, &mut cursor), 1);
+    let start = cursor;
+    assert_eq!(bit_reader_ue(&bits, &mut cursor), 16);
+    assert_eq!(bit_reader_ue(&bits, &mut cursor), 16);
+    assert!(!bits[cursor]);
+    cursor += 1;
+    let mut replacement = Vec::new();
+    bit_writer_ue(&mut replacement, 16384);
+    bit_writer_ue(&mut replacement, 16384);
+    replacement.push(true);
+    for crop in [0, 8184, 0, 8184] {
+        bit_writer_ue(&mut replacement, crop);
+    }
+    bits.splice(start..cursor, replacement);
+    while !bits.len().is_multiple_of(8) {
+        bits.push(false);
+    }
+    let raw: Vec<u8> = bits
+        .chunks_exact(8)
+        .map(|b| b.iter().fold(0, |v, &bit| (v << 1) | u8::from(bit)))
+        .collect();
+    let mut result = base[..2].to_vec();
+    let mut zeros = 0;
+    for byte in raw {
+        if zeros >= 2 && byte <= 3 {
+            result.push(3);
+            zeros = 0;
+        }
+        result.push(byte);
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+    }
+    result
+}
+
+fn junk_nal_with_hidden_parameter_sets(length: usize) -> Vec<u8> {
+    let mut nal = [
+        &[0x4eu8, 0x01][..],
+        &[0, 0, 0, 1][..],
+        &hidden_geometry_sps()[..],
+        &[0, 0, 1][..],
+        &hex("4401c173c089")[..],
+    ]
+    .concat();
+    nal.resize(length, 0xff);
+    nal
+}
+
+fn hevc_configuration_with_leading_nals(sps: Vec<u8>, leading: &[Vec<u8>]) -> Vec<u8> {
+    let mut config = vec![0u8; 23];
+    config[0] = 1;
+    config[1] = 1;
+    config[16] = 1;
+    config[17] = 1;
+    config[18] = 0xf8;
+    config[19] = 0xf8;
+    config[21] = 3;
+    config[22] = (leading.len() + 3) as u8;
+    for nal in leading.iter().chain([
+        &hex("40010c01ffff0408000003009fa800000300001eba0240"),
+        &sps,
+        &hex("4401c173c089"),
+    ]) {
+        config.push((nal[0] >> 1) & 63);
+        config.extend_from_slice(&1u16.to_be_bytes());
+        config.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+        config.extend_from_slice(nal);
+    }
+    boxed(b"hvcC", &config)
+}
+
+#[test]
+fn hidden_parameter_sets_cannot_bypass_pixel_limits() {
+    let leading = vec![junk_nal_with_hidden_parameter_sets(300)];
+    let input = image_fixture(
+        b"hvc1",
+        (16, 16),
+        hevc_configuration_with_leading_nals(small_hevc_sps(), &leading),
+        hevc_payload(),
+        None,
+    );
+    let clean = image_fixture(
+        b"hvc1",
+        (16, 16),
+        hevc_configuration(small_hevc_sps()),
+        hevc_payload(),
+        None,
+    );
+    let guardrails = DecodeGuardrails {
+        max_pixels: Some(1024),
+        ..DecodeGuardrails::default()
+    };
+    let (decoded, largest) =
+        tracked(|| decode_bytes_to_rgba_with_guardrails(&input, guardrails.clone()).unwrap());
+    assert_eq!(decoded.pixels, decode_bytes_to_rgba(&clean).unwrap().pixels);
+    assert!(
+        largest < 1024 * 1024,
+        "hidden parameter sets allocated {largest} bytes past the pixel limit"
+    );
+}
+
+#[test]
+fn hevc_decode_uses_fixed_length_prefixed_framing_at_first_nal_boundaries() {
+    let clean = image_fixture(
+        b"hvc1",
+        (16, 16),
+        hevc_configuration(small_hevc_sps()),
+        hevc_payload(),
+        None,
+    );
+    let expected = decode_bytes_to_rgba(&clean).unwrap();
+    for length in [1usize, 255, 256, 511, 512] {
+        let mut junk = vec![0x4eu8, 0x01];
+        junk.resize(length, 0xff);
+        let mut leading = vec![junk];
+        if length == 1 {
+            leading.push(junk_nal_with_hidden_parameter_sets(300));
+        }
+        let input = image_fixture(
+            b"hvc1",
+            (16, 16),
+            hevc_configuration_with_leading_nals(small_hevc_sps(), &leading),
+            hevc_payload(),
+            None,
+        );
+        let (decoded, largest) = tracked(|| {
+            decode_bytes_to_rgba_with_guardrails(
+                &input,
+                DecodeGuardrails {
+                    max_pixels: Some(1024),
+                    ..DecodeGuardrails::default()
+                },
+            )
+            .unwrap()
+        });
+        assert_eq!(decoded.pixels, expected.pixels, "first NAL length {length}");
+        assert!(
+            largest < 1024 * 1024,
+            "first NAL length {length} allocated {largest} bytes"
+        );
+    }
+}
+
+#[test]
+fn hidden_parameter_sets_in_auxiliary_alpha_stay_bounded() {
+    let leading_alpha_configuration = vec![junk_nal_with_hidden_parameter_sets(300)];
+    let input = image_fixture(
+        b"hvc1",
+        (16, 16),
+        hevc_configuration(small_hevc_sps()),
+        hevc_payload(),
+        Some((
+            (16, 16),
+            hevc_configuration_with_leading_nals(small_hevc_sps(), &leading_alpha_configuration),
+            hevc_payload(),
+        )),
+    );
+    let clean = image_fixture(
+        b"hvc1",
+        (16, 16),
+        hevc_configuration(small_hevc_sps()),
+        hevc_payload(),
+        Some((
+            (16, 16),
+            hevc_configuration(small_hevc_sps()),
+            hevc_payload(),
+        )),
+    );
+    let (decoded, largest) = tracked(|| {
+        decode_bytes_to_rgba_with_guardrails(
+            &input,
+            DecodeGuardrails {
+                max_pixels: Some(1024),
+                ..DecodeGuardrails::default()
+            },
+        )
+        .unwrap()
+    });
+    assert_eq!(
+        decoded.pixels,
+        decode_bytes_to_rgba_with_guardrails(
+            &clean,
+            DecodeGuardrails {
+                max_pixels: Some(1024),
+                ..DecodeGuardrails::default()
+            }
+        )
+        .unwrap()
+        .pixels
+    );
+    assert!(
+        largest < 1024 * 1024,
+        "hidden alpha parameter sets allocated {largest} bytes"
+    );
+}
+
+#[test]
+fn grid_tile_streams_with_hidden_parameter_sets_decode_strictly() {
+    let leading = vec![junk_nal_with_hidden_parameter_sets(300)];
+    let config = hevc_configuration_with_leading_nals(small_hevc_sps(), &leading);
+    let tile = isobmff::HeicGridTileItemData {
+        item_id: 1,
+        construction_method: 1,
+        hvcc: isobmff::parse_boxes(&config).unwrap()[0]
+            .parse_hvcc()
+            .unwrap(),
+        colr: Default::default(),
+        transforms: vec![],
+        payload: hevc_payload(),
+    };
+    let (decoded, largest) = tracked(|| crate::decode_heic_grid_tile_to_image(&tile).unwrap());
+    assert_eq!((decoded.width, decoded.height), (16, 16));
+    assert!(
+        largest < 1024 * 1024,
+        "hidden tile parameter sets allocated {largest} bytes"
+    );
+}

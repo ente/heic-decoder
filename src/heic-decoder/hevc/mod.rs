@@ -28,10 +28,10 @@ use crate::heic_decoder::error::HevcError;
 
 type Result<T> = core::result::Result<T, HevcError>;
 
-/// Decode HEVC bitstream to pixels (Annex B or raw format)
+/// Decode HEVC bitstream to pixels (four-byte length-prefixed NAL units)
 pub fn decode(data: &[u8]) -> Result<DecodedFrame> {
     // Parse NAL units
-    let nal_units = bitstream::parse_nal_units(data)?;
+    let nal_units = bitstream::parse_length_prefixed_ext(data, 4)?;
     decode_nal_units(&nal_units)
 }
 
