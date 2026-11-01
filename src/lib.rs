@@ -4021,12 +4021,14 @@ fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
     }
 
     let mut decompressed = Vec::new();
+    let initial_capacity = limits
+        .max_total_bytes
+        .min((payload.len().saturating_mul(4)).max(1024 * 1024));
     decompressed
-        .try_reserve_exact(limits.max_total_bytes)
+        .try_reserve_exact(initial_capacity)
         .map_err(|_| DecodeUncompressedError::InvalidInput {
             detail: format!(
-                "generic-compressed payload allocation of the {}-byte output budget failed",
-                limits.max_total_bytes
+                "generic-compressed payload allocation of the {initial_capacity}-byte initial reserve failed"
             ),
         })?;
     for (unit_index, unit) in units.iter().enumerate() {
@@ -15753,6 +15755,44 @@ mod tests {
         assert!(
             detail.contains("units"),
             "expected a unit-count-limit error, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn generic_compression_initial_reserve_is_bounded_by_input_size() {
+        let compressed = zlib_compress(&[7_u8; 8]);
+        let properties = isobmff::UncompressedGenericCompressionProperties {
+            cmpc: vec![isobmff::GenericCompressionPropertyPayload {
+                offset: 0,
+                payload: {
+                    let mut cmpc_payload = Vec::new();
+                    cmpc_payload.extend_from_slice(&[0_u8; 4]);
+                    cmpc_payload.extend_from_slice(b"zlib");
+                    cmpc_payload.push(super::GENERIC_COMPRESSED_UNIT_FULL_ITEM);
+                    cmpc_payload
+                },
+            }],
+            icef: vec![],
+        };
+        let limits = super::GenericCompressionLimits {
+            max_total_bytes: 1024 * 1024 * 1024,
+            max_units: 65536,
+        };
+
+        let mut decompressed =
+            super::maybe_decode_primary_uncompressed_generic_compression_payload(
+                1,
+                &properties,
+                &compressed,
+                limits,
+            )
+            .expect("tiny unit must decode within the large budget");
+        assert_eq!(decompressed.as_ref(), &[7_u8; 8]);
+        let owned = decompressed.to_mut();
+        assert!(
+            owned.capacity() <= 1024 * 1024,
+            "initial reservation must stay bounded by the compressed input size, got {}",
+            owned.capacity()
         );
     }
 
