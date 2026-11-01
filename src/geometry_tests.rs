@@ -975,3 +975,126 @@ fn rgb8_coded_route_rejects_visible_oversized_sps_before_allocation() {
     .unwrap();
     assert_eq!((decoded.width, decoded.height), (16, 16));
 }
+
+fn sps_with_tile_dimensions(width: u32, height: u32) -> Vec<u8> {
+    let base = small_hevc_sps();
+    let sps = crate::heic_decoder::hevc::bitstream::parse_single_nal(&base).unwrap();
+    let mut bits: Vec<bool> = sps
+        .payload
+        .iter()
+        .flat_map(|byte| (0..8).rev().map(move |i| byte & (1 << i) != 0))
+        .collect();
+    let mut cursor = 104;
+    bit_reader_ue(&bits, &mut cursor);
+    assert_eq!(bit_reader_ue(&bits, &mut cursor), 1);
+    let start = cursor;
+    assert_eq!(bit_reader_ue(&bits, &mut cursor), 16);
+    assert_eq!(bit_reader_ue(&bits, &mut cursor), 16);
+    assert!(!bits[cursor]);
+    cursor += 1;
+    let mut replacement = Vec::new();
+    bit_writer_ue(&mut replacement, width);
+    bit_writer_ue(&mut replacement, height);
+    replacement.push(false);
+    bits.splice(start..cursor, replacement);
+    while !bits.len().is_multiple_of(8) {
+        bits.push(false);
+    }
+    let raw: Vec<u8> = bits
+        .chunks_exact(8)
+        .map(|b| b.iter().fold(0, |v, &bit| (v << 1) | u8::from(bit)))
+        .collect();
+    let mut result = base[..2].to_vec();
+    let mut zeros = 0;
+    for byte in raw {
+        if zeros >= 2 && byte <= 3 {
+            result.push(3);
+            zeros = 0;
+        }
+        result.push(byte);
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+    }
+    result
+}
+
+fn tiled_grid(
+    columns: u16,
+    rows: u16,
+    output: (u32, u32),
+    sps: Vec<u8>,
+) -> isobmff::HeicGridPrimaryItemData {
+    let config = hevc_configuration(sps);
+    let hvcc = isobmff::parse_boxes(&config).unwrap()[0]
+        .parse_hvcc()
+        .unwrap();
+    let first = isobmff::HeicGridTileItemData {
+        item_id: 1,
+        construction_method: 1,
+        hvcc,
+        colr: Default::default(),
+        transforms: vec![],
+        payload: hevc_payload(),
+    };
+    let tile_count = u32::from(columns) * u32::from(rows);
+    isobmff::HeicGridPrimaryItemData {
+        item_id: 2,
+        construction_method: 1,
+        descriptor: isobmff::HeicGridDescriptor {
+            version: 0,
+            rows,
+            columns,
+            output_width: output.0,
+            output_height: output.1,
+        },
+        colr: Default::default(),
+        tile_item_ids: (1..=tile_count).collect(),
+        tiles: (0..tile_count)
+            .map(|index| {
+                let mut tile = first.clone();
+                tile.item_id = index + 1;
+                tile
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn heic_grid_single_span_accepts_fixed_tiles_beyond_padded_output() {
+    let sps = sps_with_tile_dimensions(512, 512);
+    for (columns, rows, output) in [
+        (1u16, 2u16, (300u32, 1000u32)),
+        (1, 16, (300, 8000)),
+        (1, 24, (480, 12000)),
+        (2, 1, (1000, 300)),
+        (16, 1, (8000, 300)),
+    ] {
+        let grid = tiled_grid(columns, rows, output, sps.clone());
+        assert!(
+            geometry::preflight_grid(&grid, &DecodeGuardrails::default()).is_ok(),
+            "{}x{} grid with output {}x{}",
+            columns,
+            rows,
+            output.0,
+            output.1
+        );
+    }
+}
+
+#[test]
+fn heic_grid_single_span_rejects_tiles_beyond_the_fixed_extent_limit() {
+    let sps = sps_with_tile_dimensions(600, 600);
+    let grid = tiled_grid(1, 2, (300, 1000), sps);
+    let result = geometry::preflight_grid(&grid, &DecodeGuardrails::default());
+    assert!(matches!(
+        result,
+        Err(DecodeError::HeicDecode(DecodeHeicError::InvalidDecodedFrame { detail }))
+            if detail.contains("tile geometry exceeds grid output")
+    ));
+}
+
+#[test]
+fn heic_grid_single_tile_keeps_the_padded_extent_bound() {
+    let sps = sps_with_tile_dimensions(512, 512);
+    let grid = tiled_grid(1, 1, (300, 8000), sps);
+    assert!(geometry::preflight_grid(&grid, &DecodeGuardrails::default()).is_err());
+}
