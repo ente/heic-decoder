@@ -7792,6 +7792,88 @@ pub(crate) mod test_support {
         file
     }
 
+    pub(crate) fn minimal_uncompressed_rgb3_heif_generic_compression_units(
+        compression_type: &[u8; 4],
+        compressed_units: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut compressed_payload = Vec::new();
+        for unit in compressed_units {
+            compressed_payload.extend_from_slice(unit);
+        }
+        let unit_sizes: Vec<u8> = compressed_units
+            .iter()
+            .map(|unit| u8::try_from(unit.len()).expect("unit fits a size byte"))
+            .collect();
+        let ftyp = ftyp_box(b"mif1");
+        let meta_with_payload_offset = |payload_offset: u32| {
+            meta_file(&[
+                pitm_box(1),
+                iloc_with_extent_box(&[(
+                    1,
+                    payload_offset,
+                    u32::try_from(compressed_payload.len()).unwrap(),
+                )]),
+                iinf_box(&[infe_box(1, b"unci")]),
+                iprp_box(
+                    &[
+                        ispe_box(2, 1),
+                        uncc_v1_box(b"rgb3"),
+                        cmpc_box(compression_type, 0),
+                        icef_implied_box(&unit_sizes),
+                    ],
+                    &[(1, &[1, 2, 3, 4])],
+                ),
+            ])
+        };
+        let meta_len = meta_with_payload_offset(0).len();
+        let mdat_header_len = 8;
+        let payload_offset = u32::try_from(ftyp.len() + meta_len + mdat_header_len).unwrap();
+        let meta = meta_with_payload_offset(payload_offset);
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&meta);
+        file.extend_from_slice(&plain_box(b"mdat", &compressed_payload));
+        file
+    }
+
+    pub(crate) fn minimal_uncompressed_multi_y_heif_generic_compression(
+        compression_type: &[u8; 4],
+        compressed_payload: &[u8],
+    ) -> Vec<u8> {
+        let ftyp = ftyp_box(b"mif1");
+        let meta_with_payload_offset = |payload_offset: u32| {
+            meta_file(&[
+                pitm_box(1),
+                iloc_with_extent_box(&[(
+                    1,
+                    payload_offset,
+                    u32::try_from(compressed_payload.len()).unwrap(),
+                )]),
+                iinf_box(&[infe_box(1, b"unci")]),
+                iprp_box(
+                    &[
+                        ispe_box(2, 1),
+                        cmpd_box(&[1, 2, 3]),
+                        uncc_v0_box(&[(0, 7), (1, 7), (0, 7), (2, 7)], 1, 5),
+                        cmpc_box(compression_type, 0),
+                    ],
+                    &[(1, &[1, 2, 3, 4])],
+                ),
+            ])
+        };
+        let meta_len = meta_with_payload_offset(0).len();
+        let mdat_header_len = 8;
+        let payload_offset = u32::try_from(ftyp.len() + meta_len + mdat_header_len).unwrap();
+        let meta = meta_with_payload_offset(payload_offset);
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&meta);
+        file.extend_from_slice(&plain_box(b"mdat", compressed_payload));
+        file
+    }
+
     /// A complete, decodable uncompressed HEIF file: `mif1` brand, a 2x1
     /// `unci` primary item with the version-1 `rgb3` (8-bit interleaved RGB)
     /// profile, and the pixel payload in a trailing `mdat`.
@@ -7811,24 +7893,70 @@ pub(crate) mod test_support {
         sampling_type: u8,
         interleave_type: u8,
     ) -> Vec<u8> {
+        let with_aligns: Vec<(u16, u8, u8)> = components
+            .iter()
+            .map(|(component_index, component_bit_depth_minus_one)| {
+                (*component_index, *component_bit_depth_minus_one, 0)
+            })
+            .collect();
+        uncc_v0_box_with_aligns(&with_aligns, sampling_type, interleave_type, 0, 0)
+    }
+
+    pub(crate) fn uncc_v0_box_with_aligns(
+        components: &[(u16, u8, u8)],
+        sampling_type: u8,
+        interleave_type: u8,
+        row_align_size: u32,
+        tile_align_size: u32,
+    ) -> Vec<u8> {
         let mut payload = vec![0_u8; 4];
         payload.extend_from_slice(&u32::try_from(components.len()).unwrap().to_be_bytes());
-        for (component_index, component_bit_depth_minus_one) in components {
+        for (component_index, component_bit_depth_minus_one, component_align_size) in components {
             payload.extend_from_slice(&component_index.to_be_bytes());
             payload.push(*component_bit_depth_minus_one);
             payload.push(0);
-            payload.push(0);
+            payload.push(*component_align_size);
         }
         payload.push(sampling_type);
         payload.push(interleave_type);
         payload.push(0);
         payload.push(0);
         payload.extend_from_slice(&0_u32.to_be_bytes());
-        payload.extend_from_slice(&0_u32.to_be_bytes());
-        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(&row_align_size.to_be_bytes());
+        payload.extend_from_slice(&tile_align_size.to_be_bytes());
         payload.extend_from_slice(&0_u32.to_be_bytes());
         payload.extend_from_slice(&0_u32.to_be_bytes());
         full_box(b"uncC", 0, 0, &payload)
+    }
+
+    pub(crate) fn minimal_uncompressed_heif_custom_layout(
+        properties: &[Vec<u8>],
+        mdat_payload: &[u8],
+    ) -> Vec<u8> {
+        let ftyp = ftyp_box(b"mif1");
+        let property_indices: Vec<u8> = (1..=u8::try_from(properties.len()).unwrap()).collect();
+        let meta_with_payload_offset = |payload_offset: u32| {
+            meta_file(&[
+                pitm_box(1),
+                iloc_with_extent_box(&[(
+                    1,
+                    payload_offset,
+                    u32::try_from(mdat_payload.len()).unwrap(),
+                )]),
+                iinf_box(&[infe_box(1, b"unci")]),
+                iprp_box(properties, &[(1, &property_indices)]),
+            ])
+        };
+        let meta_len = meta_with_payload_offset(0).len();
+        let mdat_header_len = 8;
+        let payload_offset = u32::try_from(ftyp.len() + meta_len + mdat_header_len).unwrap();
+        let meta = meta_with_payload_offset(payload_offset);
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&meta);
+        file.extend_from_slice(&plain_box(b"mdat", mdat_payload));
+        file
     }
 
     pub(crate) fn minimal_uncompressed_multi_y_heif() -> (Vec<u8>, Vec<u8>) {
