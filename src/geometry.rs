@@ -21,6 +21,17 @@ fn padded_extent(value: u32, alignment: u32) -> u64 {
     u64::from(value).div_ceil(u64::from(alignment)) * u64::from(alignment)
 }
 
+const GRID_SINGLE_SPAN_TILE_EXTENT_LIMIT: u64 = 512;
+
+fn single_span_tile_extent(output_extent: u32, alignment: u32, stacks_tiles: bool) -> u64 {
+    let padded = padded_extent(output_extent, alignment);
+    if stacks_tiles {
+        padded.max(GRID_SINGLE_SPAN_TILE_EXTENT_LIMIT)
+    } else {
+        padded
+    }
+}
+
 fn byte_limit(stage: &'static str, actual_bytes: u64, max_decoded_bytes: u64) -> DecodeError {
     DecodeGuardrailError::DecodedByteCountExceeded {
         stage,
@@ -157,12 +168,20 @@ pub(super) fn preflight_grid(
                     let max_width = if descriptor.columns > 1 {
                         u64::from(descriptor.output_width - 1) / u64::from(descriptor.columns - 1)
                     } else {
-                        padded_extent(descriptor.output_width, alignment)
+                        single_span_tile_extent(
+                            descriptor.output_width,
+                            alignment,
+                            descriptor.rows > 1,
+                        )
                     };
                     let max_height = if descriptor.rows > 1 {
                         u64::from(descriptor.output_height - 1) / u64::from(descriptor.rows - 1)
                     } else {
-                        padded_extent(descriptor.output_height, alignment)
+                        single_span_tile_extent(
+                            descriptor.output_height,
+                            alignment,
+                            descriptor.columns > 1,
+                        )
                     };
                     if u64::from(plan.destination_width) > max_width
                         || u64::from(plan.destination_height) > max_height
