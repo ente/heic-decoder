@@ -1454,3 +1454,8 @@ fn apple_monochrome_alpha_plane_decodes() {
         1,
     );
 }
+
+#[test]
+fn apple_alpha_coded_at_the_minimum_frame_size_is_kept() {
+    assert_alpha_ramp(include_bytes!("testdata/apple-alpha-40x30.heic"), 40, 30, 5);
+}

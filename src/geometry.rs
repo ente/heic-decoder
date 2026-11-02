@@ -74,20 +74,12 @@ fn check_sps(
         sps.pic_width_in_luma_samples,
         sps.pic_height_in_luma_samples,
     )?;
-    if let Some((width, height)) = expected {
-        if (metadata.width, metadata.height) != (width, height) {
-            return Err(invalid(
-                "auxiliary HEVC geometry does not match primary image",
-            ));
-        }
-        let alignment = sps.ctb_size();
-        if u64::from(sps.pic_width_in_luma_samples) > padded_extent(width, alignment)
-            || u64::from(sps.pic_height_in_luma_samples) > padded_extent(height, alignment)
-        {
-            return Err(invalid(
-                "auxiliary HEVC coded geometry exceeds primary image padding",
-            ));
-        }
+    if let Some(expected) = expected
+        && (metadata.width, metadata.height) != expected
+    {
+        return Err(invalid(
+            "auxiliary HEVC geometry does not match primary image",
+        ));
     }
     Ok(estimate_heic_grid_sps_decode_bytes(sps)?)
 }
