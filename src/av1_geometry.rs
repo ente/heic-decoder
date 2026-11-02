@@ -34,9 +34,6 @@ pub(crate) fn coded_dimensions(mut bytes: &[u8]) -> Result<Option<(u32, u32)>> {
     let mut sequence = None;
     while !bytes.is_empty() {
         let header = bytes[0];
-        if header & 0x81 != 0 {
-            return Err(invalid());
-        }
         let kind = (header >> 3) & 15;
         let mut offset = 1;
         let extension = if header & 4 != 0 {
@@ -241,6 +238,31 @@ mod tests {
             vec![0x0a; 1],
         ] {
             assert!(coded_dimensions(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn obu_header_forbidden_and_reserved_bits_are_ignored_like_the_decoder() {
+        let obus = |sequence_header: u8, frame_header: u8| {
+            vec![
+                sequence_header,
+                0x04,
+                0x18,
+                0x00,
+                0x00,
+                0x15,
+                frame_header,
+                0x01,
+                0x00,
+            ]
+        };
+        let expected = coded_dimensions(&obus(0x0a, 0x1a)).unwrap();
+        assert!(expected.is_some());
+        for (sequence_header, frame_header) in [(0x0b, 0x1a), (0x0a, 0x1b), (0x8a, 0x9a)] {
+            assert_eq!(
+                coded_dimensions(&obus(sequence_header, frame_header)).unwrap(),
+                expected
+            );
         }
     }
 }
