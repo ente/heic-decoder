@@ -1,8 +1,3 @@
-//! HEVC slice header and slice segment decoding
-//!
-//! This module handles parsing of slice segment headers (H.265 spec 7.3.6)
-//! and orchestrates CTU decoding for each slice.
-
 use super::bitstream::{BitstreamReader, NalUnit};
 use super::params::{Pps, Sps};
 use crate::heic_decoder::error::HevcError;
@@ -10,20 +5,15 @@ use alloc::vec::Vec;
 
 type Result<T> = core::result::Result<T, HevcError>;
 
-/// Slice type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SliceType {
-    /// B slice (bidirectional prediction)
     B = 0,
-    /// P slice (unidirectional prediction)
     P = 1,
-    /// I slice (intra prediction only)
     I = 2,
 }
 
 impl SliceType {
-    /// Create from raw value
     pub fn from_u8(val: u8) -> Option<Self> {
         match val {
             0 => Some(Self::B),
@@ -33,56 +23,38 @@ impl SliceType {
         }
     }
 
-    /// Check if this is an intra-only slice
     pub fn is_intra(self) -> bool {
         self == Self::I
     }
 }
 
-/// Partition mode for coding units
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PartMode {
-    /// 2Nx2N - single partition
     Part2Nx2N = 0,
-    /// 2NxN - horizontal split
     Part2NxN = 1,
-    /// Nx2N - vertical split
     PartNx2N = 2,
-    /// NxN - quad split (only for smallest CU with intra)
     PartNxN = 3,
-    /// 2NxnU - asymmetric horizontal (small top)
     Part2NxnU = 4,
-    /// 2NxnD - asymmetric horizontal (small bottom)
     Part2NxnD = 5,
-    /// nLx2N - asymmetric vertical (small left)
     PartnLx2N = 6,
-    /// nRx2N - asymmetric vertical (small right)
     PartnRx2N = 7,
 }
 
-/// Prediction mode
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PredMode {
-    /// Intra prediction
     Intra,
-    /// Inter prediction
     Inter,
-    /// Skip mode (inter)
     Skip,
 }
 
-/// Intra prediction mode (35 modes total)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IntraPredMode {
-    /// Planar mode (smooth gradient)
     Planar = 0,
-    /// DC mode (average value)
     Dc = 1,
-    /// Angular modes 2-34 (directional)
     Angular2 = 2,
     Angular3 = 3,
     Angular4 = 4,
@@ -119,7 +91,6 @@ pub enum IntraPredMode {
 }
 
 impl IntraPredMode {
-    /// Create from raw value
     #[inline]
     pub fn from_u8(val: u8) -> Option<Self> {
         match val {
@@ -162,83 +133,53 @@ impl IntraPredMode {
         }
     }
 
-    /// Get the raw mode value
     pub fn as_u8(self) -> u8 {
         self as u8
     }
 }
 
-/// Slice segment header
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SliceHeader {
-    /// First slice segment in picture flag
     pub first_slice_segment_in_pic_flag: bool,
-    /// No output of prior pics flag (for RAP pictures)
     pub no_output_of_prior_pics_flag: bool,
-    /// PPS ID
     pub pps_id: u8,
-    /// Dependent slice segment flag
     pub dependent_slice_segment_flag: bool,
-    /// Slice segment address (CTB index)
     pub slice_segment_address: u32,
 
-    /// Slice type (I, P, B)
     pub slice_type: SliceType,
-    /// Picture output flag
     pub pic_output_flag: bool,
-    /// Colour plane ID (for separate colour plane)
     pub colour_plane_id: u8,
-    /// Picture order count LSB
     pub slice_pic_order_cnt_lsb: u32,
 
-    /// SAO luma flag
     pub slice_sao_luma_flag: bool,
-    /// SAO chroma flag
     pub slice_sao_chroma_flag: bool,
 
-    /// Slice QP delta
     pub slice_qp_delta: i8,
-    /// Slice Cb QP offset
     pub slice_cb_qp_offset: i8,
-    /// Slice Cr QP offset
     pub slice_cr_qp_offset: i8,
 
-    /// CU chroma QP offset enabled flag
     pub cu_chroma_qp_offset_enabled_flag: bool,
 
-    /// Deblocking filter override flag
     pub deblocking_filter_override_flag: bool,
-    /// Slice deblocking filter disabled flag
     pub slice_deblocking_filter_disabled_flag: bool,
-    /// Beta offset div2
     pub slice_beta_offset_div2: i8,
-    /// Tc offset div2
     pub slice_tc_offset_div2: i8,
 
-    /// Loop filter across slices enabled flag
     pub slice_loop_filter_across_slices_enabled_flag: bool,
 
-    /// Number of entry point offsets (for tiles/WPP)
     pub num_entry_point_offsets: u32,
-    /// Cumulative entry point offsets from the start of slice data.
     pub entry_point_offsets: Vec<u32>,
 
-    /// Derived: SliceQPY = 26 + pps.init_qp_minus26 + slice_qp_delta
     pub slice_qp_y: i32,
 }
 
-/// Parse result containing header and data offset
 pub struct SliceParseResult {
-    /// Parsed slice header
     pub header: SliceHeader,
-    /// Byte offset where slice data begins (after header)
     pub data_offset: usize,
 }
 
 impl SliceHeader {
-    /// Parse slice segment header from NAL unit
-    /// Returns both the header and the byte offset where slice data begins
     pub fn parse(nal: &NalUnit<'_>, sps: &Sps, pps: &Pps) -> Result<SliceParseResult> {
         Self::parse_impl(nal, sps, pps, false)
     }
@@ -261,7 +202,6 @@ impl SliceHeader {
 
         let first_slice_segment_in_pic_flag = reader.read_bit()? != 0;
 
-        // no_output_of_prior_pics_flag only present for IRAP pictures
         let no_output_of_prior_pics_flag = if nal.nal_type.is_irap() {
             reader.read_bit()? != 0
         } else {
@@ -283,7 +223,6 @@ impl SliceHeader {
                 false
             };
 
-            // Calculate bits needed for slice_segment_address
             let pic_size_in_ctbs = sps.pic_width_in_ctbs() * sps.pic_height_in_ctbs();
             let address_bits = ceil_log2(pic_size_in_ctbs);
             slice_segment_address = reader.read_bits(address_bits)?;
@@ -292,8 +231,6 @@ impl SliceHeader {
             slice_segment_address = 0;
         }
 
-        // If dependent slice, we'd inherit from previous slice header
-        // For simplicity in still images, we don't support dependent slices
         if dependent_slice_segment_flag {
             return Err(HevcError::Unsupported("dependent slice segments"));
         }
@@ -306,7 +243,6 @@ impl SliceHeader {
             return Err(HevcError::Unsupported("multi-slice pictures"));
         }
 
-        // Skip reserved bits
         for _ in 0..pps.num_extra_slice_header_bits {
             reader.read_bit()?;
         }
@@ -327,7 +263,6 @@ impl SliceHeader {
             0
         };
 
-        // For IDR pictures, POC LSB and ref pic set are not present
         let slice_pic_order_cnt_lsb = if !nal.nal_type.is_idr() {
             let poc_bits = sps.log2_max_pic_order_cnt_lsb_minus4 + 4;
             reader.read_bits(poc_bits)?
@@ -335,13 +270,10 @@ impl SliceHeader {
             0
         };
 
-        // Skip short-term and long-term ref pic set parsing for I-slices in still images
-        // These are not needed for single-frame HEIC decoding
         if !nal.nal_type.is_idr() {
             skip_ref_pic_set(&mut reader, sps)?;
         }
 
-        // SAO flags
         let (slice_sao_luma_flag, slice_sao_chroma_flag) =
             if sps.sample_adaptive_offset_enabled_flag {
                 let luma = reader.read_bit()? != 0;
@@ -355,16 +287,12 @@ impl SliceHeader {
                 (false, false)
             };
 
-        // For P/B slices, there would be ref idx and weight table parsing here
-        // We skip this for I-slices (HEIC still images are typically I-frames)
         if slice_type != SliceType::I {
             return Err(HevcError::Unsupported("P/B slices not yet implemented"));
         }
 
-        // slice_qp_delta
         let slice_qp_delta = super::params::bounded_se_i8(&mut reader, bounded)?;
 
-        // Chroma QP offsets
         let (slice_cb_qp_offset, slice_cr_qp_offset) =
             if pps.pps_slice_chroma_qp_offsets_present_flag {
                 let cb = super::params::bounded_se_i8(&mut reader, bounded)?;
@@ -374,10 +302,8 @@ impl SliceHeader {
                 (0, 0)
             };
 
-        // CU chroma QP offset
-        let cu_chroma_qp_offset_enabled_flag = false; // Skip range extension for now
+        let cu_chroma_qp_offset_enabled_flag = false;
 
-        // Deblocking filter
         let deblocking_filter_override_flag = if pps.deblocking_filter_override_enabled_flag {
             reader.read_bit()? != 0
         } else {
@@ -402,7 +328,6 @@ impl SliceHeader {
                 )
             };
 
-        // Loop filter across slices
         let slice_loop_filter_across_slices_enabled_flag = if pps
             .pps_loop_filter_across_slices_enabled_flag
             && (slice_sao_luma_flag
@@ -414,7 +339,6 @@ impl SliceHeader {
             pps.pps_loop_filter_across_slices_enabled_flag
         };
 
-        // Entry point offsets (tiles/WPP)
         let (num_entry_point_offsets, entry_point_offsets) =
             if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag {
                 let n = reader.read_ue()?;
@@ -456,7 +380,6 @@ impl SliceHeader {
                 (0, Vec::new())
             };
 
-        // Skip slice segment header extension
         if pps.slice_segment_header_extension_present_flag {
             let ext_len = reader.read_ue()?;
             for _ in 0..ext_len {
@@ -464,14 +387,11 @@ impl SliceHeader {
             }
         }
 
-        // Byte alignment
-        let _alignment_bit = reader.read_bit()?; // alignment_bit_equal_to_one (should be 1)
+        let _alignment_bit = reader.read_bit()?;
         reader.byte_align();
 
-        // Get the byte offset where slice data begins
         let data_offset = reader.byte_position();
 
-        // Calculate derived values
         let slice_qp_y = 26 + pps.init_qp_minus26 as i32 + slice_qp_delta as i32;
 
         Ok(SliceParseResult {
@@ -505,19 +425,16 @@ impl SliceHeader {
     }
 }
 
-/// Skip reference picture set parsing (for non-IDR pictures)
 fn skip_ref_pic_set(reader: &mut BitstreamReader<'_>, sps: &Sps) -> Result<()> {
     let short_term_ref_pic_set_sps_flag = reader.read_bit()? != 0;
 
     if !short_term_ref_pic_set_sps_flag {
-        // Parse inline short-term ref pic set
         skip_short_term_ref_pic_set(reader, sps.num_short_term_ref_pic_sets)?;
     } else if sps.num_short_term_ref_pic_sets > 1 {
         let bits = ceil_log2(sps.num_short_term_ref_pic_sets as u32);
         reader.read_bits(bits)?;
     }
 
-    // Long-term ref pics
     if sps.long_term_ref_pics_present_flag {
         let num_long_term_sps = reader.read_ue()?;
         let num_long_term_pics = reader.read_ue()?;
@@ -526,31 +443,28 @@ fn skip_ref_pic_set(reader: &mut BitstreamReader<'_>, sps: &Sps) -> Result<()> {
 
         for i in 0..(num_long_term_sps + num_long_term_pics) {
             if i < num_long_term_sps {
-                // lt_idx_sps: u(Ceil(Log2(num_long_term_ref_pics_sps)))
                 let bits = ceil_log2(sps.num_long_term_ref_pics_sps);
                 if bits > 0 {
                     reader.read_bits(bits)?;
                 }
             } else {
-                reader.read_bits(poc_bits)?; // poc_lsb_lt
-                reader.read_bit()?; // used_by_curr_pic_lt_flag
+                reader.read_bits(poc_bits)?;
+                reader.read_bit()?;
             }
             let delta_poc_msb_present = reader.read_bit()? != 0;
             if delta_poc_msb_present {
-                reader.read_ue()?; // delta_poc_msb_cycle_lt
+                reader.read_ue()?;
             }
         }
     }
 
-    // Temporal MVP
     if sps.sps_temporal_mvp_enabled_flag {
-        reader.read_bit()?; // slice_temporal_mvp_enabled_flag
+        reader.read_bit()?;
     }
 
     Ok(())
 }
 
-/// Skip inline short-term ref pic set
 fn skip_short_term_ref_pic_set(reader: &mut BitstreamReader<'_>, idx: u8) -> Result<()> {
     let inter_ref_pic_set_prediction_flag = if idx != 0 {
         reader.read_bit()? != 0
@@ -559,10 +473,8 @@ fn skip_short_term_ref_pic_set(reader: &mut BitstreamReader<'_>, idx: u8) -> Res
     };
 
     if inter_ref_pic_set_prediction_flag {
-        // Would need previous set info
-        reader.read_bit()?; // delta_rps_sign
-        reader.read_ue()?; // abs_delta_rps_minus1
-        // This is incomplete - would need to loop based on previous set
+        reader.read_bit()?;
+        reader.read_ue()?;
         return Err(HevcError::Unsupported("inter-predicted ref pic set"));
     }
 
@@ -570,19 +482,18 @@ fn skip_short_term_ref_pic_set(reader: &mut BitstreamReader<'_>, idx: u8) -> Res
     let num_positive_pics = reader.read_ue()?;
 
     for _ in 0..num_negative_pics {
-        reader.read_ue()?; // delta_poc_s0_minus1
-        reader.read_bit()?; // used_by_curr_pic_s0_flag
+        reader.read_ue()?;
+        reader.read_bit()?;
     }
 
     for _ in 0..num_positive_pics {
-        reader.read_ue()?; // delta_poc_s1_minus1
-        reader.read_bit()?; // used_by_curr_pic_s1_flag
+        reader.read_ue()?;
+        reader.read_bit()?;
     }
 
     Ok(())
 }
 
-/// Calculate ceil(log2(x))
 fn ceil_log2(x: u32) -> u8 {
     if x <= 1 {
         0

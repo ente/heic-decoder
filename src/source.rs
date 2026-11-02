@@ -6,20 +6,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Shared random-access source abstraction for HEIF payload ingestion.
 pub trait RandomAccessSource {
-    /// Total source length in bytes.
     fn len(&self) -> u64;
 
-    /// Whether the source has zero bytes.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Read an exact byte range into `output`.
     fn read_exact_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), SourceReadError>;
 
-    /// Read an exact byte range and return owned bytes.
     fn read_range(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, SourceReadError> {
         let mut output = vec![0_u8; len];
         self.read_exact_at(offset, &mut output)?;
@@ -126,12 +121,9 @@ impl Error for SourceReadError {
     }
 }
 
-/// Limits applied while spooling non-seek inputs into a temporary file.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TempFileSpoolOptions {
-    /// Optional upper bound for total spooled bytes.
     pub max_spool_bytes: Option<u64>,
-    /// Optional directory used to create temporary spool files.
     pub spool_directory: Option<PathBuf>,
 }
 
@@ -155,7 +147,6 @@ fn validate_range(offset: u64, requested: usize, source_len: u64) -> Result<(), 
     Ok(())
 }
 
-/// In-memory borrowed source implementation.
 #[derive(Clone, Copy, Debug)]
 pub struct SliceSource<'a> {
     data: &'a [u8],
@@ -185,7 +176,6 @@ impl RandomAccessSource for SliceSource<'_> {
     }
 }
 
-/// Generic seek-backed source implementation.
 #[derive(Debug)]
 pub struct SeekableSource<R: Read + Seek> {
     reader: R,
@@ -339,7 +329,6 @@ fn create_temp_spool_file(
     })
 }
 
-/// Random-access source backed by a temporary file that is deleted on drop.
 #[derive(Debug)]
 pub struct TempFileSpoolSource {
     path: PathBuf,
@@ -347,14 +336,10 @@ pub struct TempFileSpoolSource {
 }
 
 impl TempFileSpoolSource {
-    /// Spool all bytes from a non-seek `Read` into one temp file and reopen it
-    /// as a seek-backed random-access source.
     pub fn from_reader<R: Read>(input_reader: R) -> Result<Self, SourceReadError> {
         Self::from_reader_with_options(input_reader, TempFileSpoolOptions::default())
     }
 
-    /// Spool all bytes from a non-seek `Read` into one temp file and reopen it
-    /// as a seek-backed random-access source while enforcing configured limits.
     pub fn from_reader_with_options<R: Read>(
         mut input_reader: R,
         options: TempFileSpoolOptions,
@@ -448,7 +433,6 @@ impl RandomAccessSource for TempFileSpoolSource {
 
 impl Drop for TempFileSpoolSource {
     fn drop(&mut self) {
-        // Close file handle before removing the spool path.
         let _ = self.source.take();
         let _ = std::fs::remove_file(&self.path);
     }

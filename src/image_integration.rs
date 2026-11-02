@@ -1,12 +1,3 @@
-//! Optional `image` crate integration helpers.
-//!
-//! Enable the `image-integration` feature to:
-//! - register HEIF/HEIC/AVIF decoder hooks for `image::ImageReader`
-//! - convert [`DecodedRgbaImage`] into `image` buffers
-//!   and `DynamicImage` values.
-//!
-//! See `API.md` in the crate root for end-to-end examples.
-
 use crate::{
     DecodeError, DecodeGuardrails, DecodedRgbaImage, DecodedRgbaLayout, DecodedRgbaPixels,
     HeifInputFamily, decode_bytes_to_rgba_layout_with_hint_and_guardrails,
@@ -31,9 +22,7 @@ const HOOK_EXTENSION_HEIF: &str = "heif";
 const HOOK_EXTENSION_AVIF: &str = "avif";
 
 const FTYP_MASK_12: [u8; 12] = [
-    0x00, 0x00, 0x00, 0x00, // size field is ignored
-    0xFF, 0xFF, 0xFF, 0xFF, // "ftyp"
-    0xFF, 0xFF, 0xFF, 0xFF, // major_brand
+    0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 ];
 
 const FTYP_SIG_AVIF: [u8; 12] = *b"\0\0\0\0ftypavif";
@@ -54,10 +43,6 @@ static REGISTER_IMAGE_FORMAT_DETECTION_HOOKS: Once = Once::new();
 pub type Rgba8ImageBuffer = ImageBuffer<Rgba<u8>, Vec<u8>>;
 pub type Rgba16ImageBuffer = ImageBuffer<Rgba<u16>, Vec<u16>>;
 
-/// Apply EXIF orientation (`1..=8`) to an `image::DynamicImage`.
-///
-/// This helper is intended for callers that decode with libheif-parity behavior
-/// and then apply orientation explicitly at the application layer.
 pub fn apply_exif_orientation_dynamic(image: DynamicImage, exif_orientation: u8) -> DynamicImage {
     match exif_orientation {
         2 => image.fliph(),
@@ -76,13 +61,9 @@ struct LazyHeifImageDecoder {
     hint: Option<HeifInputFamily>,
     guardrails: DecodeGuardrails,
     layout: DecodedRgbaLayout,
-    // Primary-item payload extraction the layout probe already performed;
-    // `read_image` consumes it instead of copying every payload out of the
-    // container a second time.
     preextracted_heic: Option<crate::isobmff::HeicPrimaryItemDataWithGrid>,
 }
 
-// Manual impl: a derived Debug would dump the entire encoded input.
 impl std::fmt::Debug for LazyHeifImageDecoder {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -199,12 +180,6 @@ impl ImageDecoder for LazyHeifImageDecoder {
     }
 }
 
-/// Build a hook decoder that probes metadata up front and defers pixel decode
-/// until `read_image` supplies the destination buffer.
-///
-/// Memory invariant: every accepted format writes into the caller's buffer;
-/// there is no eager owned-RGBA fallback. Codec-native planes and bounded grid
-/// tile scratch buffers may still be allocated during decode.
 fn decoder_from_seekable_with_hint_and_guardrails<R: Read + Seek>(
     input_reader: R,
     hint: Option<HeifInputFamily>,
@@ -236,14 +211,6 @@ fn decoder_from_seekable_with_hint_and_guardrails<R: Read + Seek>(
 /// larger, guardrail-permitted inputs.
 pub const DEFAULT_HOOK_MAX_INPUT_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Read the whole encoded input into memory.
-///
-/// This is a deliberate trade: the lazy decoder needs the full input as a
-/// byte slice so `read_image` can decode directly into the caller's buffer
-/// (without an additional full-frame owned RGBA allocation, which would
-/// dominate peak memory). The cost is that the encoded input — usually far
-/// smaller than the decoded RGBA — is held in memory for the decoder's
-/// lifetime, bounded by `guardrails.max_input_bytes`.
 fn read_seekable_input_to_vec<R: Read + Seek>(
     mut input_reader: R,
     guardrails: &DecodeGuardrails,
@@ -291,7 +258,6 @@ fn read_seekable_input_to_vec<R: Read + Seek>(
     Ok(input)
 }
 
-/// Result of attempting to install `image` crate decoder hooks for this crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImageHookRegistration {
     pub heic_decoder_hook_registered: bool,
@@ -313,20 +279,6 @@ impl ImageHookRegistration {
     }
 }
 
-/// Register HEIF/HEIC/AVIF decoder hooks with `image::hooks`.
-///
-/// After registration, `image::ImageReader` can decode `.heic`, `.heif`, and
-/// `.avif` inputs through this crate's pure-Rust decode path, including direct
-/// extension-based dispatch and content-based `ftyp` guesses for common brands.
-///
-/// Memory: hook decodes buffer the entire encoded input in memory before
-/// decoding (in exchange, pixels decode straight into the caller's buffer
-/// without an additional full-frame RGBA allocation). Codec-native planes
-/// and a single grid-tile scratch buffer may still be allocated. The encoded
-/// input buffer is capped at [`DEFAULT_HOOK_MAX_INPUT_BYTES`]; callers that
-/// need a different bound (or none) should use
-/// [`register_image_decoder_hooks_with_guardrails`] with
-/// [`DecodeGuardrails::max_input_bytes`] set accordingly.
 pub fn register_image_decoder_hooks() -> ImageHookRegistration {
     register_image_decoder_hooks_with_guardrails(DecodeGuardrails {
         max_input_bytes: Some(DEFAULT_HOOK_MAX_INPUT_BYTES),
@@ -334,11 +286,6 @@ pub fn register_image_decoder_hooks() -> ImageHookRegistration {
     })
 }
 
-/// Register HEIF/HEIC/AVIF decoder hooks with `image::hooks`, applying the provided guardrails to all hook decodes.
-///
-/// Hook decodes buffer the entire encoded input in memory (see
-/// [`register_image_decoder_hooks`]); `guardrails.max_input_bytes` bounds
-/// that buffer.
 pub fn register_image_decoder_hooks_with_guardrails(
     guardrails: DecodeGuardrails,
 ) -> ImageHookRegistration {
@@ -443,15 +390,12 @@ fn register_image_format_detection_hooks() {
     );
 }
 
-/// ImageBuffer variants produced by `DecodedRgbaImage` conversion helpers.
 #[derive(Debug)]
 pub enum ImageBufferKind {
     Rgba8(Rgba8ImageBuffer),
     Rgba16(Rgba16ImageBuffer),
 }
 
-/// `image::ImageBuffer` conversion output plus metadata that cannot be stored
-/// directly inside `ImageBuffer`.
 #[derive(Debug)]
 pub struct ImageBufferWithMetadata {
     pub image: ImageBufferKind,
@@ -480,8 +424,6 @@ impl ImageBufferWithMetadata {
     }
 }
 
-/// `image::DynamicImage` conversion output plus metadata that cannot be stored
-/// directly inside `DynamicImage`.
 #[derive(Debug)]
 pub struct DynamicImageWithMetadata {
     pub image: DynamicImage,
@@ -489,7 +431,6 @@ pub struct DynamicImageWithMetadata {
     pub icc_profile: Option<Vec<u8>>,
 }
 
-/// Conversion failures while handing off decoded RGBA buffers to the `image` crate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImageConversionError {
     SampleCountOverflow {
@@ -531,7 +472,6 @@ impl Display for ImageConversionError {
 impl Error for ImageConversionError {}
 
 impl DecodedRgbaImage {
-    /// Convert decoded pixels into `image::ImageBuffer` while carrying metadata.
     pub fn into_image_buffer_with_metadata(
         self,
     ) -> Result<ImageBufferWithMetadata, ImageConversionError> {
@@ -581,12 +521,10 @@ impl DecodedRgbaImage {
         })
     }
 
-    /// Convert decoded pixels into `image::ImageBuffer`.
     pub fn into_image_buffer(self) -> Result<ImageBufferKind, ImageConversionError> {
         Ok(self.into_image_buffer_with_metadata()?.image)
     }
 
-    /// Convert decoded pixels into `image::DynamicImage` while carrying metadata.
     pub fn into_dynamic_image_with_metadata(
         self,
     ) -> Result<DynamicImageWithMetadata, ImageConversionError> {
@@ -595,7 +533,6 @@ impl DecodedRgbaImage {
             .into_dynamic_image_with_metadata())
     }
 
-    /// Convert decoded pixels into `image::DynamicImage`.
     pub fn into_dynamic_image(self) -> Result<DynamicImage, ImageConversionError> {
         Ok(self.into_dynamic_image_with_metadata()?.image)
     }
@@ -616,8 +553,6 @@ fn expected_rgba_byte_count(width: u32, height: u32, storage_bit_depth: u8) -> O
     expected_rgba_sample_count(width, height)?.checked_mul(bytes_per_sample)
 }
 
-/// `expected_rgba_byte_count` with the byte-count overflow mapped to the
-/// decoder adapters' shared parameter error.
 fn expected_rgba_total_bytes(width: u32, height: u32, storage_bit_depth: u8) -> ImageResult<usize> {
     expected_rgba_byte_count(width, height, storage_bit_depth).ok_or_else(|| {
         parameter_error(format!(
@@ -669,9 +604,6 @@ mod tests {
     use std::io::Cursor;
     use std::rc::Rc;
 
-    /// Locks the uncompressed half of the lazy-adapter contract: layout
-    /// probing and caller-buffer decoding must stay pixel-identical to the
-    /// direct owned API.
     #[test]
     fn hook_decoder_decodes_uncompressed_heif_lazily() {
         let (file, expected_rgba) = crate::isobmff::test_support::minimal_uncompressed_rgb3_heif();
@@ -692,10 +624,6 @@ mod tests {
         assert_eq!(pixels, expected_rgba);
     }
 
-    /// A reader whose seek-reported length lies wildly. The hook must not
-    /// size an allocation from the untrusted length (that would panic or
-    /// abort before a single byte is read) and must still decode the bytes
-    /// the reader actually yields.
     struct LyingLengthReader(Cursor<Vec<u8>>);
 
     impl std::io::Read for LyingLengthReader {
@@ -778,9 +706,6 @@ mod tests {
         );
     }
 
-    /// Decode does not bake EXIF orientation into pixels, so hook callers
-    /// rely on `exif_metadata`/`orientation` to rotate correctly; without
-    /// the override they would always see `Orientation::NoTransforms`.
     #[test]
     fn hook_decoder_exposes_exif_orientation() {
         let (file, expected_rgba, expected_tiff) =
@@ -805,7 +730,6 @@ mod tests {
             image::metadata::Orientation::Rotate90
         );
 
-        // Pixels stay unrotated; orientation is applied by the caller.
         let mut pixels = vec![0_u8; expected_rgba.len()];
         decoder
             .read_image_boxed(&mut pixels)
@@ -813,11 +737,6 @@ mod tests {
         assert_eq!(pixels, expected_rgba);
     }
 
-    /// When the primary item carries `irot`/`imir`, decode bakes that
-    /// transform into the pixels, so `orientation()` must report
-    /// `NoTransforms` — otherwise generic `orientation()` +
-    /// `apply_orientation` callers double-rotate. Mirrors
-    /// `ExifOrientationHint::should_apply_exif_orientation`.
     #[test]
     fn hook_decoder_suppresses_exif_orientation_when_transforms_bake_rotation() {
         let (file, unrotated_rgba, expected_tiff) = crate::isobmff::test_support::
@@ -833,8 +752,6 @@ mod tests {
         )
         .expect("hook construction should succeed");
 
-        // The EXIF block itself stays exposed (camera metadata and friends);
-        // only the derived orientation is suppressed.
         assert_eq!(
             decoder
                 .exif_metadata()
@@ -848,7 +765,6 @@ mod tests {
             image::metadata::Orientation::NoTransforms
         );
 
-        // The irot is baked into the pixels: 2x1 rotated 90 degrees CCW.
         assert_eq!(decoder.dimensions(), (1, 2));
         let mut pixels = vec![0_u8; unrotated_rgba.len()];
         decoder
@@ -862,11 +778,6 @@ mod tests {
         assert_eq!(pixels, expected_rotated);
     }
 
-    /// An identity `irot` (angle 0) bakes nothing into the pixels, so it
-    /// must NOT suppress the EXIF-derived orientation: suppressing here
-    /// would leave generic `orientation()` + `apply_orientation` callers
-    /// with an unrotated image. Locks the identity gate shared with
-    /// `ExifOrientationHint::should_apply_exif_orientation`.
     #[test]
     fn hook_decoder_keeps_exif_orientation_for_identity_irot() {
         let (file, expected_rgba, expected_tiff) = crate::isobmff::test_support::
@@ -895,7 +806,6 @@ mod tests {
             image::metadata::Orientation::Rotate90
         );
 
-        // The identity irot leaves the pixels untouched and unrotated.
         assert_eq!(decoder.dimensions(), (2, 1));
         let mut pixels = vec![0_u8; expected_rgba.len()];
         decoder

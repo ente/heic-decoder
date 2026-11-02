@@ -1,13 +1,3 @@
-//! HEVC transform and inverse quantization
-//!
-//! This module implements the inverse transforms used in HEVC:
-//! - 4x4 Inverse DST (for intra 4x4 luma)
-//! - 4x4, 8x8, 16x16, 32x32 Inverse DCT
-//!
-//! The 8x8, 16x16, and 32x32 IDCTs dispatch to AVX2 when available. Flat and
-//! scaling-list dequantization also use exact NEON kernels on AArch64.
-
-// Transform and inverse quantization for HEVC
 #[cfg(target_arch = "aarch64")]
 use super::transform_simd::{dequantize_neon, dequantize_scaled_neon};
 use super::transform_simd::{
@@ -18,10 +8,8 @@ use super::transform_simd::{
 use super::transform_simd::{dequantize_v3, idct8_v3, idct16_v3, idct32_v3, idst4_v3};
 use archmage::incant;
 
-/// Maximum number of coefficients (32x32 transform)
 pub const MAX_COEFF: usize = 32 * 32;
 
-/// DST-VII basis functions for 4x4 (scaled by 64)
 static DST4_MATRIX: [[i16; 4]; 4] = [
     [29, 55, 74, 84],
     [74, 74, 0, -74],
@@ -29,7 +17,6 @@ static DST4_MATRIX: [[i16; 4]; 4] = [
     [55, -84, 74, -29],
 ];
 
-/// DCT-II basis functions for 4x4 (scaled by 64)
 static DCT4_MATRIX: [[i16; 4]; 4] = [
     [64, 64, 64, 64],
     [83, 36, -36, -83],
@@ -37,12 +24,10 @@ static DCT4_MATRIX: [[i16; 4]; 4] = [
     [36, -83, 83, -36],
 ];
 
-/// Inverse 4x4 DST (for intra 4x4 luma blocks)
 pub fn idst4(coeffs: &[i16; 16], output: &mut [i16; 16], bit_depth: u8) {
     incant!(idst4(coeffs, output, bit_depth), [v3, scalar]);
 }
 
-/// Scalar implementation of inverse 4x4 DST
 pub(crate) fn idst4_inner(coeffs: &[i16; 16], output: &mut [i16; 16], bit_depth: u8) {
     let shift1 = 7;
     let shift2 = 20 - bit_depth;
@@ -51,19 +36,16 @@ pub(crate) fn idst4_inner(coeffs: &[i16; 16], output: &mut [i16; 16], bit_depth:
 
     let mut tmp = [0i32; 16];
 
-    // First pass (vertical)
     for i in 0..4 {
         for j in 0..4 {
             let mut sum = 0i32;
             for k in 0..4 {
                 sum += DST4_MATRIX[k][j] as i32 * coeffs[k * 4 + i] as i32;
             }
-            // H.265 Eq. 8-314: clip intermediate results to 16-bit range
             tmp[j * 4 + i] = ((sum + add1) >> shift1).clamp(-32768, 32767);
         }
     }
 
-    // Second pass (horizontal)
     for i in 0..4 {
         for j in 0..4 {
             let mut sum = 0i32;
@@ -75,7 +57,6 @@ pub(crate) fn idst4_inner(coeffs: &[i16; 16], output: &mut [i16; 16], bit_depth:
     }
 }
 
-/// Inverse 4x4 DCT
 pub fn idct4(coeffs: &[i16; 16], output: &mut [i16; 16], bit_depth: u8) {
     let shift1 = 7;
     let shift2 = 20 - bit_depth;
@@ -84,19 +65,16 @@ pub fn idct4(coeffs: &[i16; 16], output: &mut [i16; 16], bit_depth: u8) {
 
     let mut tmp = [0i32; 16];
 
-    // First pass (vertical)
     for i in 0..4 {
         for j in 0..4 {
             let mut sum = 0i32;
             for k in 0..4 {
                 sum += DCT4_MATRIX[k][j] as i32 * coeffs[k * 4 + i] as i32;
             }
-            // H.265 Eq. 8-314: clip intermediate results to 16-bit range
             tmp[j * 4 + i] = ((sum + add1) >> shift1).clamp(-32768, 32767);
         }
     }
 
-    // Second pass (horizontal)
     for i in 0..4 {
         for j in 0..4 {
             let mut sum = 0i32;
@@ -108,35 +86,26 @@ pub fn idct4(coeffs: &[i16; 16], output: &mut [i16; 16], bit_depth: u8) {
     }
 }
 
-/// 8-point partial butterfly IDCT (H.265 8.6.4.2)
-///
-/// Exploits DCT-II symmetry to reduce 64 multiply-adds to 24 per column.
-/// `src` are 8 frequency-domain inputs, `dst` gets 8 spatial-domain outputs.
 #[inline(always)]
 fn idct8_1d(src: [i32; 8], shift: i32) -> [i32; 8] {
     let add = 1i32 << (shift - 1);
 
-    // Odd part: 4 coefficients × 4 outputs = 16 multiply-adds
     let o0 = 89 * src[1] + 75 * src[3] + 50 * src[5] + 18 * src[7];
     let o1 = 75 * src[1] - 18 * src[3] - 89 * src[5] - 50 * src[7];
     let o2 = 50 * src[1] - 89 * src[3] + 18 * src[5] + 75 * src[7];
     let o3 = 18 * src[1] - 50 * src[3] + 75 * src[5] - 89 * src[7];
 
-    // Even-even part: 2 multiply-adds
     let ee0 = 64 * src[0] + 64 * src[4];
     let ee1 = 64 * src[0] - 64 * src[4];
 
-    // Even-odd part: 4 multiply-adds
     let eo0 = 83 * src[2] + 36 * src[6];
     let eo1 = 36 * src[2] - 83 * src[6];
 
-    // Even part combination
     let e0 = ee0 + eo0;
     let e1 = ee1 + eo1;
     let e2 = ee1 - eo1;
     let e3 = ee0 - eo0;
 
-    // Output with butterfly (E+O / E-O symmetry)
     [
         ((e0 + o0 + add) >> shift).clamp(-32768, 32767),
         ((e1 + o1 + add) >> shift).clamp(-32768, 32767),
@@ -149,19 +118,16 @@ fn idct8_1d(src: [i32; 8], shift: i32) -> [i32; 8] {
     ]
 }
 
-/// Inverse 8x8 DCT — dispatches to AVX2 when available, scalar fallback otherwise
 pub fn idct8(coeffs: &[i16; 64], output: &mut [i16; 64], bit_depth: u8) {
     incant!(idct8(coeffs, output, bit_depth), [v3, scalar])
 }
 
-/// Scalar 8x8 IDCT using partial butterfly (called by SIMD scalar fallback)
 pub(crate) fn idct8_inner(coeffs: &[i16; 64], output: &mut [i16; 64], bit_depth: u8) {
     let shift1 = 7i32;
     let shift2 = 20 - bit_depth as i32;
 
     let mut tmp = [0i32; 64];
 
-    // First pass: vertical (column-wise)
     for col in 0..8 {
         let src = [
             coeffs[col] as i32,
@@ -179,7 +145,6 @@ pub(crate) fn idct8_inner(coeffs: &[i16; 64], output: &mut [i16; 64], bit_depth:
         }
     }
 
-    // Second pass: horizontal (row-wise)
     for row in 0..8 {
         let base = row * 8;
         let src = [
@@ -199,12 +164,10 @@ pub(crate) fn idct8_inner(coeffs: &[i16; 64], output: &mut [i16; 64], bit_depth:
     }
 }
 
-/// 16-point partial butterfly IDCT (H.265 8.6.4.2)
 #[inline(always)]
 fn idct16_1d(src: [i32; 16], shift: i32) -> [i32; 16] {
     let add = 1i32 << (shift - 1);
 
-    // Odd part: 8 inputs (odd indices) × 8 outputs = 64 multiply-adds
     let s1 = src[1];
     let s3 = src[3];
     let s5 = src[5];
@@ -223,7 +186,6 @@ fn idct16_1d(src: [i32; 16], shift: i32) -> [i32; 16] {
     let o6 = 25 * s1 - 70 * s3 + 90 * s5 - 80 * s7 + 43 * s9 + 9 * s11 - 57 * s13 + 87 * s15;
     let o7 = 9 * s1 - 25 * s3 + 43 * s5 - 57 * s7 + 70 * s9 - 80 * s11 + 87 * s13 - 90 * s15;
 
-    // Even part: reuse 8-point butterfly on even indices
     let s0 = src[0];
     let s2 = src[2];
     let s4 = src[4];
@@ -233,13 +195,11 @@ fn idct16_1d(src: [i32; 16], shift: i32) -> [i32; 16] {
     let s12 = src[12];
     let s14 = src[14];
 
-    // Even-odd: 4 coefficients
     let eo0 = 89 * s2 + 75 * s6 + 50 * s10 + 18 * s14;
     let eo1 = 75 * s2 - 18 * s6 - 89 * s10 - 50 * s14;
     let eo2 = 50 * s2 - 89 * s6 + 18 * s10 + 75 * s14;
     let eo3 = 18 * s2 - 50 * s6 + 75 * s10 - 89 * s14;
 
-    // Even-even
     let eee0 = 64 * s0 + 64 * s8;
     let eee1 = 64 * s0 - 64 * s8;
     let eeo0 = 83 * s4 + 36 * s12;
@@ -279,19 +239,16 @@ fn idct16_1d(src: [i32; 16], shift: i32) -> [i32; 16] {
     ]
 }
 
-/// Inverse 16x16 DCT — dispatches to AVX2 when available, scalar fallback otherwise
 pub fn idct16(coeffs: &[i16; 256], output: &mut [i16; 256], bit_depth: u8) {
     incant!(idct16(coeffs, output, bit_depth), [v3, scalar])
 }
 
-/// Scalar 16x16 IDCT using partial butterfly (called by SIMD scalar fallback)
 pub(crate) fn idct16_inner(coeffs: &[i16; 256], output: &mut [i16; 256], bit_depth: u8) {
     let shift1 = 7i32;
     let shift2 = 20 - bit_depth as i32;
 
     let mut tmp = [0i32; 256];
 
-    // First pass: vertical
     for col in 0..16 {
         let mut src = [0i32; 16];
         for k in 0..16 {
@@ -303,7 +260,6 @@ pub(crate) fn idct16_inner(coeffs: &[i16; 256], output: &mut [i16; 256], bit_dep
         }
     }
 
-    // Second pass: horizontal
     for row in 0..16 {
         let base = row * 16;
         let mut src = [0i32; 16];
@@ -315,15 +271,10 @@ pub(crate) fn idct16_inner(coeffs: &[i16; 256], output: &mut [i16; 256], bit_dep
     }
 }
 
-/// 32-point partial butterfly IDCT (H.265 8.6.4.2)
-///
-/// Uses 5 stages of butterfly decomposition to reduce 1024 multiply-adds
-/// per column to ~350.
 #[inline(always)]
 fn idct32_1d(src: [i32; 32], shift: i32) -> [i32; 32] {
     let add = 1i32 << (shift - 1);
 
-    // Stage 1: Odd part — 16 inputs (odd indices) × 16 outputs
     let s1 = src[1];
     let s3 = src[3];
     let s5 = src[5];
@@ -341,7 +292,6 @@ fn idct32_1d(src: [i32; 32], shift: i32) -> [i32; 32] {
     let s29 = src[29];
     let s31 = src[31];
 
-    // DCT32 odd coefficients from H.265 Table 8-5 (rows 1,3,5,...,31)
     let o0 = 90 * s1
         + 90 * s3
         + 88 * s5
@@ -505,7 +455,6 @@ fn idct32_1d(src: [i32; 32], shift: i32) -> [i32; 32] {
         + 90 * s29
         - 90 * s31;
 
-    // Even part: 16-point butterfly on even indices
     let s0 = src[0];
     let s2 = src[2];
     let s4 = src[4];
@@ -523,7 +472,6 @@ fn idct32_1d(src: [i32; 32], shift: i32) -> [i32; 32] {
     let s28 = src[28];
     let s30 = src[30];
 
-    // Even-odd: 8 outputs from odd-indexed even inputs
     let eo0 = 90 * s2 + 87 * s6 + 80 * s10 + 70 * s14 + 57 * s18 + 43 * s22 + 25 * s26 + 9 * s30;
     let eo1 = 87 * s2 + 57 * s6 + 9 * s10 - 43 * s14 - 80 * s18 - 90 * s22 - 70 * s26 - 25 * s30;
     let eo2 = 80 * s2 + 9 * s6 - 70 * s10 - 87 * s14 - 25 * s18 + 57 * s22 + 90 * s26 + 43 * s30;
@@ -533,7 +481,6 @@ fn idct32_1d(src: [i32; 32], shift: i32) -> [i32; 32] {
     let eo6 = 25 * s2 - 70 * s6 + 90 * s10 - 80 * s14 + 43 * s18 + 9 * s22 - 57 * s26 + 87 * s30;
     let eo7 = 9 * s2 - 25 * s6 + 43 * s10 - 57 * s14 + 70 * s18 - 80 * s22 + 87 * s26 - 90 * s30;
 
-    // Even-even: 8-point butterfly on doubly-even inputs
     let eeo0 = 89 * s4 + 75 * s12 + 50 * s20 + 18 * s28;
     let eeo1 = 75 * s4 - 18 * s12 - 89 * s20 - 50 * s28;
     let eeo2 = 50 * s4 - 89 * s12 + 18 * s20 + 75 * s28;
@@ -611,19 +558,16 @@ fn idct32_1d(src: [i32; 32], shift: i32) -> [i32; 32] {
     ]
 }
 
-/// Inverse 32x32 DCT — dispatches to AVX2 when available, scalar fallback otherwise
 pub fn idct32(coeffs: &[i16; 1024], output: &mut [i16; 1024], bit_depth: u8) {
     incant!(idct32(coeffs, output, bit_depth), [v3, scalar])
 }
 
-/// Scalar 32x32 IDCT using partial butterfly (called by SIMD scalar fallback)
 pub(crate) fn idct32_inner(coeffs: &[i16; 1024], output: &mut [i16; 1024], bit_depth: u8) {
     let shift1 = 7i32;
     let shift2 = 20 - bit_depth as i32;
 
     let mut tmp = [0i32; 1024];
 
-    // First pass: vertical
     for col in 0..32 {
         let mut src = [0i32; 32];
         for k in 0..32 {
@@ -635,7 +579,6 @@ pub(crate) fn idct32_inner(coeffs: &[i16; 1024], output: &mut [i16; 1024], bit_d
         }
     }
 
-    // Second pass: horizontal
     for row in 0..32 {
         let base = row * 32;
         let mut src = [0i32; 32];
@@ -647,20 +590,14 @@ pub(crate) fn idct32_inner(coeffs: &[i16; 1024], output: &mut [i16; 1024], bit_d
     }
 }
 
-/// Dequantization parameters
 #[derive(Debug, Clone, Copy)]
 pub struct DequantParams {
-    /// QP value
     pub qp: i32,
-    /// Bit depth
     pub bit_depth: u8,
-    /// Transform size log2
     pub log2_tr_size: u8,
 }
 
-/// Dequantize coefficients (flat scaling — when scaling lists disabled)
 pub fn dequantize(coeffs: &mut [i16], params: DequantParams) {
-    // Scaling factors from H.265 Table 8-8
     static LEVEL_SCALE: [i32; 6] = [40, 45, 51, 57, 64, 72];
 
     let qp_per = params.qp / 6;
@@ -685,7 +622,6 @@ pub fn dequantize(coeffs: &mut [i16], params: DequantParams) {
             *coef = value.clamp(-32768, 32767) as i16;
         }
     } else {
-        // Negative shift (left shift) — rare, keep scalar
         let neg_shift = -shift;
         for coef in coeffs.iter_mut() {
             let value = (*coef as i64 * combined_scale as i64) << neg_shift;
@@ -694,9 +630,6 @@ pub fn dequantize(coeffs: &mut [i16], params: DequantParams) {
     }
 }
 
-/// Dequantize coefficients with per-position scaling factors (H.265 8.6.3 Eq 8-309)
-///
-/// `scaling_matrix`: pre-computed m[x][y] values in raster order (size*size entries)
 pub fn dequantize_scaled(coeffs: &mut [i16], params: DequantParams, scaling_matrix: &[u8]) {
     static LEVEL_SCALE: [i32; 6] = [40, 45, 51, 57, 64, 72];
 
@@ -704,7 +637,6 @@ pub fn dequantize_scaled(coeffs: &mut [i16], params: DequantParams, scaling_matr
     let qp_rem = params.qp % 6;
     let level_scale = LEVEL_SCALE[qp_rem as usize];
 
-    // Full bdShift = BitDepth + Log2(nTbS) - 5 (H.265 Eq 8-309)
     let bd_shift = params.bit_depth as i32 + params.log2_tr_size as i32 - 5;
     let add = if bd_shift > 0 { 1 << (bd_shift - 1) } else { 0 };
 
@@ -732,7 +664,6 @@ pub fn dequantize_scaled(coeffs: &mut [i16], params: DequantParams, scaling_matr
     }
 }
 
-/// Generic inverse transform dispatch
 #[inline(always)]
 pub fn inverse_transform(
     coeffs: &[i16],
@@ -743,7 +674,6 @@ pub fn inverse_transform(
 ) {
     match size {
         4 => {
-            // Use try_into to get sized array references without copies
             let in_arr: &[i16; 16] = coeffs[..16].try_into().unwrap();
             let out_arr: &mut [i16; 16] = (&mut output[..16]).try_into().unwrap();
 
@@ -778,9 +708,8 @@ mod tests {
 
     #[test]
     fn test_idct4_dc_only() {
-        // With DC coefficient = 64 (after dequant), all output samples should be equal
         let mut coeffs = [0i16; 16];
-        coeffs[0] = 64; // DC coefficient at (0,0)
+        coeffs[0] = 64;
 
         let mut output = [0i16; 16];
         idct4(&coeffs, &mut output, 8);
@@ -790,11 +719,6 @@ mod tests {
             println!("  {:?}", &output[y * 4..y * 4 + 4]);
         }
 
-        // For DC-only input, DCT should produce uniform output
-        // DC value propagates as: DC * 64 * 64 >> 7 >> 12 = DC >> 7 = 0 for DC=64
-        // Actually: 64 * 64 >> 7 = 32 for first pass per sample
-        // Then 32 * 64 * 4 >> 12 = 32 for each output
-        // Let me just verify all outputs are equal
         let first = output[0];
         for &v in &output {
             assert_eq!(v, first, "DC-only should produce uniform output");
@@ -804,7 +728,7 @@ mod tests {
     #[test]
     fn test_idst4_dc_only() {
         let mut coeffs = [0i16; 16];
-        coeffs[0] = 64; // DC coefficient
+        coeffs[0] = 64;
 
         let mut output = [0i16; 16];
         idst4(&coeffs, &mut output, 8);
@@ -814,8 +738,6 @@ mod tests {
             println!("  {:?}", &output[y * 4..y * 4 + 4]);
         }
 
-        // DST doesn't produce uniform output for DC input (unlike DCT)
-        // Just verify it produces non-zero values
         let non_zero = output.iter().any(|&v| v != 0);
         assert!(
             non_zero,
@@ -825,9 +747,7 @@ mod tests {
 
     #[test]
     fn test_idst4_with_real_coeffs() {
-        // Use actual coefficients from our first decoded TU
         let mut coeffs = [0i16; 16];
-        // Dequantized coeffs: [144, -3024, -288, 0, -144, -432, -288, 0, 144, -576, 432, 0, -144, 288, 288, 0]
         coeffs[0] = 144;
         coeffs[1] = -3024;
         coeffs[2] = -288;

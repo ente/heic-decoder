@@ -1,22 +1,15 @@
-//! Spatial transforms: rotation and mirror operations on decoded frames.
-
 use alloc::vec;
 use alloc::vec::Vec;
 
 use super::DecodedFrame;
 
 impl DecodedFrame {
-    /// Rotate the frame 90° clockwise, returning a new frame.
-    ///
-    /// Output dimensions are swapped: `(width, height)` becomes `(height, width)`.
-    /// Crop offsets are transformed accordingly.
     pub fn rotate_90_cw(&self) -> Self {
         let ow = self.width;
         let oh = self.height;
         let nw = oh;
         let nh = ow;
 
-        // Rotate luma: dst(dx, dy) = src(dy, oh-1-dx)
         let mut y_plane = vec![0u16; (nw * nh) as usize];
         for dy in 0..nh {
             for dx in 0..nw {
@@ -24,7 +17,6 @@ impl DecodedFrame {
             }
         }
 
-        // Rotate alpha plane (same transform as luma)
         let alpha_plane = self.alpha_plane.as_ref().map(|alpha| {
             let mut rotated = vec![0u16; (nw * nh) as usize];
             for dy in 0..nh {
@@ -35,7 +27,6 @@ impl DecodedFrame {
             rotated
         });
 
-        // Rotate chroma planes
         let (ocw, och) = self.chroma_dims();
         let (cb_plane, cr_plane) = if ocw > 0 && och > 0 {
             let ncw = och;
@@ -81,14 +72,10 @@ impl DecodedFrame {
         }
     }
 
-    /// Rotate the frame 180°, returning a new frame.
-    ///
-    /// Dimensions remain the same. Crop offsets are swapped (left↔right, top↔bottom).
     pub fn rotate_180(&self) -> Self {
         let w = self.width;
         let h = self.height;
 
-        // Rotate luma: dst(dx, dy) = src(w-1-dx, h-1-dy)
         let mut y_plane = vec![0u16; (w * h) as usize];
         for dy in 0..h {
             for dx in 0..w {
@@ -97,7 +84,6 @@ impl DecodedFrame {
             }
         }
 
-        // Rotate alpha plane
         let alpha_plane = self.alpha_plane.as_ref().map(|alpha| {
             let mut rotated = vec![0u16; (w * h) as usize];
             for dy in 0..h {
@@ -109,7 +95,6 @@ impl DecodedFrame {
             rotated
         });
 
-        // Rotate chroma planes
         let (cw, ch) = self.chroma_dims();
         let (cb_plane, cr_plane) = if cw > 0 && ch > 0 {
             let csz = (cw * ch) as usize;
@@ -153,17 +138,12 @@ impl DecodedFrame {
         }
     }
 
-    /// Rotate the frame 270° clockwise (= 90° counter-clockwise), returning a new frame.
-    ///
-    /// Output dimensions are swapped: `(width, height)` becomes `(height, width)`.
-    /// Crop offsets are transformed accordingly.
     pub fn rotate_270_cw(&self) -> Self {
         let ow = self.width;
         let oh = self.height;
         let nw = oh;
         let nh = ow;
 
-        // Rotate luma: dst(dx, dy) = src(ow-1-dy, dx)
         let mut y_plane = vec![0u16; (nw * nh) as usize];
         for dy in 0..nh {
             for dx in 0..nw {
@@ -171,7 +151,6 @@ impl DecodedFrame {
             }
         }
 
-        // Rotate alpha plane
         let alpha_plane = self.alpha_plane.as_ref().map(|alpha| {
             let mut rotated = vec![0u16; (nw * nh) as usize];
             for dy in 0..nh {
@@ -182,7 +161,6 @@ impl DecodedFrame {
             rotated
         });
 
-        // Rotate chroma planes
         let (ocw, och) = self.chroma_dims();
         let (cb_plane, cr_plane) = if ocw > 0 && och > 0 {
             let ncw = och;
@@ -228,9 +206,6 @@ impl DecodedFrame {
         }
     }
 
-    /// Mirror the frame about the vertical axis (left-right flip), returning a new frame.
-    ///
-    /// Dimensions remain the same. Left and right crop offsets are swapped.
     pub fn mirror_horizontal(&self) -> Self {
         let w = self.width;
         let h = self.height;
@@ -295,9 +270,6 @@ impl DecodedFrame {
         }
     }
 
-    /// Mirror the frame about the horizontal axis (top-bottom flip), returning a new frame.
-    ///
-    /// Dimensions remain the same. Top and bottom crop offsets are swapped.
     pub fn mirror_vertical(&self) -> Self {
         let w = self.width;
         let h = self.height;
