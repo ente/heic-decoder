@@ -1559,7 +1559,7 @@ struct UncompressedComponentDecodeParams {
 struct UncompressedBitReader<'a> {
     data: &'a [u8],
     bit_offset: usize,
-    pixel_start_byte: usize,
+    pixel_start_bit: usize,
     row_start_byte: usize,
     tile_start_byte: usize,
 }
@@ -1569,14 +1569,14 @@ impl<'a> UncompressedBitReader<'a> {
         Self {
             data,
             bit_offset: 0,
-            pixel_start_byte: 0,
+            pixel_start_bit: 0,
             row_start_byte: 0,
             tile_start_byte: 0,
         }
     }
 
     fn mark_pixel_start(&mut self) {
-        self.pixel_start_byte = self.current_byte_index();
+        self.pixel_start_bit = self.bit_offset;
     }
 
     fn mark_row_start(&mut self) {
@@ -1674,30 +1674,27 @@ impl<'a> UncompressedBitReader<'a> {
             return Ok(());
         }
 
-        let pixel_size =
-            usize::try_from(pixel_size).map_err(|_| DecodeUncompressedError::InvalidInput {
+        let pixel_bits = usize::try_from(pixel_size)
+            .ok()
+            .and_then(|pixel_bytes| pixel_bytes.checked_mul(8))
+            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
                 detail: format!("uncC pixel_size {pixel_size} cannot be represented"),
             })?;
-        let bytes_in_pixel = self
-            .current_byte_index()
-            .checked_sub(self.pixel_start_byte)
-            .ok_or(DecodeUncompressedError::InvalidInput {
+        let bits_in_pixel = self.bit_offset.checked_sub(self.pixel_start_bit).ok_or(
+            DecodeUncompressedError::InvalidInput {
                 detail: "uncompressed pixel alignment cursor underflow".to_string(),
-            })?;
+            },
+        )?;
 
-        if pixel_size > bytes_in_pixel {
-            self.skip_bytes(pixel_size - bytes_in_pixel)?;
-            return Ok(());
-        }
-        if pixel_size == bytes_in_pixel {
-            return Ok(());
+        if bits_in_pixel > pixel_bits {
+            return Err(DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "uncC pixel_size {pixel_size} is smaller than decoded pixel payload ({bits_in_pixel} bits)"
+                ),
+            });
         }
 
-        Err(DecodeUncompressedError::InvalidInput {
-            detail: format!(
-                "uncC pixel_size {pixel_size} is smaller than decoded pixel payload ({bytes_in_pixel} bytes)"
-            ),
-        })
+        self.skip_bits(pixel_bits - bits_in_pixel)
     }
 
     fn handle_row_alignment(&mut self, alignment: u32) -> Result<(), DecodeUncompressedError> {
@@ -15577,6 +15574,260 @@ mod tests {
             .expect("uncompressed control should succeed");
         assert_eq!((decoded.width, decoded.height), (1, 1));
         assert_eq!(decoded.pixels, control.pixels);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct PixelGroupLayout {
+        width: u32,
+        height: u32,
+        component_types: &'static [u16],
+        component_indices: &'static [u16],
+        bit_depth: u8,
+        sampling_type: u8,
+        interleave_type: u8,
+        pixel_size: u32,
+        row_align_size: u32,
+        tile_grid: (u32, u32),
+    }
+
+    const RGB10_IN_FOUR_BYTES: PixelGroupLayout = PixelGroupLayout {
+        width: 2,
+        height: 1,
+        component_types: &[4, 5, 6],
+        component_indices: &[0, 1, 2],
+        bit_depth: 10,
+        sampling_type: 0,
+        interleave_type: super::UNCOMPRESSED_INTERLEAVE_PIXEL,
+        pixel_size: 4,
+        row_align_size: 0,
+        tile_grid: (1, 1),
+    };
+
+    impl PixelGroupLayout {
+        fn file(&self, pixel_size: u32, payload: &[u8], compressed: bool) -> Vec<u8> {
+            let components: Vec<(u16, u8, u8)> = self
+                .component_indices
+                .iter()
+                .map(|index| (*index, self.bit_depth - 1, 0))
+                .collect();
+            let mut properties = vec![
+                isobmff::test_support::ispe_box(self.width, self.height),
+                isobmff::test_support::cmpd_box(self.component_types),
+                isobmff::test_support::uncc_v0_box_with_layout(
+                    &components,
+                    self.sampling_type,
+                    self.interleave_type,
+                    pixel_size,
+                    self.row_align_size,
+                    0,
+                    self.tile_grid,
+                ),
+            ];
+            if compressed {
+                properties.push(isobmff::test_support::cmpc_box(b"zlib", 0));
+                return isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+                    &properties,
+                    &zlib_compress(payload),
+                );
+            }
+            isobmff::test_support::minimal_uncompressed_heif_custom_layout(&properties, payload)
+        }
+
+        fn payload(&self, pixel_size: usize) -> Vec<u8> {
+            let bit_depth = usize::from(self.bit_depth);
+            let samples_per_group = self.component_indices.len();
+            let subsample_x = match self.sampling_type {
+                super::UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING => 1,
+                _ => 2,
+            };
+            let groups_per_row = (self.width / self.tile_grid.0 / subsample_x) as usize;
+            let stored_rows = (self.height * self.tile_grid.0) as usize;
+            let samples: Vec<u16> = (0..stored_rows * groups_per_row * samples_per_group)
+                .map(|index| ((index * 37 + 11) % (1 << bit_depth)) as u16)
+                .collect();
+
+            let mut payload = Vec::new();
+            for row in samples.chunks(samples_per_group * groups_per_row) {
+                let mut row_bytes = if pixel_size == 0 {
+                    pack_msb_first(row, bit_depth)
+                } else {
+                    row.chunks(samples_per_group)
+                        .flat_map(|group| {
+                            let mut group_bytes = pack_msb_first(group, bit_depth);
+                            group_bytes.resize(pixel_size, 0);
+                            group_bytes
+                        })
+                        .collect()
+                };
+                if self.row_align_size != 0 {
+                    let row_bytes_aligned = row_bytes
+                        .len()
+                        .next_multiple_of(self.row_align_size as usize);
+                    row_bytes.resize(row_bytes_aligned, 0);
+                }
+                payload.extend_from_slice(&row_bytes);
+            }
+            payload
+        }
+    }
+
+    fn pack_msb_first(samples: &[u16], bit_depth: usize) -> Vec<u8> {
+        let mut bytes = vec![0_u8; (samples.len() * bit_depth).div_ceil(8)];
+        for (sample_index, sample) in samples.iter().enumerate() {
+            for bit in 0..bit_depth {
+                let position = sample_index * bit_depth + bit;
+                let value = u8::from((sample >> (bit_depth - 1 - bit)) & 1 != 0);
+                bytes[position / 8] |= value << (7 - position % 8);
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn pixel_size_starts_the_next_pixel_on_its_own_boundary() {
+        for padding_bits in [0x00_u8, 0x03] {
+            let payload = [
+                0x55,
+                0x6A,
+                0xA3,
+                0xC0 | padding_bits,
+                0xF0,
+                0xD2,
+                0xDA,
+                0xD8 | padding_bits,
+            ];
+            let decoded = super::decode_primary_uncompressed_to_image(
+                &RGB10_IN_FOUR_BYTES.file(4, &payload, false),
+            )
+            .expect("spec-sized payload should decode");
+            assert_eq!(
+                decoded.rgba,
+                [0x155, 0x2AA, 0x0F0, 0x3FF, 0x3C3, 0x12D, 0x2B6, 0x3FF]
+            );
+        }
+    }
+
+    #[test]
+    fn pixel_size_is_an_exact_stride_for_sub_byte_groups() {
+        const MONO7_IN_TWO_BYTES: PixelGroupLayout = PixelGroupLayout {
+            width: 8,
+            component_types: &[0],
+            component_indices: &[0],
+            bit_depth: 7,
+            pixel_size: 2,
+            ..RGB10_IN_FOUR_BYTES
+        };
+        const MULTI_Y7_IN_FOUR_BYTES: PixelGroupLayout = PixelGroupLayout {
+            width: 8,
+            component_types: &[1, 2, 3],
+            component_indices: &[0, 1, 0, 2],
+            bit_depth: 7,
+            sampling_type: super::UNCOMPRESSED_SAMPLING_422,
+            interleave_type: super::UNCOMPRESSED_INTERLEAVE_MULTI_Y,
+            ..RGB10_IN_FOUR_BYTES
+        };
+
+        let layouts = [
+            RGB10_IN_FOUR_BYTES,
+            PixelGroupLayout {
+                width: 3,
+                ..RGB10_IN_FOUR_BYTES
+            },
+            PixelGroupLayout {
+                width: 4,
+                ..RGB10_IN_FOUR_BYTES
+            },
+            PixelGroupLayout {
+                width: 5,
+                ..RGB10_IN_FOUR_BYTES
+            },
+            PixelGroupLayout {
+                width: 8,
+                height: 3,
+                ..RGB10_IN_FOUR_BYTES
+            },
+            PixelGroupLayout {
+                width: 7,
+                pixel_size: 5,
+                ..RGB10_IN_FOUR_BYTES
+            },
+            PixelGroupLayout {
+                height: 2,
+                row_align_size: 16,
+                ..RGB10_IN_FOUR_BYTES
+            },
+            PixelGroupLayout {
+                width: 8,
+                height: 2,
+                tile_grid: (2, 2),
+                ..RGB10_IN_FOUR_BYTES
+            },
+            MONO7_IN_TWO_BYTES,
+            PixelGroupLayout {
+                pixel_size: 1,
+                ..MONO7_IN_TWO_BYTES
+            },
+            MULTI_Y7_IN_FOUR_BYTES,
+            PixelGroupLayout {
+                pixel_size: 5,
+                height: 2,
+                ..MULTI_Y7_IN_FOUR_BYTES
+            },
+        ];
+
+        for layout in layouts {
+            let payload = layout.payload(layout.pixel_size as usize);
+            let plain = super::decode_primary_uncompressed_to_image(&layout.file(
+                layout.pixel_size,
+                &payload,
+                false,
+            ))
+            .unwrap_or_else(|err| panic!("plain {layout:?}: {err}"));
+            let compressed = super::decode_primary_uncompressed_to_image(&layout.file(
+                layout.pixel_size,
+                &payload,
+                true,
+            ))
+            .unwrap_or_else(|err| panic!("compressed {layout:?}: {err}"));
+            let tight = super::decode_primary_uncompressed_to_image(&layout.file(
+                0,
+                &layout.payload(0),
+                false,
+            ))
+            .unwrap_or_else(|err| panic!("tight {layout:?}: {err}"));
+            assert_eq!(plain.rgba, tight.rgba, "{layout:?}");
+            assert_eq!(compressed.rgba, tight.rgba, "{layout:?}");
+
+            let mut oversized = payload;
+            oversized.push(0);
+            let err = super::decode_primary_uncompressed_to_image(&layout.file(
+                layout.pixel_size,
+                &oversized,
+                true,
+            ))
+            .expect_err("expansion beyond the stride must be rejected");
+            assert!(
+                err.to_string().contains("output budget"),
+                "{layout:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn pixel_size_smaller_than_a_sub_byte_group_is_rejected() {
+        let layout = PixelGroupLayout {
+            width: 1,
+            pixel_size: 3,
+            ..RGB10_IN_FOUR_BYTES
+        };
+        let payload = layout.payload(0);
+        let err = super::decode_primary_uncompressed_to_image(&layout.file(3, &payload, false))
+            .expect_err("a 30-bit group cannot fit a 3-byte pixel");
+        assert!(
+            err.to_string()
+                .contains("uncC pixel_size 3 is smaller than decoded pixel payload"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

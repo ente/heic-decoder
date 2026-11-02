@@ -7909,6 +7909,27 @@ pub(crate) mod test_support {
         row_align_size: u32,
         tile_align_size: u32,
     ) -> Vec<u8> {
+        uncc_v0_box_with_layout(
+            components,
+            sampling_type,
+            interleave_type,
+            0,
+            row_align_size,
+            tile_align_size,
+            (1, 1),
+        )
+    }
+
+    pub(crate) fn uncc_v0_box_with_layout(
+        components: &[(u16, u8, u8)],
+        sampling_type: u8,
+        interleave_type: u8,
+        pixel_size: u32,
+        row_align_size: u32,
+        tile_align_size: u32,
+        tile_grid: (u32, u32),
+    ) -> Vec<u8> {
+        let (tile_cols, tile_rows) = tile_grid;
         let mut payload = vec![0_u8; 4];
         payload.extend_from_slice(&u32::try_from(components.len()).unwrap().to_be_bytes());
         for (component_index, component_bit_depth_minus_one, component_align_size) in components {
@@ -7921,11 +7942,11 @@ pub(crate) mod test_support {
         payload.push(interleave_type);
         payload.push(0);
         payload.push(0);
-        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(&pixel_size.to_be_bytes());
         payload.extend_from_slice(&row_align_size.to_be_bytes());
         payload.extend_from_slice(&tile_align_size.to_be_bytes());
-        payload.extend_from_slice(&0_u32.to_be_bytes());
-        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(&(tile_cols - 1).to_be_bytes());
+        payload.extend_from_slice(&(tile_rows - 1).to_be_bytes());
         full_box(b"uncC", 0, 0, &payload)
     }
 
