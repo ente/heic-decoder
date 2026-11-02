@@ -976,6 +976,113 @@ fn rgb8_coded_route_rejects_visible_oversized_sps_before_allocation() {
     assert_eq!((decoded.width, decoded.height), (16, 16));
 }
 
+#[test]
+fn rgb8_path_route_rejects_visible_oversized_sps_before_allocation() {
+    let oversized = image_fixture(
+        b"hvc1",
+        (16, 16),
+        hevc_configuration(hidden_geometry_sps()),
+        hevc_payload(),
+        None,
+    );
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("heic-rgb8-{}-{nonce}.heic", std::process::id()));
+    std::fs::write(&path, oversized).unwrap();
+    let (result, largest) = tracked(|| {
+        decode_path_to_rgb8_with_guardrails(
+            &path,
+            DecodeGuardrails {
+                max_pixels: Some(1024),
+                ..DecodeGuardrails::default()
+            },
+        )
+    });
+    std::fs::remove_file(&path).unwrap();
+    assert!(matches!(
+        result,
+        Err(DecodeError::Guardrail(
+            DecodeGuardrailError::PixelCountExceeded { .. }
+        ))
+    ));
+    assert!(
+        largest < 1024 * 1024,
+        "oversized coded frame allocated {largest} bytes before the pixel limit"
+    );
+}
+
+fn assert_backend_decode_failure(input: &[u8], expected: &str) {
+    for failure in [
+        decode_bytes_to_rgba(input).err(),
+        decode_bytes_to_rgb8(input).err(),
+    ] {
+        assert!(
+            matches!(
+                &failure,
+                Some(DecodeError::HeicDecode(DecodeHeicError::BackendDecodeFailed { detail }))
+                    if detail.contains(expected)
+            ),
+            "{failure:?}"
+        );
+    }
+}
+
+fn hevc_payload_with_nal_header(header: [u8; 2]) -> Vec<u8> {
+    let mut payload = hevc_payload();
+    payload[4..6].copy_from_slice(&header);
+    payload
+}
+
+#[test]
+fn streams_without_a_base_layer_slice_fail_instead_of_returning_a_blank_frame() {
+    for header in [[0x28, 0x09], [0x2c, 0x01], [0xa8, 0x01], [0x28, 0x00]] {
+        let input = image_fixture(
+            b"hvc1",
+            (16, 16),
+            hevc_configuration(small_hevc_sps()),
+            hevc_payload_with_nal_header(header),
+            None,
+        );
+        assert_backend_decode_failure(&input, "no base layer slice");
+    }
+}
+
+#[test]
+fn enhancement_layer_nal_units_do_not_hide_the_base_layer_slice() {
+    let input = image_fixture(
+        b"hvc1",
+        (16, 16),
+        hevc_configuration(small_hevc_sps()),
+        [hevc_payload_with_nal_header([0x28, 0x09]), hevc_payload()].concat(),
+        None,
+    );
+    let clean = image_fixture(
+        b"hvc1",
+        (16, 16),
+        hevc_configuration(small_hevc_sps()),
+        hevc_payload(),
+        None,
+    );
+    assert_eq!(
+        decode_bytes_to_rgba(&input).unwrap().pixels,
+        decode_bytes_to_rgba(&clean).unwrap().pixels
+    );
+}
+
+#[test]
+fn slices_ending_before_the_last_ctu_fail_instead_of_returning_blank_ctus() {
+    let input = image_fixture(
+        b"hvc1",
+        (32, 16),
+        hevc_configuration(sps_with_tile_dimensions(32, 16)),
+        hevc_payload(),
+        None,
+    );
+    assert_backend_decode_failure(&input, "slice ended before the last CTU");
+}
+
 fn sps_with_tile_dimensions(width: u32, height: u32) -> Vec<u8> {
     let base = small_hevc_sps();
     let sps = crate::heic_decoder::hevc::bitstream::parse_single_nal(&base).unwrap();

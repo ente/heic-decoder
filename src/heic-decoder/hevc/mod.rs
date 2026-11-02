@@ -96,6 +96,15 @@ fn decode_nal_units(nal_units: &[bitstream::NalUnit<'_>]) -> Result<DecodedFrame
         });
     }
 
+    // Decode slice data (base layer only — skip enhancement layer NALs in L-HEVC streams)
+    let mut slices = nal_units
+        .iter()
+        .filter(|nal| nal.nal_type.is_slice() && nal.nuh_layer_id == 0)
+        .peekable();
+    if slices.peek().is_none() {
+        return Err(HevcError::InvalidBitstream("no base layer slice"));
+    }
+
     // Create frame buffer with actual bit depth and chroma format from SPS
     let mut frame = DecodedFrame::try_with_params(
         sps.pic_width_in_luma_samples,
@@ -134,11 +143,8 @@ fn decode_nal_units(nal_units: &[bitstream::NalUnit<'_>]) -> Result<DecodedFrame
         frame.set_crop(crop_left, crop_right, crop_top, crop_bottom);
     }
 
-    // Decode slice data (base layer only — skip enhancement layer NALs in L-HEVC streams)
-    for nal in nal_units {
-        if nal.nal_type.is_slice() && nal.nuh_layer_id == 0 {
-            decode_slice(nal, &sps, &pps, &mut frame)?;
-        }
+    for nal in slices {
+        decode_slice(nal, &sps, &pps, &mut frame)?;
     }
 
     Ok(frame)
