@@ -3530,7 +3530,6 @@ fn uncompressed_pixel_group_tile_size_bytes(
         usize::try_from(pixel_size)
             .ok()
             .and_then(|pixel_bytes| pixel_bytes.checked_mul(groups_per_row))
-            .and_then(|bytes| bytes.checked_add(usize::from(row_bits % 8 != 0)))
             .ok_or_else(|| uncompressed_size_overflow("pixel-group row"))?
     };
     let aligned_row_bytes =
@@ -15741,7 +15740,7 @@ mod tests {
                     (1, 1),
                 ),
             ],
-            &[0xAB, 0xCD, 0xEF],
+            &[0xAB, 0xCD],
         );
     }
 
