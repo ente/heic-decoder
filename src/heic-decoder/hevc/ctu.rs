@@ -456,6 +456,11 @@ impl<'a> SliceContext<'a> {
         if DEBUG_TRACE {
             debug::print_tracker_summary();
         }
+        if ctu_count < total_ctus {
+            return Err(HevcError::InvalidBitstream(
+                "slice ended before the last CTU",
+            ));
+        }
         Ok(())
     }
 
