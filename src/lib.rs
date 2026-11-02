@@ -51,6 +51,8 @@ mod bounded;
 mod geometry;
 #[cfg(test)]
 mod geometry_tests;
+#[cfg(test)]
+mod uncompressed_layout_tests;
 #[cfg(feature = "incremental-experiment")]
 pub use bounded::incremental::decode as decode_incremental_experiment;
 #[path = "heic-decoder/mod.rs"]
@@ -269,6 +271,10 @@ pub enum TransformGuardError {
         width: u32,
         height: u32,
     },
+    AllocationFailed {
+        stage: &'static str,
+        samples: usize,
+    },
 }
 
 impl TransformGuardError {
@@ -277,6 +283,7 @@ impl TransformGuardError {
             TransformGuardError::UnsupportedRotation { .. } => {
                 DecodeErrorCategory::UnsupportedFeature
             }
+            TransformGuardError::AllocationFailed { .. } => DecodeErrorCategory::ResourceLimit,
             _ => DecodeErrorCategory::MalformedInput,
         }
     }
@@ -285,6 +292,9 @@ impl TransformGuardError {
 impl Display for TransformGuardError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            TransformGuardError::AllocationFailed { stage, samples } => {
+                write!(f, "{stage} allocation of {samples} samples failed")
+            }
             TransformGuardError::RgbaSampleCountMismatch {
                 stage,
                 actual,
@@ -1295,12 +1305,16 @@ pub enum DecodeUncompressedError {
     ExtractPrimaryPayload(isobmff::ExtractUncompressedItemDataError),
     UnsupportedFeature { detail: String },
     InvalidInput { detail: String },
+    ResourceLimit { detail: String },
 }
 
 impl DecodeUncompressedError {
     /// Return the stable high-level category for this uncompressed decode failure.
     pub fn category(&self) -> DecodeErrorCategory {
         match self {
+            DecodeUncompressedError::ExtractPrimaryPayload(
+                isobmff::ExtractUncompressedItemDataError::PayloadAllocationFailed { .. },
+            ) => DecodeErrorCategory::ResourceLimit,
             DecodeUncompressedError::ParsePrimaryProperties(_)
             | DecodeUncompressedError::ParsePrimaryTransforms(_)
             | DecodeUncompressedError::ExtractPrimaryPayload(_) => DecodeErrorCategory::Parse,
@@ -1308,6 +1322,7 @@ impl DecodeUncompressedError {
                 DecodeErrorCategory::UnsupportedFeature
             }
             DecodeUncompressedError::InvalidInput { .. } => DecodeErrorCategory::MalformedInput,
+            DecodeUncompressedError::ResourceLimit { .. } => DecodeErrorCategory::ResourceLimit,
         }
     }
 }
@@ -1320,6 +1335,7 @@ impl Display for DecodeUncompressedError {
             DecodeUncompressedError::ExtractPrimaryPayload(err) => write!(f, "{err}"),
             DecodeUncompressedError::UnsupportedFeature { detail } => write!(f, "{detail}"),
             DecodeUncompressedError::InvalidInput { detail } => write!(f, "{detail}"),
+            DecodeUncompressedError::ResourceLimit { detail } => write!(f, "{detail}"),
         }
     }
 }
@@ -1331,7 +1347,8 @@ impl Error for DecodeUncompressedError {
             DecodeUncompressedError::ParsePrimaryTransforms(err) => Some(err),
             DecodeUncompressedError::ExtractPrimaryPayload(err) => Some(err),
             DecodeUncompressedError::UnsupportedFeature { .. }
-            | DecodeUncompressedError::InvalidInput { .. } => None,
+            | DecodeUncompressedError::InvalidInput { .. }
+            | DecodeUncompressedError::ResourceLimit { .. } => None,
         }
     }
 }
@@ -1761,7 +1778,15 @@ fn decode_primary_uncompressed_to_image_internal(
     source: &mut Option<&mut dyn RandomAccessSource>,
 ) -> Result<DecodedUncompressedImage, DecodeUncompressedError> {
     let decoded = decode_primary_uncompressed_to_channels_internal(input, source)?;
-    let mut rgba = Vec::with_capacity(decoded.rgba_sample_count()?);
+    let rgba_sample_count = decoded.rgba_sample_count()?;
+    let mut rgba = Vec::new();
+    rgba.try_reserve_exact(rgba_sample_count).map_err(|_| {
+        DecodeUncompressedError::ResourceLimit {
+            detail: format!(
+                "uncompressed RGBA allocation of {rgba_sample_count} u16 samples failed"
+            ),
+        }
+    })?;
     for pixel_index in 0..decoded.pixel_count()? {
         rgba.extend_from_slice(&decoded.rgba_at(pixel_index)?);
     }
@@ -2319,6 +2344,33 @@ fn decode_primary_uncompressed_to_channels_internal(
                     .to_string(),
         });
     }
+    if interleave_type == UNCOMPRESSED_INTERLEAVE_MULTI_Y {
+        if sampling_type != UNCOMPRESSED_SAMPLING_422 {
+            return Err(DecodeUncompressedError::UnsupportedFeature {
+                detail: format!(
+                    "uncC multi-y interleave currently supports only sampling_type {} (4:2:2)",
+                    UNCOMPRESSED_SAMPLING_422
+                ),
+            });
+        }
+        let unsupported_component = component_specs.iter().find(|spec| {
+            !matches!(
+                spec.role,
+                UncompressedChannelRole::Luma
+                    | UncompressedChannelRole::ChromaBlue
+                    | UncompressedChannelRole::ChromaRed
+                    | UncompressedChannelRole::Padded
+            )
+        });
+        if let Some(spec) = unsupported_component {
+            return Err(DecodeUncompressedError::UnsupportedFeature {
+                detail: format!(
+                    "uncC multi-y interleave currently supports only Y/Cb/Cr/padded components, found {:?}",
+                    spec.role
+                ),
+            });
+        }
+    }
     if sampling_type != UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING {
         if !has_full_ycbcr {
             return Err(DecodeUncompressedError::UnsupportedFeature {
@@ -2351,14 +2403,6 @@ fn decode_primary_uncompressed_to_channels_internal(
             });
         }
         if interleave_type == UNCOMPRESSED_INTERLEAVE_MULTI_Y {
-            if sampling_type != UNCOMPRESSED_SAMPLING_422 {
-                return Err(DecodeUncompressedError::UnsupportedFeature {
-                    detail: format!(
-                        "uncC multi-y interleave currently supports only sampling_type {} (4:2:2)",
-                        UNCOMPRESSED_SAMPLING_422
-                    ),
-                });
-            }
             let expected_luma_components = ycbcr_subsample_x
                 .checked_mul(ycbcr_subsample_y)
                 .ok_or_else(|| DecodeUncompressedError::InvalidInput {
@@ -2428,18 +2472,13 @@ fn decode_primary_uncompressed_to_channels_internal(
         row_align_size: properties.unc_c.row_align_size,
         tile_align_size: properties.unc_c.tile_align_size,
     };
-    let generic_compression_limits = GenericCompressionLimits {
-        max_total_bytes: GENERIC_COMPRESSION_LIMITS.max_total_bytes.min(
-            uncompressed_payload_upper_bound_bytes(
-                &component_specs,
-                sampling_type,
-                interleave_type,
-                &tile_layout,
-                properties.unc_c.pixel_size,
-            )?,
-        ),
-        max_units: GENERIC_COMPRESSION_LIMITS.max_units,
-    };
+    let minimum_payload_bits = uncompressed_minimum_payload_bits(
+        &component_specs,
+        sampling_type,
+        interleave_type,
+        width_usize,
+        height_usize,
+    )?;
     let item_data = if let Some(source) = source.as_mut() {
         isobmff::extract_primary_uncompressed_item_data_from_source(source, input)?
     } else {
@@ -2449,29 +2488,30 @@ fn decode_primary_uncompressed_to_channels_internal(
         item_data.item_id,
         &item_data.generic_compression_properties,
         &item_data.payload,
-        generic_compression_limits,
+        || {
+            let sample_specs: Vec<_> = component_specs
+                .iter()
+                .copied()
+                .filter(|spec| spec.role != UncompressedChannelRole::Padded)
+                .collect();
+            generic_compression_limits_for_layout(
+                uncompressed_payload_size_bytes(
+                    &component_specs,
+                    sampling_type,
+                    interleave_type,
+                    &tile_layout,
+                    properties.unc_c.pixel_size,
+                )?,
+                uncompressed_minimum_payload_bits(
+                    &sample_specs,
+                    sampling_type,
+                    interleave_type,
+                    width_usize,
+                    height_usize,
+                )?,
+            )
+        },
     )?;
-    let mut minimum_payload_bits = 0_u64;
-    for spec in &component_specs {
-        if spec.bit_depth == 0 || spec.bit_depth > 16 {
-            return Err(DecodeUncompressedError::InvalidInput {
-                detail: format!(
-                    "uncC component bit depth {} is outside the supported 1..=16 range",
-                    spec.bit_depth
-                ),
-            });
-        }
-        let (subsample_x, subsample_y) = if interleave_type == UNCOMPRESSED_INTERLEAVE_MULTI_Y {
-            (2_usize, 1_usize)
-        } else {
-            uncompressed_component_subsampling(spec.role, sampling_type)?
-        };
-        minimum_payload_bits = minimum_payload_bits.saturating_add(
-            (width_usize.div_ceil(subsample_x) as u64)
-                .saturating_mul(height_usize.div_ceil(subsample_y) as u64)
-                .saturating_mul(u64::from(spec.bit_depth)),
-        );
-    }
     if (payload.len() as u64).saturating_mul(8) < minimum_payload_bits {
         return Err(DecodeUncompressedError::InvalidInput {
             detail: format!(
@@ -2487,7 +2527,7 @@ fn decode_primary_uncompressed_to_channels_internal(
         if has_channel[channel_index] {
             let mut samples = Vec::new();
             samples.try_reserve_exact(pixel_count).map_err(|_| {
-                DecodeUncompressedError::InvalidInput {
+                DecodeUncompressedError::ResourceLimit {
                     detail: format!(
                         "uncompressed channel allocation of {pixel_count} u16 samples failed"
                     ),
@@ -2623,25 +2663,62 @@ fn decode_primary_uncompressed_to_channels_internal(
     })
 }
 
+fn uncompressed_minimum_payload_bits(
+    specs: &[UncompressedComponentDecodeSpec],
+    sampling_type: u8,
+    interleave_type: u8,
+    width: usize,
+    height: usize,
+) -> Result<u64, DecodeUncompressedError> {
+    let mut minimum_payload_bits = 0_u64;
+    for spec in specs {
+        if spec.bit_depth == 0 || spec.bit_depth > 16 {
+            return Err(DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "uncC component bit depth {} is outside the supported 1..=16 range",
+                    spec.bit_depth
+                ),
+            });
+        }
+        let (subsample_x, subsample_y) = if interleave_type == UNCOMPRESSED_INTERLEAVE_MULTI_Y {
+            uncompressed_chroma_subsampling(sampling_type)?
+        } else {
+            uncompressed_component_subsampling(spec.role, sampling_type)?
+        };
+        minimum_payload_bits = minimum_payload_bits.saturating_add(
+            (width.div_ceil(subsample_x) as u64)
+                .saturating_mul(height.div_ceil(subsample_y) as u64)
+                .saturating_mul(u64::from(spec.bit_depth)),
+        );
+    }
+    Ok(minimum_payload_bits)
+}
+
+fn uncompressed_chroma_subsampling(
+    sampling_type: u8,
+) -> Result<(usize, usize), DecodeUncompressedError> {
+    // Provenance: mirrors chroma plane sizing in
+    // libheif/libheif/codecs/uncompressed/unc_decoder_legacybase.cc:
+    // unc_decoder_legacybase::buildChannelListEntry.
+    match sampling_type {
+        UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING => Ok((1, 1)),
+        UNCOMPRESSED_SAMPLING_422 => Ok((2, 1)),
+        UNCOMPRESSED_SAMPLING_420 => Ok((2, 2)),
+        _ => Err(DecodeUncompressedError::UnsupportedFeature {
+            detail: format!(
+                "unsupported uncC sampling_type {sampling_type} for Cb/Cr component decoding"
+            ),
+        }),
+    }
+}
+
 fn uncompressed_component_subsampling(
     role: UncompressedChannelRole,
     sampling_type: u8,
 ) -> Result<(usize, usize), DecodeUncompressedError> {
     match role {
         UncompressedChannelRole::ChromaBlue | UncompressedChannelRole::ChromaRed => {
-            // Provenance: mirrors chroma plane sizing in
-            // libheif/libheif/codecs/uncompressed/unc_decoder_legacybase.cc:
-            // unc_decoder_legacybase::buildChannelListEntry.
-            match sampling_type {
-                UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING => Ok((1, 1)),
-                UNCOMPRESSED_SAMPLING_422 => Ok((2, 1)),
-                UNCOMPRESSED_SAMPLING_420 => Ok((2, 2)),
-                _ => Err(DecodeUncompressedError::UnsupportedFeature {
-                    detail: format!(
-                        "unsupported uncC sampling_type {sampling_type} for Cb/Cr component decoding"
-                    ),
-                }),
-            }
+            uncompressed_chroma_subsampling(sampling_type)
         }
         _ => Ok((1, 1)),
     }
@@ -2785,6 +2862,24 @@ fn decode_uncompressed_component_interleave(
     Ok(())
 }
 
+fn uncompressed_complementary_chroma_spec(
+    specs: &[UncompressedComponentDecodeSpec],
+    role: UncompressedChannelRole,
+) -> Result<UncompressedComponentDecodeSpec, DecodeUncompressedError> {
+    let other_role = match role {
+        UncompressedChannelRole::ChromaBlue => UncompressedChannelRole::ChromaRed,
+        UncompressedChannelRole::ChromaRed => UncompressedChannelRole::ChromaBlue,
+        _ => unreachable!(),
+    };
+    specs
+        .iter()
+        .copied()
+        .find(|candidate| candidate.role == other_role)
+        .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+            detail: "uncC mixed interleave is missing a complementary Cb/Cr channel".to_string(),
+        })
+}
+
 fn decode_uncompressed_mixed_interleave(
     reader: &mut UncompressedBitReader<'_>,
     specs: &[UncompressedComponentDecodeSpec],
@@ -2803,19 +2898,7 @@ fn decode_uncompressed_mixed_interleave(
                 if decoded_chroma_pair {
                     continue;
                 }
-                let other_role = match spec.role {
-                    UncompressedChannelRole::ChromaBlue => UncompressedChannelRole::ChromaRed,
-                    UncompressedChannelRole::ChromaRed => UncompressedChannelRole::ChromaBlue,
-                    _ => unreachable!(),
-                };
-                let other_spec = specs
-                    .iter()
-                    .copied()
-                    .find(|candidate| candidate.role == other_role)
-                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-                        detail: "uncC mixed interleave is missing a complementary Cb/Cr channel"
-                            .to_string(),
-                    })?;
+                let other_spec = uncompressed_complementary_chroma_spec(specs, spec.role)?;
 
                 let (subsample_x, subsample_y) =
                     uncompressed_component_subsampling(spec.role, sampling_type)?;
@@ -2989,17 +3072,7 @@ fn decode_uncompressed_multi_y_interleave(
     // plus uncC profile definitions in
     // libheif/libheif/codecs/uncompressed/unc_boxes.cc
     // (e.g. 2vuy/yuv2/yvyu/vyuy tuple ordering for 4:2:2 groups).
-    let (subsample_x, subsample_y) = match sampling_type {
-        UNCOMPRESSED_SAMPLING_422 => (2_usize, 1_usize),
-        _ => {
-            return Err(DecodeUncompressedError::UnsupportedFeature {
-                detail: format!(
-                    "uncC multi-y interleave currently supports only sampling_type {} (4:2:2)",
-                    UNCOMPRESSED_SAMPLING_422
-                ),
-            });
-        }
-    };
+    let (subsample_x, subsample_y) = uncompressed_chroma_subsampling(sampling_type)?;
     if !tile_region.width.is_multiple_of(subsample_x)
         || !tile_region.height.is_multiple_of(subsample_y)
     {
@@ -3109,14 +3182,7 @@ fn decode_uncompressed_multi_y_interleave(
                         }
                     }
                     UncompressedChannelRole::Padded => {}
-                    _ => {
-                        return Err(DecodeUncompressedError::UnsupportedFeature {
-                            detail: format!(
-                                "uncC multi-y interleave currently supports only Y/Cb/Cr/padded components, found {:?}",
-                                spec.role
-                            ),
-                        });
-                    }
+                    _ => unreachable!(),
                 }
             }
 
@@ -3149,36 +3215,13 @@ fn decode_uncompressed_tile_component_interleave(
     // {unc_decoder_component_interleave::get_tile_data_sizes,decode_tile}
     // by re-addressing per-component tile payload segments from the full item
     // payload into per-tile component streams.
-    let tile_count = tile_layout
-        .tile_rows
-        .checked_mul(tile_layout.tile_cols)
-        .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-            detail: format!(
-                "uncompressed tile-count overflow for tile grid {}x{}",
-                tile_layout.tile_cols, tile_layout.tile_rows
-            ),
-        })?;
-
-    let mut component_tile_sizes = Vec::with_capacity(specs.len());
-    let mut per_tile_size = 0_usize;
-    for (component_index, spec) in specs.iter().copied().enumerate() {
-        let component_tile_size = uncompressed_component_tile_size_bytes(
-            spec,
-            tile_layout.tile_width,
-            tile_layout.tile_height,
-            tile_layout.row_align_size,
-            tile_layout.tile_align_size,
-            sampling_type,
-        )?;
-        component_tile_sizes.push(component_tile_size);
-        per_tile_size = per_tile_size
-            .checked_add(component_tile_size)
-            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-                detail: format!(
-                    "tile-component payload-size overflow while accumulating component {component_index}"
-                ),
-            })?;
-    }
+    let tile_count = uncompressed_tile_count(&tile_layout)?;
+    let (component_tile_sizes, per_tile_size) = uncompressed_component_tile_sizes(
+        specs,
+        &tile_layout,
+        tile_layout.tile_align_size,
+        sampling_type,
+    )?;
 
     let mut component_base_offsets = Vec::with_capacity(specs.len());
     let mut full_layout_size = 0_usize;
@@ -3209,7 +3252,12 @@ fn decode_uncompressed_tile_component_interleave(
         });
     }
 
-    let mut tile_payload_scratch = Vec::with_capacity(per_tile_size);
+    let mut tile_payload_scratch = Vec::new();
+    tile_payload_scratch
+        .try_reserve_exact(per_tile_size)
+        .map_err(|_| DecodeUncompressedError::ResourceLimit {
+            detail: format!("tile-component scratch allocation of {per_tile_size} bytes failed"),
+        })?;
     for tile_row in 0..tile_layout.tile_rows {
         let tile_origin_y = tile_row
             .checked_mul(tile_layout.tile_height)
@@ -3301,10 +3349,12 @@ fn uncompressed_component_sample_bits(
 ) -> Result<usize, DecodeUncompressedError> {
     let mut bits_per_component = usize::from(spec.bit_depth);
     if spec.component_align_size != 0 {
-        let component_alignment = usize::from(spec.component_align_size);
         let component_bytes = bits_per_component.div_ceil(8);
-        let aligned_component_bytes =
-            align_up_uncompressed_bytes(component_bytes, component_alignment, "component")?;
+        let aligned_component_bytes = align_up_uncompressed_bytes(
+            component_bytes,
+            u32::from(spec.component_align_size),
+            "component",
+        )?;
         bits_per_component = aligned_component_bytes.checked_mul(8).ok_or_else(|| {
             DecodeUncompressedError::InvalidInput {
                 detail: "component bit-size overflow after alignment expansion".to_string(),
@@ -3347,24 +3397,9 @@ fn uncompressed_component_tile_size_bytes(
                 "component row bit-size overflow for tile width {component_tile_width} and component bit-size {bits_per_component}"
             ),
         })?;
-    let mut bytes_per_row =
-        bits_per_row
-            .checked_add(7)
-            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-                detail: "component row byte-size overflow".to_string(),
-            })?
-            / 8;
-    if row_align_size != 0 {
-        bytes_per_row = align_up_uncompressed_bytes(
-            bytes_per_row,
-            usize::try_from(row_align_size).map_err(|_| DecodeUncompressedError::InvalidInput {
-                detail: format!("uncC row_align_size {row_align_size} cannot be represented"),
-            })?,
-            "row",
-        )?;
-    }
-
-    let mut bytes_per_tile =
+    let bytes_per_row =
+        align_up_uncompressed_bytes(bits_per_row.div_ceil(8), row_align_size, "row")?;
+    let bytes_per_tile =
         bytes_per_row
             .checked_mul(component_tile_height)
             .ok_or_else(|| DecodeUncompressedError::InvalidInput {
@@ -3372,28 +3407,64 @@ fn uncompressed_component_tile_size_bytes(
                     "component tile byte-size overflow for {bytes_per_row} bytes/row and tile height {component_tile_height}"
                 ),
             })?;
-    if tile_align_size != 0 {
-        bytes_per_tile = align_up_uncompressed_bytes(
-            bytes_per_tile,
-            usize::try_from(tile_align_size).map_err(|_| {
-                DecodeUncompressedError::InvalidInput {
-                    detail: format!("uncC tile_align_size {tile_align_size} cannot be represented"),
-                }
-            })?,
-            "tile",
+    align_up_uncompressed_bytes(bytes_per_tile, tile_align_size, "tile")
+}
+
+fn uncompressed_component_tile_sizes(
+    specs: &[UncompressedComponentDecodeSpec],
+    tile_layout: &UncompressedTileDecodeLayout,
+    tile_align_size: u32,
+    sampling_type: u8,
+) -> Result<(Vec<usize>, usize), DecodeUncompressedError> {
+    let mut component_tile_sizes = Vec::with_capacity(specs.len());
+    let mut per_tile_size = 0_usize;
+    for (component_index, spec) in specs.iter().copied().enumerate() {
+        let component_tile_size = uncompressed_component_tile_size_bytes(
+            spec,
+            tile_layout.tile_width,
+            tile_layout.tile_height,
+            tile_layout.row_align_size,
+            tile_align_size,
+            sampling_type,
         )?;
+        component_tile_sizes.push(component_tile_size);
+        per_tile_size = per_tile_size
+            .checked_add(component_tile_size)
+            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+                detail: format!(
+                    "tile-component payload-size overflow while accumulating component {component_index}"
+                ),
+            })?;
     }
-    Ok(bytes_per_tile)
+    Ok((component_tile_sizes, per_tile_size))
+}
+
+fn uncompressed_tile_count(
+    tile_layout: &UncompressedTileDecodeLayout,
+) -> Result<usize, DecodeUncompressedError> {
+    tile_layout
+        .tile_rows
+        .checked_mul(tile_layout.tile_cols)
+        .ok_or_else(|| DecodeUncompressedError::InvalidInput {
+            detail: format!(
+                "uncompressed tile-count overflow for tile grid {}x{}",
+                tile_layout.tile_cols, tile_layout.tile_rows
+            ),
+        })
 }
 
 fn align_up_uncompressed_bytes(
     value: usize,
-    alignment: usize,
+    alignment: u32,
     target: &'static str,
 ) -> Result<usize, DecodeUncompressedError> {
     if alignment == 0 {
         return Ok(value);
     }
+    let alignment =
+        usize::try_from(alignment).map_err(|_| DecodeUncompressedError::InvalidInput {
+            detail: format!("uncC {target} alignment {alignment} cannot be represented"),
+        })?;
     let residual = value % alignment;
     if residual == 0 {
         return Ok(value);
@@ -3407,225 +3478,140 @@ fn align_up_uncompressed_bytes(
         })
 }
 
-fn uncompressed_payload_upper_bound_bytes(
+fn uncompressed_size_overflow(subject: &str) -> DecodeUncompressedError {
+    DecodeUncompressedError::InvalidInput {
+        detail: format!("uncompressed {subject} size overflow"),
+    }
+}
+
+fn uncompressed_payload_size_bytes(
     specs: &[UncompressedComponentDecodeSpec],
     sampling_type: u8,
     interleave_type: u8,
     tile_layout: &UncompressedTileDecodeLayout,
     pixel_size: u32,
 ) -> Result<usize, DecodeUncompressedError> {
-    let tile_count = tile_layout
-        .tile_rows
-        .checked_mul(tile_layout.tile_cols)
-        .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-            detail: format!(
-                "uncompressed tile-count overflow for grid {}x{}",
-                tile_layout.tile_cols, tile_layout.tile_rows
-            ),
-        })?;
-    let per_tile_bytes = match interleave_type {
+    let tile_bytes = match interleave_type {
         UNCOMPRESSED_INTERLEAVE_PIXEL | UNCOMPRESSED_INTERLEAVE_MULTI_Y => {
-            let groups_per_row = if interleave_type == UNCOMPRESSED_INTERLEAVE_MULTI_Y {
-                tile_layout.tile_width / 2
-            } else {
-                tile_layout.tile_width
-            };
-            let mut group_bits = 0_usize;
-            let mut aligned_components = 0_usize;
-            for spec in specs {
-                group_bits = group_bits
-                    .checked_add(uncompressed_component_sample_bits(*spec)?)
-                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-                        detail: "uncompressed pixel-group bit-size overflow".to_string(),
-                    })?;
-                if spec.component_align_size != 0 {
-                    aligned_components = aligned_components.checked_add(1).ok_or_else(|| {
-                        DecodeUncompressedError::InvalidInput {
-                            detail: "uncompressed pixel-group aligned-component-count overflow"
-                                .to_string(),
-                        }
-                    })?;
-                }
-            }
-            if aligned_components > 0 && aligned_components < specs.len() {
-                group_bits = group_bits
-                    .checked_add(aligned_components.checked_mul(7).ok_or_else(|| {
-                        DecodeUncompressedError::InvalidInput {
-                            detail: "uncompressed pixel-group bit-size overflow".to_string(),
-                        }
-                    })?)
-                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-                        detail: "uncompressed pixel-group bit-size overflow".to_string(),
-                    })?;
-            }
-            let tight_group_bytes = group_bits.div_ceil(8);
-            let pixel_size_bytes =
-                usize::try_from(pixel_size).map_err(|_| DecodeUncompressedError::InvalidInput {
-                    detail: format!("uncC pixel_size {pixel_size} cannot be represented"),
-                })?;
-            let group_bytes = pixel_size_bytes.max(tight_group_bytes);
-            let row_bytes = group_bytes.checked_mul(groups_per_row).ok_or_else(|| {
-                DecodeUncompressedError::InvalidInput {
-                    detail: format!(
-                        "uncompressed pixel-group row byte-size overflow for {groups_per_row} groups of {group_bytes} bytes"
-                    ),
-                }
-            })?;
-            let row_alignment = usize::try_from(tile_layout.row_align_size).map_err(|_| {
-                DecodeUncompressedError::InvalidInput {
-                    detail: format!(
-                        "uncC row_align_size {} cannot be represented",
-                        tile_layout.row_align_size
-                    ),
-                }
-            })?;
-            let aligned_row_bytes = align_up_uncompressed_bytes(row_bytes, row_alignment, "row")?;
-            let tile_bytes = aligned_row_bytes
-                .checked_mul(tile_layout.tile_height)
-                .ok_or_else(|| {
-                    DecodeUncompressedError::InvalidInput {
-                        detail: format!(
-                            "uncompressed pixel-group tile byte-size overflow for {} rows of {aligned_row_bytes} bytes",
-                            tile_layout.tile_height
-                        ),
-                    }
-                })?;
-            let tile_alignment = usize::try_from(tile_layout.tile_align_size).map_err(|_| {
-                DecodeUncompressedError::InvalidInput {
-                    detail: format!(
-                        "uncC tile_align_size {} cannot be represented",
-                        tile_layout.tile_align_size
-                    ),
-                }
-            })?;
-            align_up_uncompressed_bytes(tile_bytes, tile_alignment, "tile")?
+            uncompressed_pixel_group_tile_size_bytes(specs, sampling_type, tile_layout, pixel_size)?
         }
         UNCOMPRESSED_INTERLEAVE_MIXED => {
-            let mut per_tile_bytes = 0_usize;
-            let mut chroma_pair_counted = false;
-            for spec in specs {
-                match spec.role {
-                    UncompressedChannelRole::ChromaBlue | UncompressedChannelRole::ChromaRed => {
-                        if chroma_pair_counted {
-                            continue;
-                        }
-                        chroma_pair_counted = true;
-                        let other_role = match spec.role {
-                            UncompressedChannelRole::ChromaBlue => {
-                                UncompressedChannelRole::ChromaRed
-                            }
-                            UncompressedChannelRole::ChromaRed => {
-                                UncompressedChannelRole::ChromaBlue
-                            }
-                            _ => unreachable!(),
-                        };
-                        let Some(other_spec) = specs
-                            .iter()
-                            .copied()
-                            .find(|candidate| candidate.role == other_role)
-                        else {
-                            return Err(DecodeUncompressedError::InvalidInput {
-                                detail:
-                                    "uncC mixed interleave is missing a complementary Cb/Cr channel"
-                                        .to_string(),
-                            });
-                        };
-                        let (subsample_x, subsample_y) =
-                            uncompressed_component_subsampling(spec.role, sampling_type)?;
-                        let pair_width = tile_layout.tile_width / subsample_x;
-                        let pair_height = tile_layout.tile_height / subsample_y;
-                        let mut pair_bits = uncompressed_component_sample_bits(*spec)?
-                            .checked_add(uncompressed_component_sample_bits(other_spec)?)
-                            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-                                detail: "uncompressed mixed chroma-pair bit-size overflow"
-                                    .to_string(),
-                            })?;
-                        if (spec.component_align_size != 0)
-                            != (other_spec.component_align_size != 0)
-                        {
-                            pair_bits = pair_bits.checked_add(7).ok_or_else(|| {
-                                DecodeUncompressedError::InvalidInput {
-                                    detail: "uncompressed mixed chroma-pair bit-size overflow"
-                                        .to_string(),
-                                }
-                            })?;
-                        }
-                        let row_bits = pair_bits.checked_mul(pair_width).ok_or_else(|| {
-                            DecodeUncompressedError::InvalidInput {
-                                detail: format!(
-                                    "uncompressed mixed chroma row bit-size overflow for {pair_width} pairs"
-                                ),
-                            }
-                        })?;
-                        let chroma_bytes = row_bits
-                            .div_ceil(8)
-                            .checked_mul(pair_height)
-                            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-                                detail: "uncompressed mixed chroma byte-size overflow".to_string(),
-                            })?;
-                        per_tile_bytes =
-                            per_tile_bytes.checked_add(chroma_bytes).ok_or_else(|| {
-                                DecodeUncompressedError::InvalidInput {
-                                    detail:
-                                        "uncompressed tile byte-size overflow across components"
-                                            .to_string(),
-                                }
-                            })?;
-                    }
-                    _ => {
-                        per_tile_bytes = per_tile_bytes
-                            .checked_add(uncompressed_component_tile_size_bytes(
-                                *spec,
-                                tile_layout.tile_width,
-                                tile_layout.tile_height,
-                                tile_layout.row_align_size,
-                                tile_layout.tile_align_size,
-                                sampling_type,
-                            )?)
-                            .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-                                detail: "uncompressed tile byte-size overflow across components"
-                                    .to_string(),
-                            })?;
-                    }
-                }
-            }
-            let tile_alignment = usize::try_from(tile_layout.tile_align_size).map_err(|_| {
-                DecodeUncompressedError::InvalidInput {
-                    detail: format!(
-                        "uncC tile_align_size {} cannot be represented",
-                        tile_layout.tile_align_size
-                    ),
-                }
-            })?;
-            align_up_uncompressed_bytes(per_tile_bytes, tile_alignment, "tile")?
+            uncompressed_mixed_tile_size_bytes(specs, sampling_type, tile_layout)?
         }
-        _ => {
-            let mut per_tile_bytes = 0_usize;
-            for spec in specs {
-                per_tile_bytes = per_tile_bytes
-                    .checked_add(uncompressed_component_tile_size_bytes(
-                        *spec,
-                        tile_layout.tile_width,
-                        tile_layout.tile_height,
-                        tile_layout.row_align_size,
-                        tile_layout.tile_align_size,
-                        sampling_type,
-                    )?)
-                    .ok_or_else(|| DecodeUncompressedError::InvalidInput {
-                        detail: "uncompressed tile byte-size overflow across components"
-                            .to_string(),
-                    })?;
-            }
+        UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT => {
+            let (_, per_tile_bytes) = uncompressed_component_tile_sizes(
+                specs,
+                tile_layout,
+                tile_layout.tile_align_size,
+                sampling_type,
+            )?;
             per_tile_bytes
         }
-    };
-    per_tile_bytes.checked_mul(tile_count).ok_or_else(|| {
-        DecodeUncompressedError::InvalidInput {
-            detail: format!(
-                "uncompressed payload byte-size overflow for {tile_count} tiles of {per_tile_bytes} bytes"
-            ),
+        _ => {
+            let (_, per_tile_bytes) =
+                uncompressed_component_tile_sizes(specs, tile_layout, 0, sampling_type)?;
+            align_up_uncompressed_bytes(per_tile_bytes, tile_layout.tile_align_size, "tile")?
         }
-    })
+    };
+    tile_bytes
+        .checked_mul(uncompressed_tile_count(tile_layout)?)
+        .ok_or_else(|| uncompressed_size_overflow("payload"))
+}
+
+fn uncompressed_pixel_group_tile_size_bytes(
+    specs: &[UncompressedComponentDecodeSpec],
+    sampling_type: u8,
+    tile_layout: &UncompressedTileDecodeLayout,
+    pixel_size: u32,
+) -> Result<usize, DecodeUncompressedError> {
+    let (subsample_x, _) = uncompressed_chroma_subsampling(sampling_type)?;
+    let groups_per_row = tile_layout.tile_width / subsample_x;
+    let row_bits = uncompressed_group_run_bits(specs, groups_per_row)?;
+    let row_bytes = if pixel_size == 0 {
+        row_bits.div_ceil(8)
+    } else {
+        usize::try_from(pixel_size)
+            .ok()
+            .and_then(|pixel_bytes| pixel_bytes.checked_mul(groups_per_row))
+            .and_then(|bytes| bytes.checked_add(usize::from(row_bits % 8 != 0)))
+            .ok_or_else(|| uncompressed_size_overflow("pixel-group row"))?
+    };
+    let aligned_row_bytes =
+        align_up_uncompressed_bytes(row_bytes, tile_layout.row_align_size, "row")?;
+    let tile_bytes = aligned_row_bytes
+        .checked_mul(tile_layout.tile_height)
+        .ok_or_else(|| uncompressed_size_overflow("pixel-group tile"))?;
+    align_up_uncompressed_bytes(tile_bytes, tile_layout.tile_align_size, "tile")
+}
+
+fn uncompressed_mixed_tile_size_bytes(
+    specs: &[UncompressedComponentDecodeSpec],
+    sampling_type: u8,
+    tile_layout: &UncompressedTileDecodeLayout,
+) -> Result<usize, DecodeUncompressedError> {
+    let mut tile_bytes = 0_usize;
+    let mut chroma_pair_counted = false;
+    for spec in specs {
+        let is_chroma = matches!(
+            spec.role,
+            UncompressedChannelRole::ChromaBlue | UncompressedChannelRole::ChromaRed
+        );
+        if is_chroma && chroma_pair_counted {
+            continue;
+        }
+        let chroma_pair;
+        let group = if is_chroma {
+            chroma_pair_counted = true;
+            chroma_pair = [
+                *spec,
+                uncompressed_complementary_chroma_spec(specs, spec.role)?,
+            ];
+            &chroma_pair[..]
+        } else {
+            std::slice::from_ref(spec)
+        };
+        let (subsample_x, subsample_y) =
+            uncompressed_component_subsampling(spec.role, sampling_type)?;
+        let row_bits = uncompressed_group_run_bits(group, tile_layout.tile_width / subsample_x)?;
+        tile_bytes = row_bits
+            .div_ceil(8)
+            .checked_mul(tile_layout.tile_height / subsample_y)
+            .and_then(|bytes| tile_bytes.checked_add(bytes))
+            .ok_or_else(|| uncompressed_size_overflow("mixed tile"))?;
+    }
+    align_up_uncompressed_bytes(tile_bytes, tile_layout.tile_align_size, "tile")
+}
+
+fn uncompressed_group_run_bits(
+    group: &[UncompressedComponentDecodeSpec],
+    group_count: usize,
+) -> Result<usize, DecodeUncompressedError> {
+    let Some(following_groups) = group_count.checked_sub(1) else {
+        return Ok(0);
+    };
+    let first_group_bits = uncompressed_group_end_bit(group, 0)?;
+    let start_bit = first_group_bits % 8;
+    let following_group_bits = uncompressed_group_end_bit(group, start_bit)? - start_bit;
+    following_group_bits
+        .checked_mul(following_groups)
+        .and_then(|bits| bits.checked_add(first_group_bits))
+        .ok_or_else(|| uncompressed_size_overflow("group run"))
+}
+
+fn uncompressed_group_end_bit(
+    group: &[UncompressedComponentDecodeSpec],
+    start_bit: usize,
+) -> Result<usize, DecodeUncompressedError> {
+    let mut bit = start_bit;
+    for spec in group {
+        if spec.component_align_size != 0 {
+            bit = bit.next_multiple_of(8);
+        }
+        bit = bit
+            .checked_add(uncompressed_component_sample_bits(*spec)?)
+            .ok_or_else(|| uncompressed_size_overflow("group"))?;
+    }
+    Ok(bit)
 }
 
 fn decode_uncompressed_pixel_interleave(
@@ -3934,7 +3920,7 @@ fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
     item_id: u32,
     generic_compression_properties: &isobmff::UncompressedGenericCompressionProperties,
     payload: &'a [u8],
-    limits: GenericCompressionLimits,
+    limits: impl FnOnce() -> Result<GenericCompressionLimits, DecodeUncompressedError>,
 ) -> Result<Cow<'a, [u8]>, DecodeUncompressedError> {
     // Provenance: generic compression handling mirrors libheif
     // uncompressed decode flow and cmpC/icef semantics in
@@ -3980,19 +3966,20 @@ fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
         });
     }
 
-    if !matches!(
-        generic_compression.config.compression_type,
-        GENERIC_COMPRESSION_TYPE_BROTLI
-            | GENERIC_COMPRESSION_TYPE_ZLIB
-            | GENERIC_COMPRESSION_TYPE_DEFLATE
-    ) {
-        return Err(DecodeUncompressedError::UnsupportedFeature {
-            detail: format!(
-                "unsupported cmpC compression_type {} for generic-compressed uncompressed (`unci`) payload",
-                String::from_utf8_lossy(&generic_compression.config.compression_type)
-            ),
-        });
-    }
+    let codec = match generic_compression.config.compression_type {
+        GENERIC_COMPRESSION_TYPE_BROTLI => GenericCompressionCodec::Brotli,
+        GENERIC_COMPRESSION_TYPE_ZLIB => GenericCompressionCodec::Zlib,
+        GENERIC_COMPRESSION_TYPE_DEFLATE => GenericCompressionCodec::Deflate,
+        unsupported => {
+            return Err(DecodeUncompressedError::UnsupportedFeature {
+                detail: format!(
+                    "unsupported cmpC compression_type {} for generic-compressed uncompressed (`unci`) payload",
+                    String::from_utf8_lossy(&unsupported)
+                ),
+            });
+        }
+    };
+    let limits = limits()?;
 
     let fallback_size =
         u64::try_from(payload.len()).map_err(|_| DecodeUncompressedError::InvalidInput {
@@ -4026,7 +4013,7 @@ fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
         .min((payload.len().saturating_mul(4)).max(1024 * 1024));
     decompressed
         .try_reserve_exact(initial_capacity)
-        .map_err(|_| DecodeUncompressedError::InvalidInput {
+        .map_err(|_| DecodeUncompressedError::ResourceLimit {
             detail: format!(
                 "generic-compressed payload allocation of the {initial_capacity}-byte initial reserve failed"
             ),
@@ -4070,7 +4057,7 @@ fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
 
         let unit_payload = &payload[start..end];
         decompress_generic_compressed_unit_into(
-            generic_compression.config.compression_type,
+            codec,
             unit_payload,
             unit_index,
             &mut decompressed,
@@ -4315,42 +4302,84 @@ const GENERIC_COMPRESSION_LIMITS: GenericCompressionLimits = GenericCompressionL
     max_total_bytes: 1024 * 1024 * 1024,
     max_units: 65536,
 };
+const GENERIC_COMPRESSION_UNCONDITIONAL_LAYOUT_BYTES: usize = 16 * 1024 * 1024;
+const GENERIC_COMPRESSION_MAX_LAYOUT_TO_SAMPLE_RATIO: usize = 8;
+const GENERIC_COMPRESSION_READ_CHUNK_BYTES: usize = 64 * 1024;
+const BROTLI_WINDOW_HEADER_MASK: u8 = 0x7F;
+const BROTLI_LARGE_WINDOW_HEADER: u8 = 0x11;
+
+fn generic_compression_limits_for_layout(
+    layout_bytes: usize,
+    sample_bits: u64,
+) -> Result<GenericCompressionLimits, DecodeUncompressedError> {
+    let sample_bytes = usize::try_from(sample_bits.div_ceil(8)).unwrap_or(usize::MAX);
+    let limit = sample_bytes
+        .saturating_mul(GENERIC_COMPRESSION_MAX_LAYOUT_TO_SAMPLE_RATIO)
+        .clamp(
+            GENERIC_COMPRESSION_UNCONDITIONAL_LAYOUT_BYTES,
+            GENERIC_COMPRESSION_LIMITS.max_total_bytes,
+        );
+    if layout_bytes > limit {
+        return Err(DecodeUncompressedError::ResourceLimit {
+            detail: format!(
+                "generic-compressed layout declares {layout_bytes} bytes for {sample_bytes} bytes of samples, exceeding the {limit}-byte limit"
+            ),
+        });
+    }
+    Ok(GenericCompressionLimits {
+        max_total_bytes: layout_bytes,
+        max_units: GENERIC_COMPRESSION_LIMITS.max_units,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum GenericCompressionCodec {
+    Brotli,
+    Zlib,
+    Deflate,
+}
 
 fn decompress_generic_compressed_unit_into(
-    compression_type: [u8; 4],
+    codec: GenericCompressionCodec,
     compressed_data: &[u8],
     unit_index: usize,
     output: &mut Vec<u8>,
     max_total_bytes: usize,
 ) -> Result<(), DecodeUncompressedError> {
-    let compression_label = String::from_utf8_lossy(&compression_type).into_owned();
-    match compression_type {
-        GENERIC_COMPRESSION_TYPE_BROTLI => read_unit_into_budget(
-            BrotliDecompressor::new(compressed_data, 4096),
-            unit_index,
-            "brotli",
-            output,
-            max_total_bytes,
-        ),
-        GENERIC_COMPRESSION_TYPE_ZLIB => read_unit_into_budget(
+    match codec {
+        GenericCompressionCodec::Brotli => {
+            if compressed_data
+                .first()
+                .is_some_and(|byte| byte & BROTLI_WINDOW_HEADER_MASK == BROTLI_LARGE_WINDOW_HEADER)
+            {
+                return Err(DecodeUncompressedError::UnsupportedFeature {
+                    detail: format!(
+                        "brotli generic-compressed unit {unit_index} uses the unsupported large-window extension"
+                    ),
+                });
+            }
+            read_unit_into_budget(
+                BrotliDecompressor::new(compressed_data, 4096),
+                unit_index,
+                "brotli",
+                output,
+                max_total_bytes,
+            )
+        }
+        GenericCompressionCodec::Zlib => read_unit_into_budget(
             ZlibDecoder::new(compressed_data),
             unit_index,
             "zlib",
             output,
             max_total_bytes,
         ),
-        GENERIC_COMPRESSION_TYPE_DEFLATE => read_unit_into_budget(
+        GenericCompressionCodec::Deflate => read_unit_into_budget(
             DeflateDecoder::new(compressed_data),
             unit_index,
             "deflate",
             output,
             max_total_bytes,
         ),
-        _ => Err(DecodeUncompressedError::UnsupportedFeature {
-            detail: format!(
-                "unsupported cmpC compression_type {compression_label} for generic-compressed uncompressed (`unci`) payload"
-            ),
-        }),
     }
 }
 
@@ -4361,30 +4390,50 @@ fn read_unit_into_budget<R: Read>(
     output: &mut Vec<u8>,
     max_total_bytes: usize,
 ) -> Result<(), DecodeUncompressedError> {
-    let unit_start = output.len();
-    let budget_remaining = max_total_bytes.saturating_sub(unit_start);
     let decompress_error = |err: std::io::Error| DecodeUncompressedError::InvalidInput {
         detail: format!("failed to decompress {codec} generic-compressed unit {unit_index}: {err}"),
     };
-    {
-        let mut limited = decoder.by_ref().take(budget_remaining as u64);
-        limited.read_to_end(output).map_err(decompress_error)?;
-    }
-    if output.len() - unit_start == budget_remaining {
-        let mut overflow_probe = [0_u8; 1];
-        match decoder.read(&mut overflow_probe) {
-            Ok(0) => {}
-            Ok(_) => {
-                return Err(DecodeUncompressedError::InvalidInput {
+    loop {
+        let filled = output.len();
+        let remaining = max_total_bytes.saturating_sub(filled);
+        if remaining == 0 {
+            let mut overflow_probe = [0_u8; 1];
+            return match decoder
+                .read(&mut overflow_probe)
+                .map_err(decompress_error)?
+            {
+                0 => Ok(()),
+                _ => Err(DecodeUncompressedError::InvalidInput {
                     detail: format!(
                         "{codec} generic-compressed unit {unit_index} decompresses to more than the {max_total_bytes}-byte output budget, exceeding the limit across units"
                     ),
-                });
-            }
-            Err(err) => return Err(decompress_error(err)),
+                }),
+            };
+        }
+
+        let chunk = remaining.min(GENERIC_COMPRESSION_READ_CHUNK_BYTES);
+        if output.capacity() - filled < chunk {
+            let capacity = output
+                .capacity()
+                .saturating_mul(2)
+                .clamp(filled + chunk, max_total_bytes);
+            output.try_reserve_exact(capacity - filled).map_err(|_| {
+                DecodeUncompressedError::ResourceLimit {
+                    detail: format!(
+                        "{codec} generic-compressed unit {unit_index} output allocation of {capacity} bytes failed"
+                    ),
+                }
+            })?;
+        }
+        output.resize(filled + chunk, 0);
+        let read = decoder
+            .read(&mut output[filled..])
+            .map_err(decompress_error)?;
+        output.truncate(filled + read);
+        if read == 0 {
+            return Ok(());
         }
     }
-    Ok(())
 }
 
 fn uncompressed_channel_name(channel_index: usize) -> &'static str {
@@ -11405,7 +11454,7 @@ fn decoded_uncompressed_to_rgba_image(
     }
 
     if bit_depth <= 8 {
-        let mut rgba8 = Vec::with_capacity(rgba.len());
+        let mut rgba8 = try_rgba_buffer(rgba.len(), "uncompressed RGBA8 conversion")?;
         for sample in rgba {
             rgba8.push(scale_sample_to_u8(sample, bit_depth));
         }
@@ -11432,7 +11481,7 @@ fn decoded_uncompressed_to_rgba_image(
         });
     }
 
-    let mut rgba16 = Vec::with_capacity(rgba.len());
+    let mut rgba16 = try_rgba_buffer(rgba.len(), "uncompressed RGBA16 conversion")?;
     for sample in rgba {
         rgba16.push(scale_sample_to_u16(sample, bit_depth));
     }
@@ -11680,6 +11729,14 @@ fn checked_interleaved_sample_count(
     })
 }
 
+fn try_rgba_buffer<T>(samples: usize, stage: &'static str) -> Result<Vec<T>, DecodeError> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(samples).map_err(|_| {
+        DecodeError::TransformGuard(TransformGuardError::AllocationFailed { stage, samples })
+    })?;
+    Ok(buffer)
+}
+
 fn rotate_rgba_ccw<T: Copy + Default>(
     width: u32,
     height: u32,
@@ -11688,7 +11745,9 @@ fn rotate_rgba_ccw<T: Copy + Default>(
 ) -> Result<(u32, u32, Vec<T>), DecodeError> {
     let normalized = rotation_ccw_degrees % 360;
     if normalized == 0 {
-        return Ok((width, height, pixels.to_vec()));
+        let mut unrotated = try_rgba_buffer(pixels.len(), "rotation")?;
+        unrotated.extend_from_slice(pixels);
+        return Ok((width, height, unrotated));
     }
 
     let (dst_width, dst_height) = match normalized {
@@ -11725,7 +11784,8 @@ fn rotate_rgba_ccw<T: Copy + Default>(
         })
     })?;
     let output_len = checked_rgba_sample_count(dst_width, dst_height)?;
-    let mut out = vec![T::default(); output_len];
+    let mut out = try_rgba_buffer(output_len, "rotation")?;
+    out.resize(output_len, T::default());
 
     for y in 0..src_height {
         for x in 0..src_width {
@@ -11791,7 +11851,8 @@ fn mirror_rgba<T: Copy + Default>(
         })
     })?;
     let output_len = checked_rgba_sample_count(width, height)?;
-    let mut out = vec![T::default(); output_len];
+    let mut out = try_rgba_buffer(output_len, "mirror")?;
+    out.resize(output_len, T::default());
 
     for y in 0..src_height {
         for x in 0..src_width {
@@ -12004,7 +12065,7 @@ fn crop_rgba_by_clean_aperture<T: Copy>(
     })?;
 
     let out_len = checked_rgba_sample_count(crop.width, crop.height)?;
-    let mut out = Vec::with_capacity(out_len);
+    let mut out = try_rgba_buffer(out_len, "clean aperture")?;
     for y in top_usize..=bottom_usize {
         let row_pixel_start = y
             .checked_mul(src_width)
@@ -15382,7 +15443,7 @@ mod tests {
         assert_eq!(decoded.pixels, super::DecodedRgbaPixels::U8(expected_rgba));
     }
 
-    fn zlib_compress(data: &[u8]) -> Vec<u8> {
+    pub(super) fn zlib_compress(data: &[u8]) -> Vec<u8> {
         use std::io::Write as _;
 
         let mut encoder =
@@ -15419,8 +15480,341 @@ mod tests {
         let err = super::decode_bytes_to_rgba(&file).expect_err("bomb must be rejected");
         let detail = err.to_string();
         assert!(
-            detail.contains("exceeding the"),
-            "expected a decompression-limit error, got: {detail}"
+            detail.contains("output budget"),
+            "expected a geometry-budget error, got: {detail}"
+        );
+    }
+
+    struct EndlessZeros {
+        produced: usize,
+    }
+
+    impl std::io::Read for EndlessZeros {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            buffer.fill(0);
+            self.produced += buffer.len();
+            Ok(buffer.len())
+        }
+    }
+
+    #[test]
+    fn generic_compression_bomb_stops_one_byte_past_the_budget() {
+        let mut bomb = EndlessZeros { produced: 0 };
+        let mut output = Vec::new();
+
+        let err = super::read_unit_into_budget(&mut bomb, 0, "zlib", &mut output, 1024)
+            .expect_err("bomb must be rejected");
+
+        let detail = err.to_string();
+        assert!(
+            detail.contains("output budget"),
+            "expected a geometry-budget error, got: {detail}"
+        );
+        assert_eq!(output.len(), 1024);
+        assert_eq!(output.capacity(), 1024);
+        assert_eq!(bomb.produced, 1025);
+    }
+
+    #[test]
+    fn generic_compression_small_image_cannot_declare_a_padding_only_layout() {
+        let floor = super::GENERIC_COMPRESSION_UNCONDITIONAL_LAYOUT_BYTES as u32;
+        let ceiling = super::GENERIC_COMPRESSION_LIMITS.max_total_bytes as u32;
+        let mono = [(0_u16, 7_u8, 0_u8)];
+        let mut mono_with_padding = vec![(0_u16, 7_u8, 0_u8)];
+        mono_with_padding.resize(4097, (1, 15, 0));
+        let file = |extent: u32,
+                    component_types: &[u16],
+                    components: &[(u16, u8, u8)],
+                    (pixel_size, row_align, tile_align): (u32, u32, u32)| {
+            isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+                &[
+                    isobmff::test_support::ispe_box(extent, extent),
+                    isobmff::test_support::cmpd_box(component_types),
+                    isobmff::test_support::uncc_v0_box_with_layout(
+                        components,
+                        0,
+                        super::UNCOMPRESSED_INTERLEAVE_PIXEL,
+                        pixel_size,
+                        row_align,
+                        tile_align,
+                        (1, 1),
+                    ),
+                    isobmff::test_support::cmpc_box(b"zlib", 0),
+                ],
+                b"not a zlib stream",
+            )
+        };
+
+        for file in [
+            file(1, &[0], &mono, (floor + 1, 0, 0)),
+            file(1, &[0], &mono, (ceiling + 1, 0, 0)),
+            file(1, &[0], &mono, (0, floor + 1, 0)),
+            file(1, &[0], &mono, (0, 0, floor + 1)),
+            file(64, &[0, 12], &mono_with_padding, (65_536, 0, 0)),
+        ] {
+            let err = super::decode_bytes_to_rgba(&file).expect_err("layout must be rejected");
+
+            assert_eq!(err.category(), super::DecodeErrorCategory::ResourceLimit);
+        }
+    }
+
+    #[test]
+    fn generic_compression_limits_keep_layouts_backed_by_samples() {
+        let megabyte = 1024 * 1024;
+        let limits = |layout_bytes: usize, sample_bytes: usize| {
+            super::generic_compression_limits_for_layout(layout_bytes, sample_bytes as u64 * 8)
+        };
+
+        let unconditional = limits(16 * megabyte, 1).expect("floor applies to every layout");
+        assert_eq!(unconditional.max_total_bytes, 16 * megabyte);
+        assert!(limits(16 * megabyte + 1, 1).is_err());
+
+        let backed = limits(800 * megabyte, 100 * megabyte).expect("8x samples is allowed");
+        assert_eq!(backed.max_total_bytes, 800 * megabyte);
+        assert!(limits(800 * megabyte + 1, 100 * megabyte).is_err());
+
+        let ceiling = limits(1024 * megabyte, 1024 * megabyte).expect("ceiling is inclusive");
+        assert_eq!(ceiling.max_total_bytes, 1024 * megabyte);
+        assert!(limits(1024 * megabyte + 1, 1024 * megabyte).is_err());
+    }
+
+    #[test]
+    fn generic_compression_limits_are_only_evaluated_for_supported_codecs() {
+        let no_compression = isobmff::UncompressedGenericCompressionProperties {
+            cmpc: vec![],
+            icef: vec![],
+        };
+        let payload = [1_u8, 2, 3];
+        let plain = super::maybe_decode_primary_uncompressed_generic_compression_payload(
+            1,
+            &no_compression,
+            &payload,
+            || panic!("plain items have no output budget"),
+        )
+        .expect("plain payload passes through");
+        assert_eq!(plain.as_ref(), &payload);
+
+        let mut cmpc_payload = vec![0_u8; 4];
+        cmpc_payload.extend_from_slice(b"lz4 ");
+        cmpc_payload.push(super::GENERIC_COMPRESSED_UNIT_FULL_ITEM);
+        let unknown_codec = isobmff::UncompressedGenericCompressionProperties {
+            cmpc: vec![isobmff::GenericCompressionPropertyPayload {
+                offset: 0,
+                payload: cmpc_payload,
+            }],
+            icef: vec![],
+        };
+        let err = super::maybe_decode_primary_uncompressed_generic_compression_payload(
+            1,
+            &unknown_codec,
+            &payload,
+            || panic!("unknown codecs have no output budget"),
+        )
+        .expect_err("unknown codec must be rejected");
+        assert_eq!(
+            err.category(),
+            super::DecodeErrorCategory::UnsupportedFeature
+        );
+    }
+
+    #[test]
+    fn uncompressed_multi_y_without_subsampling_is_unsupported() {
+        let layout = [
+            isobmff::test_support::ispe_box(2, 1),
+            isobmff::test_support::cmpd_box(&[1, 2, 3]),
+            isobmff::test_support::uncc_v0_box(
+                &[(0, 7), (1, 7), (0, 7), (2, 7)],
+                0,
+                super::UNCOMPRESSED_INTERLEAVE_MULTI_Y,
+            ),
+        ];
+        let compressed = [
+            &layout[..],
+            &[isobmff::test_support::cmpc_box(b"zlib", 0)][..],
+        ]
+        .concat();
+        let pixels = [0_u8; 4];
+
+        for file in [
+            isobmff::test_support::minimal_uncompressed_heif_custom_layout(&layout, &pixels),
+            isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+                &compressed,
+                &zlib_compress(&pixels),
+            ),
+        ] {
+            let err = super::decode_bytes_to_rgba(&file).expect_err("layout is unsupported");
+            assert_eq!(
+                err.category(),
+                super::DecodeErrorCategory::UnsupportedFeature
+            );
+        }
+    }
+
+    #[test]
+    fn uncompressed_multi_y_with_alpha_is_unsupported_before_the_budget() {
+        let layout = |pixel_size: u32| {
+            vec![
+                isobmff::test_support::ispe_box(2, 1),
+                isobmff::test_support::cmpd_box(&[1, 2, 3, 7]),
+                isobmff::test_support::uncc_v0_box_with_layout(
+                    &[(0, 7, 0), (1, 7, 0), (0, 7, 0), (2, 7, 0), (3, 7, 0)],
+                    1,
+                    super::UNCOMPRESSED_INTERLEAVE_MULTI_Y,
+                    pixel_size,
+                    0,
+                    0,
+                    (1, 1),
+                ),
+            ]
+        };
+        let compressed = |pixel_size: u32| {
+            let mut properties = layout(pixel_size);
+            properties.push(isobmff::test_support::cmpc_box(b"zlib", 0));
+            properties
+        };
+        let exact = [0_u8; 5];
+        let oversized = [0_u8; 6];
+
+        for file in [
+            isobmff::test_support::minimal_uncompressed_heif_custom_layout(&layout(0), &exact),
+            isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+                &compressed(0),
+                &zlib_compress(&exact),
+            ),
+            isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+                &compressed(0),
+                &zlib_compress(&oversized),
+            ),
+            isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+                &compressed(300 * 1024 * 1024),
+                &zlib_compress(&exact),
+            ),
+        ] {
+            let err = super::decode_bytes_to_rgba(&file).expect_err("layout is unsupported");
+            assert_eq!(
+                err.category(),
+                super::DecodeErrorCategory::UnsupportedFeature
+            );
+        }
+    }
+
+    fn assert_compressed_budget_is_exactly(layout: &[Vec<u8>], payload: &[u8]) {
+        let compressed_layout =
+            [layout, &[isobmff::test_support::cmpc_box(b"zlib", 0)][..]].concat();
+        let control = super::decode_bytes_to_rgba(
+            &isobmff::test_support::minimal_uncompressed_heif_custom_layout(layout, payload),
+        )
+        .expect("uncompressed control should succeed");
+        let decoded = super::decode_bytes_to_rgba(
+            &isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+                &compressed_layout,
+                &zlib_compress(payload),
+            ),
+        )
+        .expect("compressed decode should succeed");
+        assert_eq!(decoded.pixels, control.pixels);
+
+        let err = super::decode_bytes_to_rgba(
+            &isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+                &compressed_layout,
+                &zlib_compress(&[payload, &[0]].concat()),
+            ),
+        )
+        .expect_err("expansion beyond the layout must be rejected");
+        let detail = err.to_string();
+        assert!(
+            detail.contains("output budget"),
+            "expected a geometry-budget error, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn generic_compression_budget_covers_pixel_size_with_a_sub_byte_residual() {
+        assert_compressed_budget_is_exactly(
+            &[
+                isobmff::test_support::ispe_box(1, 1),
+                isobmff::test_support::cmpd_box(&[4, 5, 6]),
+                isobmff::test_support::uncc_v0_box_with_layout(
+                    &[(0, 3, 0), (1, 3, 0), (2, 3, 0)],
+                    0,
+                    super::UNCOMPRESSED_INTERLEAVE_PIXEL,
+                    2,
+                    0,
+                    0,
+                    (1, 1),
+                ),
+            ],
+            &[0xAB, 0xCD, 0xEF],
+        );
+    }
+
+    #[test]
+    fn generic_compression_budget_packs_sub_byte_pixels_across_the_row() {
+        assert_compressed_budget_is_exactly(
+            &[
+                isobmff::test_support::ispe_box(8, 1),
+                isobmff::test_support::cmpd_box(&[0]),
+                isobmff::test_support::uncc_v0_box(
+                    &[(0, 0)],
+                    0,
+                    super::UNCOMPRESSED_INTERLEAVE_PIXEL,
+                ),
+            ],
+            &[0b1010_0101],
+        );
+    }
+
+    #[test]
+    fn generic_compression_mixed_budget_ignores_row_alignment_like_the_reader() {
+        assert_compressed_budget_is_exactly(
+            &[
+                isobmff::test_support::ispe_box(2, 2),
+                isobmff::test_support::cmpd_box(&[1, 2, 3]),
+                isobmff::test_support::uncc_v0_box_with_aligns(
+                    &[(0, 7, 0), (1, 7, 0), (2, 7, 0)],
+                    2,
+                    super::UNCOMPRESSED_INTERLEAVE_MIXED,
+                    16,
+                    0,
+                ),
+            ],
+            &[10, 20, 30, 40, 128, 128],
+        );
+    }
+
+    #[test]
+    fn generic_compression_component_budget_aligns_the_tile_once() {
+        assert_compressed_budget_is_exactly(
+            &[
+                isobmff::test_support::ispe_box(2, 1),
+                isobmff::test_support::cmpd_box(&[4, 5, 6]),
+                isobmff::test_support::uncc_v0_box_with_aligns(
+                    &[(0, 7, 0), (1, 7, 0), (2, 7, 0)],
+                    0,
+                    super::UNCOMPRESSED_INTERLEAVE_COMPONENT,
+                    0,
+                    16,
+                ),
+            ],
+            &[7_u8; 16],
+        );
+    }
+
+    #[test]
+    fn generic_compression_tile_component_budget_aligns_each_component() {
+        assert_compressed_budget_is_exactly(
+            &[
+                isobmff::test_support::ispe_box(2, 1),
+                isobmff::test_support::cmpd_box(&[4, 5, 6]),
+                isobmff::test_support::uncc_v0_box_with_aligns(
+                    &[(0, 7, 0), (1, 7, 0), (2, 7, 0)],
+                    0,
+                    super::UNCOMPRESSED_INTERLEAVE_TILE_COMPONENT,
+                    0,
+                    16,
+                ),
+            ],
+            &[7_u8; 48],
         );
     }
 
@@ -15690,7 +16084,7 @@ mod tests {
             1,
             &properties,
             &payload,
-            limits,
+            || Ok(limits),
         )
         .expect_err("total cap must reject");
         let detail = err.to_string();
@@ -15750,7 +16144,7 @@ mod tests {
             1,
             &properties,
             &payload,
-            limits,
+            || Ok(limits),
         )
         .expect_err("unit-count cap must reject");
         let detail = err.to_string();
@@ -15760,22 +16154,48 @@ mod tests {
         );
     }
 
+    pub(super) fn zlib_full_item_properties() -> isobmff::UncompressedGenericCompressionProperties {
+        let mut cmpc_payload = vec![0_u8; 4];
+        cmpc_payload.extend_from_slice(b"zlib");
+        cmpc_payload.push(super::GENERIC_COMPRESSED_UNIT_FULL_ITEM);
+        isobmff::UncompressedGenericCompressionProperties {
+            cmpc: vec![isobmff::GenericCompressionPropertyPayload {
+                offset: 0,
+                payload: cmpc_payload,
+            }],
+            icef: vec![],
+        }
+    }
+
+    #[test]
+    fn generic_compression_grows_past_the_initial_reserve_without_losing_bytes() {
+        let expanded: Vec<u8> = (0..3 * 1024 * 1024_usize)
+            .map(|index| (index / 4096) as u8 ^ (index % 7) as u8)
+            .collect();
+        let compressed = zlib_compress(&expanded);
+        assert!(compressed.len() * 4 < expanded.len());
+        let limits = super::GenericCompressionLimits {
+            max_total_bytes: expanded.len(),
+            max_units: 65536,
+        };
+
+        let mut decompressed =
+            super::maybe_decode_primary_uncompressed_generic_compression_payload(
+                1,
+                &zlib_full_item_properties(),
+                &compressed,
+                || Ok(limits),
+            )
+            .expect("stream within the budget must decode");
+
+        assert_eq!(decompressed.as_ref(), expanded.as_slice());
+        assert_eq!(decompressed.to_mut().capacity(), expanded.len());
+    }
+
     #[test]
     fn generic_compression_initial_reserve_is_bounded_by_input_size() {
         let compressed = zlib_compress(&[7_u8; 8]);
-        let properties = isobmff::UncompressedGenericCompressionProperties {
-            cmpc: vec![isobmff::GenericCompressionPropertyPayload {
-                offset: 0,
-                payload: {
-                    let mut cmpc_payload = Vec::new();
-                    cmpc_payload.extend_from_slice(&[0_u8; 4]);
-                    cmpc_payload.extend_from_slice(b"zlib");
-                    cmpc_payload.push(super::GENERIC_COMPRESSED_UNIT_FULL_ITEM);
-                    cmpc_payload
-                },
-            }],
-            icef: vec![],
-        };
+        let properties = zlib_full_item_properties();
         let limits = super::GenericCompressionLimits {
             max_total_bytes: 1024 * 1024 * 1024,
             max_units: 65536,
@@ -15786,7 +16206,7 @@ mod tests {
                 1,
                 &properties,
                 &compressed,
-                limits,
+                || Ok(limits),
             )
             .expect("tiny unit must decode within the large budget");
         assert_eq!(decompressed.as_ref(), &[7_u8; 8]);

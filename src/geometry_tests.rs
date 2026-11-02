@@ -572,6 +572,225 @@ fn heic_copied_plane_allocation_failure_is_a_resource_error() {
     ));
 }
 
+fn with_allocations_failing_at<T>(size: usize, run: impl FnOnce() -> T) -> T {
+    FAIL_ALLOCATION_AT.with(|limit| limit.set(Some(size)));
+    let result = run();
+    FAIL_ALLOCATION_AT.with(|limit| limit.set(None));
+    result
+}
+
+#[test]
+fn uncompressed_channel_allocation_failure_is_a_resource_error() {
+    let payload = vec![0_u8; 128 * 1024];
+    let file = isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+        &[
+            isobmff::test_support::ispe_box(1024, 1024),
+            isobmff::test_support::cmpd_box(&[0]),
+            isobmff::test_support::uncc_v0_box(&[(0, 0)], 0, UNCOMPRESSED_INTERLEAVE_PIXEL),
+        ],
+        &payload,
+    );
+
+    let result = with_allocations_failing_at(1024 * 1024, || {
+        decode_primary_uncompressed_to_channels_internal(&file, &mut None)
+    });
+
+    assert!(matches!(
+        result,
+        Err(DecodeUncompressedError::ResourceLimit { .. })
+    ));
+}
+
+fn plain_mono8_file(width: u32, height: u32) -> Vec<u8> {
+    isobmff::test_support::minimal_uncompressed_heif_custom_layout(
+        &[
+            isobmff::test_support::ispe_box(width, height),
+            isobmff::test_support::cmpd_box(&[0]),
+            isobmff::test_support::uncc_v0_box(&[(0, 7)], 0, UNCOMPRESSED_INTERLEAVE_PIXEL),
+        ],
+        &vec![0_u8; width as usize * height as usize],
+    )
+}
+
+#[test]
+fn uncompressed_rgba_allocation_failure_is_a_resource_error() {
+    let file = plain_mono8_file(512, 512);
+
+    let result =
+        with_allocations_failing_at(1024 * 1024, || decode_primary_uncompressed_to_image(&file));
+
+    assert!(matches!(
+        result,
+        Err(DecodeUncompressedError::ResourceLimit { .. })
+    ));
+}
+
+#[test]
+fn uncompressed_payload_allocation_failure_is_a_resource_error() {
+    let file = plain_mono8_file(1024, 1024);
+
+    let result = with_allocations_failing_at(1024 * 1024, || {
+        decode_primary_uncompressed_to_channels_internal(&file, &mut None).map(|_| ())
+    });
+
+    let error = result.expect_err("payload allocation must fail");
+    assert!(matches!(
+        error,
+        DecodeUncompressedError::ExtractPrimaryPayload(
+            isobmff::ExtractUncompressedItemDataError::PayloadAllocationFailed { .. }
+        )
+    ));
+    assert_eq!(error.category(), DecodeErrorCategory::ResourceLimit);
+}
+
+#[test]
+fn uncompressed_tile_scratch_allocation_failure_is_a_resource_error() {
+    let payload = vec![0_u8; 1024 * 1024];
+    let specs = [UncompressedComponentDecodeSpec {
+        role: UncompressedChannelRole::Monochrome,
+        bit_depth: 8,
+        component_align_size: 0,
+    }];
+    let tile_layout = UncompressedTileDecodeLayout {
+        tile_rows: 1,
+        tile_cols: 1,
+        tile_width: 1024,
+        tile_height: 1024,
+        image_width: 1024,
+        row_align_size: 0,
+        tile_align_size: 0,
+    };
+    let mut channel_samples: [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT] =
+        std::array::from_fn(|_| None);
+    channel_samples[UNCOMPRESSED_CHANNEL_MONO] = Some(vec![0_u16; 1024 * 1024]);
+
+    let result = with_allocations_failing_at(1024 * 1024, || {
+        decode_uncompressed_tile_component_interleave(
+            &payload,
+            &specs,
+            tile_layout,
+            UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING,
+            &mut channel_samples,
+        )
+    });
+
+    assert!(matches!(
+        result,
+        Err(DecodeUncompressedError::ResourceLimit { .. })
+    ));
+}
+
+#[test]
+fn uncompressed_sample_conversion_allocation_failure_is_a_resource_error() {
+    for bit_depth in [8, 10] {
+        let decoded = DecodedUncompressedImage {
+            width: 512,
+            height: 512,
+            bit_depth,
+            rgba: vec![0_u16; 1024 * 1024],
+            icc_profile: None,
+        };
+
+        let result = with_allocations_failing_at(1024 * 1024, || {
+            decoded_uncompressed_to_rgba_image(decoded, &[])
+        });
+
+        let error = result.expect_err("conversion allocation must fail");
+        assert_eq!(error.category(), DecodeErrorCategory::ResourceLimit);
+    }
+}
+
+#[test]
+fn rgba_transform_allocation_failure_is_a_resource_error() {
+    let pixels = vec![0_u8; 4 * 1024 * 1024];
+    let crop_source = pixels.clone();
+    let clean_aperture = isobmff::ImageCleanApertureProperty {
+        clean_aperture_width_num: 1024,
+        clean_aperture_width_den: 1,
+        clean_aperture_height_num: 768,
+        clean_aperture_height_den: 1,
+        horizontal_offset_num: 0,
+        horizontal_offset_den: 1,
+        vertical_offset_num: 0,
+        vertical_offset_den: 1,
+    };
+
+    let results = with_allocations_failing_at(3 * 1024 * 1024, || {
+        [
+            rotate_rgba_ccw(1024, 1024, &pixels, 0).map(|_| ()),
+            rotate_rgba_ccw(1024, 1024, &pixels, 90).map(|_| ()),
+            mirror_rgba(
+                1024,
+                1024,
+                &pixels,
+                isobmff::ImageMirrorDirection::Horizontal,
+            )
+            .map(|_| ()),
+            crop_rgba_by_clean_aperture(1024, 1024, crop_source, clean_aperture).map(|_| ()),
+        ]
+    });
+
+    for result in results {
+        let error = result.expect_err("transform allocation must fail");
+        assert_eq!(error.category(), DecodeErrorCategory::ResourceLimit);
+    }
+}
+
+#[test]
+fn large_window_brotli_is_rejected_before_its_ring_buffer_is_requested() {
+    let stream = [&[0x11_u8, 0x1E, 0x1E, 0x00, 0x02][..], &[7; 16], &[0]].concat();
+    let file =
+        isobmff::test_support::minimal_uncompressed_rgb3_heif_generic_compression(b"brot", &stream);
+
+    let (result, largest_request) = tracked(|| decode_primary_uncompressed_to_image(&file));
+
+    assert!(largest_request < 1024 * 1024);
+    let error = result
+        .map(|_| ())
+        .expect_err("large-window stream must be rejected");
+    assert_eq!(error.category(), DecodeErrorCategory::UnsupportedFeature);
+}
+
+#[test]
+fn generic_compression_reserve_failure_is_a_resource_error() {
+    let properties = crate::tests::zlib_full_item_properties();
+    let compressed = crate::tests::zlib_compress(&[0_u8; 8]);
+
+    let result = with_allocations_failing_at(1024 * 1024, || {
+        maybe_decode_primary_uncompressed_generic_compression_payload(
+            1,
+            &properties,
+            &compressed,
+            || Ok(GENERIC_COMPRESSION_LIMITS),
+        )
+    });
+
+    assert!(matches!(
+        result,
+        Err(DecodeUncompressedError::ResourceLimit { .. })
+    ));
+}
+
+#[test]
+fn generic_compression_growth_failure_is_a_resource_error() {
+    let properties = crate::tests::zlib_full_item_properties();
+    let compressed = crate::tests::zlib_compress(&vec![0_u8; 4 * 1024 * 1024]);
+
+    let result = with_allocations_failing_at(2 * 1024 * 1024, || {
+        maybe_decode_primary_uncompressed_generic_compression_payload(
+            1,
+            &properties,
+            &compressed,
+            || Ok(GENERIC_COMPRESSION_LIMITS),
+        )
+    });
+
+    assert!(matches!(
+        result,
+        Err(DecodeUncompressedError::ResourceLimit { .. })
+    ));
+}
+
 #[test]
 fn heic_alpha_checks_decoded_bytes_before_allocating_planes() {
     let config = hevc_configuration(small_hevc_sps());
