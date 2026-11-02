@@ -147,8 +147,11 @@ Notes:
 - HEVC preflight estimates decoded planes and normalized bitstream storage.
   The byte allowance is 12 bytes per allowed pixel plus 64 MiB, with the
   primary area limiting auxiliary frames and the composed output area limiting
-  grids. Every grid tile, including the first, and the sum of all tile estimates
-  must fit this allowance. This estimate is not a process RSS limit.
+  grids. A grid dimension covered by a single tile row or column counts as at
+  least 512 pixels when tiles are stacked along the other dimension, matching
+  the fixed tile span encoders use for narrow images. Every grid tile,
+  including the first, and the sum of all tile estimates must fit this
+  allowance. This estimate is not a process RSS limit.
 
 ## Error Handling Contract
 

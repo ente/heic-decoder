@@ -1428,6 +1428,48 @@ fn heic_grid_single_tile_keeps_the_padded_extent_bound() {
     assert!(geometry::preflight_grid(&grid, &DecodeGuardrails::default()).is_err());
 }
 
+#[test]
+fn heic_grid_budget_counts_the_fixed_tile_span_of_narrow_grids() {
+    let sps = sps_with_tile_dimensions(512, 512);
+    for (columns, rows, output) in [
+        (1u16, 59u16, (40u32, 30000u32)),
+        (59, 1, (30000, 40)),
+        (1, 79, (100, 40000)),
+    ] {
+        let grid = tiled_grid(columns, rows, output, sps.clone());
+        assert!(
+            geometry::preflight_grid(&grid, &DecodeGuardrails::default()).is_ok(),
+            "{}x{} grid with output {}x{}",
+            columns,
+            rows,
+            output.0,
+            output.1
+        );
+    }
+}
+
+#[test]
+fn heic_grid_narrow_budget_stays_capped_by_max_pixels() {
+    let sps = sps_with_tile_dimensions(512, 512);
+    let grid = tiled_grid(1, 59, (40, 30000), sps);
+    let result = geometry::preflight_grid(
+        &grid,
+        &DecodeGuardrails {
+            max_pixels: Some(40 * 30000),
+            ..DecodeGuardrails::default()
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(DecodeError::Guardrail(
+            DecodeGuardrailError::DecodedByteCountExceeded {
+                stage: "HEIC grid",
+                ..
+            }
+        ))
+    ));
+}
+
 fn assert_alpha_ramp(input: &[u8], width: u32, height: u32, x_step: u32) {
     let decoded = decode_bytes_to_rgba(input).unwrap();
     assert_eq!((decoded.width, decoded.height), (width, height));
