@@ -976,6 +976,43 @@ fn rgb8_coded_route_rejects_visible_oversized_sps_before_allocation() {
     assert_eq!((decoded.width, decoded.height), (16, 16));
 }
 
+#[test]
+fn rgb8_path_route_rejects_visible_oversized_sps_before_allocation() {
+    let oversized = image_fixture(
+        b"hvc1",
+        (16, 16),
+        hevc_configuration(hidden_geometry_sps()),
+        hevc_payload(),
+        None,
+    );
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("heic-rgb8-{}-{nonce}.heic", std::process::id()));
+    std::fs::write(&path, oversized).unwrap();
+    let (result, largest) = tracked(|| {
+        decode_path_to_rgb8_with_guardrails(
+            &path,
+            DecodeGuardrails {
+                max_pixels: Some(1024),
+                ..DecodeGuardrails::default()
+            },
+        )
+    });
+    std::fs::remove_file(&path).unwrap();
+    assert!(matches!(
+        result,
+        Err(DecodeError::Guardrail(
+            DecodeGuardrailError::PixelCountExceeded { .. }
+        ))
+    ));
+    assert!(
+        largest < 1024 * 1024,
+        "oversized coded frame allocated {largest} bytes before the pixel limit"
+    );
+}
+
 fn sps_with_tile_dimensions(width: u32, height: u32) -> Vec<u8> {
     let base = small_hevc_sps();
     let sps = crate::heic_decoder::hevc::bitstream::parse_single_nal(&base).unwrap();
