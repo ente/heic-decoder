@@ -1427,3 +1427,30 @@ fn heic_grid_single_tile_keeps_the_padded_extent_bound() {
     let grid = tiled_grid(1, 1, (300, 8000), sps);
     assert!(geometry::preflight_grid(&grid, &DecodeGuardrails::default()).is_err());
 }
+
+fn assert_alpha_ramp(input: &[u8], width: u32, height: u32, x_step: u32) {
+    let decoded = decode_bytes_to_rgba(input).unwrap();
+    assert_eq!((decoded.width, decoded.height), (width, height));
+    let DecodedRgbaPixels::U8(pixels) = decoded.pixels else {
+        panic!("expected 8-bit RGBA output");
+    };
+    for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+        let (x, y) = (index as u32 % width, index as u32 / width);
+        let expected = x_step * x + y;
+        assert!(
+            u32::from(pixel[3]).abs_diff(expected) <= 2,
+            "alpha at ({x}, {y}) is {}, expected {expected}",
+            pixel[3]
+        );
+    }
+}
+
+#[test]
+fn apple_monochrome_alpha_plane_decodes() {
+    assert_alpha_ramp(
+        include_bytes!("testdata/apple-alpha-192x64.heic"),
+        192,
+        64,
+        1,
+    );
+}
