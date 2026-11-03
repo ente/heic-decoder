@@ -1,20 +1,10 @@
-//! CTU (Coding Tree Unit) and CU (Coding Unit) decoding
-//!
-//! This module handles the hierarchical quad-tree structure of HEVC:
-//! - CTU: Coding Tree Unit (largest block, typically 64x64)
-//! - CU: Coding Unit (result of quad-tree split, 8x8 to 64x64)
-//! - PU: Prediction Unit (for motion/intra prediction)
-//! - TU: Transform Unit (for residual coding)
-
 use alloc::vec;
 use alloc::vec::Vec;
 #[cfg(feature = "decoder-tracing")]
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// Verbose decoder tracing is available only in explicitly opted-in builds.
 const DEBUG_TRACE: bool = cfg!(feature = "decoder-tracing");
 
-/// Debug print macro gated behind DEBUG_TRACE const
 macro_rules! debug_trace {
     ($($arg:tt)*) => {{
         #[cfg(feature = "std")]
@@ -45,14 +35,11 @@ use archmage::incant;
 
 type Result<T> = core::result::Result<T, HevcError>;
 
-/// Global SE counter for syntax element tracing
 #[cfg(feature = "decoder-tracing")]
 pub static SE_COUNTER: AtomicU32 = AtomicU32::new(0);
 #[cfg(feature = "decoder-tracing")]
 pub const SE_TRACE_LIMIT: u32 = 0;
 
-/// Log a syntax element decode for differential testing.
-/// Increase `SE_TRACE_LIMIT` to include syntax-element details in tracing.
 #[cfg(feature = "decoder-tracing")]
 #[allow(clippy::absurd_extreme_comparisons)]
 fn se_trace(name: &str, val: i64, cabac: &CabacDecoder) {
@@ -75,12 +62,7 @@ fn se_trace(name: &str, val: i64, cabac: &CabacDecoder) {
 #[inline(always)]
 fn se_trace(_name: &str, _val: i64, _cabac: &CabacDecoder) {}
 
-/// Chroma QP mapping table (H.265 Table 8-10)
-/// Maps qPi (0-57) to QpC for 8-bit video
 fn chroma_qp_mapping(qp_i: i32) -> i32 {
-    // Table 8-10: qPi to QpC mapping
-    // For qPi 0-29, QpC = qPi
-    // For qPi 30-57, QpC follows the table
     static CHROMA_QP_TABLE: [i32; 58] = [
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
         25, 26, 27, 28, 29, 29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37, 38, 39, 40, 41,
@@ -89,81 +71,49 @@ fn chroma_qp_mapping(qp_i: i32) -> i32 {
     CHROMA_QP_TABLE[qp_i.clamp(0, 57) as usize]
 }
 
-/// Decoding context for a slice
 pub struct SliceContext<'a> {
-    /// Sequence parameter set
     pub sps: &'a Sps,
-    /// Picture parameter set
     pub pps: &'a Pps,
-    /// Slice header
     pub header: &'a SliceHeader,
-    /// CABAC decoder
     pub cabac: CabacDecoder<'a>,
-    /// Context models
     pub ctx: [ContextModel; context::NUM_CONTEXTS],
-    /// Current CTB X position (in CTB units)
     pub ctb_x: u32,
-    /// Current CTB Y position (in CTB units)
     pub ctb_y: u32,
-    /// Current luma QP value
     pub qp_y: i32,
-    /// Current Cb QP value
     pub qp_cb: i32,
-    /// Current Cr QP value
     pub qp_cr: i32,
-    /// Is CU QP delta coded flag
     pub is_cu_qp_delta_coded: bool,
-    /// CU QP delta value
     pub cu_qp_delta: i32,
-    /// CU transquant bypass flag
     pub cu_transquant_bypass_flag: bool,
-    /// Debug flag for current CTU
     debug_ctu: bool,
-    /// Debug: track chroma prediction calls
     #[allow(dead_code)]
     chroma_pred_count: u32,
-    /// CT depth map for split_cu_flag context derivation (indexed by min_cb_size grid)
     ct_depth_map: Vec<u8>,
-    /// Width of ct_depth_map in min_cb_size units
     ct_depth_map_stride: u32,
-    /// Intra luma mode map (indexed by min_pu_size grid, stores IntraPredMode as u8)
-    /// min_pu_size = min_cb_size / 2, to support NxN PU resolution
     intra_mode_map: Vec<u8>,
-    /// Width of intra_mode_map in min_pu_size units
     intra_mode_map_stride: u32,
-    /// Intra chroma mode map (indexed by min_pu_size grid, stores IntraPredMode as u8)
     intra_chroma_mode_map: Vec<u8>,
-    /// Current CU base position (set at decode_coding_unit start)
     cu_base_x: u32,
     cu_base_y: u32,
-    /// Current CU log2 size (set at decode_coding_unit start)
     cu_log2_size: u8,
-    /// QP map: stores per-CU QPY values (indexed by min_tb_size grid)
     qp_map: Vec<i8>,
-    /// Width of QP map in min_tb_size units
     qp_map_stride: u32,
-    /// Current QPY for the current quantization group
     current_qpy: i32,
-    /// Last QPY from previous quantization group (for prediction)
     last_qpy_in_prev_qg: i32,
-    /// Current quantization group position
     current_qg_x: i32,
     current_qg_y: i32,
-    /// SAO parameters per CTB
     pub sao_map: SaoMap,
-    /// Reusable residual buffer (inverse transform writes all elements, no re-zeroing needed)
+    /// The inverse transform writes every element, so no re-zeroing is needed.
     residual_buf: [i16; 1024],
     /// Reusable sparse coefficient workspace. Only indices recorded in
     /// `touched_coeffs` may be non-zero between residual decodes.
     coeff_buf: [i16; 1024],
     touched_coeffs: [u16; 1024],
-    /// Reusable scaling matrix buffer
     scaling_buf: [u8; 1024],
     map_origin: u32,
 }
 
 impl<'a> SliceContext<'a> {
-    /// Create a new slice context
     pub fn new(
         sps: &'a Sps,
         pps: &'a Pps,
@@ -229,7 +179,6 @@ impl<'a> SliceContext<'a> {
             offset
         );
 
-        // Initialize context models
         let mut ctx = [ContextModel::new(154); context::NUM_CONTEXTS];
         let slice_qp = header.slice_qp_y;
 
@@ -237,14 +186,9 @@ impl<'a> SliceContext<'a> {
             ctx[i].init(*init_val, slice_qp);
         }
 
-        // Calculate chroma QP values (H.265 Table 8-10 and section 8.6.1)
-        // qPi_Cb = qP_Y + pps_cb_qp_offset + slice_cb_qp_offset
-        // qPi_Cr = qP_Y + pps_cr_qp_offset + slice_cr_qp_offset
         let qp_i_cb = slice_qp + pps.pps_cb_qp_offset as i32 + header.slice_cb_qp_offset as i32;
         let qp_i_cr = slice_qp + pps.pps_cr_qp_offset as i32 + header.slice_cr_qp_offset as i32;
 
-        // Apply chroma QP mapping table (H.265 Table 8-10, 4:2:0 only; for
-        // 4:2:2/4:4:4 the spec uses QpC = Min(qPi, 51))
         let (qp_cb, qp_cr) = if sps.chroma_format_idc == 1 {
             (
                 chroma_qp_mapping(qp_i_cb.clamp(0, 57)),
@@ -269,16 +213,12 @@ impl<'a> SliceContext<'a> {
             pps.tiles_enabled_flag,
             pps.entropy_coding_sync_enabled_flag
         );
-        // Initialize ct_depth_map for split_cu_flag context derivation
-        // Map is in units of min_cb_size (typically 8x8)
         let min_cb_size = 1u32 << sps.log2_min_cb_size();
         let ct_depth_map_stride = sps.pic_width_in_luma_samples.div_ceil(min_cb_size);
         let ct_depth_map_height = height.div_ceil(min_cb_size);
         let ct_map_size = (ct_depth_map_stride * ct_depth_map_height) as usize;
         let ct_depth_map = super::allocation::filled(0xFF, ct_map_size)?;
 
-        // Intra mode map at min_pu_size granularity (= min_cb_size / 2)
-        // This supports NxN partition PU-level resolution
         let min_pu_size = (min_cb_size / 2).max(1);
         let intra_mode_map_stride = sps.pic_width_in_luma_samples.div_ceil(min_pu_size);
         let intra_mode_map_height = height.div_ceil(min_pu_size);
@@ -287,7 +227,6 @@ impl<'a> SliceContext<'a> {
         let intra_chroma_mode_map =
             super::allocation::filled(IntraPredMode::Dc.as_u8(), pu_map_size)?;
 
-        // QP map at min_tb_size granularity
         let min_tb_size = 1u32 << sps.log2_min_tb_size();
         let qp_map_stride = sps.pic_width_in_luma_samples.div_ceil(min_tb_size);
         let qp_map_height = height.div_ceil(min_tb_size);
@@ -340,7 +279,6 @@ impl<'a> SliceContext<'a> {
         })
     }
 
-    /// Decode all CTUs in the slice
     pub fn decode_slice(&mut self, frame: &mut DecodedFrame) -> Result<()> {
         #[cfg(feature = "decoder-tracing")]
         debug::init_tracker();
@@ -350,7 +288,6 @@ impl<'a> SliceContext<'a> {
         let pic_height_in_ctbs = self.sps.pic_height_in_ctbs();
         let wpp = self.pps.entropy_coding_sync_enabled_flag;
 
-        // Start from slice segment address
         let start_addr = self.header.slice_segment_address;
         let start_ctb_y = start_addr / pic_width_in_ctbs;
         self.ctb_y = start_ctb_y;
@@ -359,11 +296,9 @@ impl<'a> SliceContext<'a> {
         let mut ctu_count = 0u32;
         let total_ctus = pic_width_in_ctbs * pic_height_in_ctbs;
 
-        // WPP: saved context models from CTB column 1 of previous row
         let mut wpp_saved_ctx: Option<[super::cabac::ContextModel; context::NUM_CONTEXTS]> = None;
 
         loop {
-            // WPP: at start of each new row (ctb_x==0, ctb_y>0), restore saved context
             if wpp
                 && self.ctb_x == 0
                 && self.ctb_y > 0
@@ -373,7 +308,6 @@ impl<'a> SliceContext<'a> {
                 self.ctx = saved;
             }
 
-            // Decode one CTU
             let x_ctb = self.ctb_x * ctb_size;
             let y_ctb = self.ctb_y * ctb_size;
 
@@ -395,18 +329,15 @@ impl<'a> SliceContext<'a> {
                     );
                 }
             }
-            // Enable debug for CTU 1 (where first large coefficient occurs)
             self.debug_ctu = ctu_count == 1;
 
             self.decode_ctu(x_ctb, y_ctb, frame)?;
             ctu_count += 1;
 
-            // WPP: save context models after CTB column 1
             if wpp && self.ctb_x == 1 && self.ctb_y < pic_height_in_ctbs - 1 {
                 wpp_saved_ctx = Some(self.ctx);
             }
 
-            // Check for end of slice segment
             let end_of_slice = self.cabac.decode_terminate();
             se_trace("end_of_slice", end_of_slice as i64, &self.cabac);
             if end_of_slice != 0 {
@@ -419,17 +350,14 @@ impl<'a> SliceContext<'a> {
                 break;
             }
 
-            // Track previous row for WPP boundary detection
             let prev_ctb_y = self.ctb_y;
 
-            // Move to next CTB
             self.ctb_x += 1;
             if self.ctb_x >= pic_width_in_ctbs {
                 self.ctb_x = 0;
                 self.ctb_y += 1;
             }
 
-            // WPP: at row boundaries, decode end_of_sub_stream and reinit CABAC
             if wpp && self.ctb_y != prev_ctb_y {
                 let _eoss = self.cabac.decode_terminate();
                 let entry_point_index = self.ctb_y.saturating_sub(start_ctb_y + 1) as usize;
@@ -446,7 +374,6 @@ impl<'a> SliceContext<'a> {
                 }
             }
 
-            // Check for end of picture
             if self.ctb_y >= pic_height_in_ctbs {
                 break;
             }
@@ -509,27 +436,21 @@ impl<'a> SliceContext<'a> {
         Ok(())
     }
 
-    /// Decode a single CTU (Coding Tree Unit)
     fn decode_ctu(&mut self, x_ctb: u32, y_ctb: u32, frame: &mut DecodedFrame) -> Result<()> {
         let log2_ctb_size = self.sps.log2_ctb_size();
 
-        // Reset per-CTU state
         if self.pps.cu_qp_delta_enabled_flag {
             self.is_cu_qp_delta_coded = false;
             self.cu_qp_delta = 0;
         }
 
-        // Decode SAO syntax elements (must consume from CABAC stream even if not applied)
         if self.header.slice_sao_luma_flag || self.header.slice_sao_chroma_flag {
             self.decode_sao(x_ctb, y_ctb)?;
         }
 
-        // Decode the coding quadtree
         self.decode_coding_quadtree(x_ctb, y_ctb, log2_ctb_size, 0, frame)
     }
 
-    /// Decode SAO (Sample Adaptive Offset) syntax elements from CABAC stream
-    /// and store them in the SAO map for later filtering.
     fn decode_sao(&mut self, x_ctb_pixels: u32, y_ctb_pixels: u32) -> Result<()> {
         let ctb_size = self.sps.ctb_size();
         let x_ctb = x_ctb_pixels / ctb_size;
@@ -538,7 +459,6 @@ impl<'a> SliceContext<'a> {
         let mut sao_merge_left_flag = false;
         let mut sao_merge_up_flag = false;
 
-        // sao_merge_left_flag
         if x_ctb > 0 {
             let pic_width_ctbs = self.sps.pic_width_in_ctbs();
             let ctb_addr_rs = y_ctb * pic_width_ctbs + x_ctb;
@@ -551,7 +471,6 @@ impl<'a> SliceContext<'a> {
             }
         }
 
-        // sao_merge_up_flag
         if y_ctb > 0 && !sao_merge_left_flag {
             let pic_width_ctbs = self.sps.pic_width_in_ctbs();
             let ctb_addr_rs = y_ctb * pic_width_ctbs + x_ctb;
@@ -611,8 +530,6 @@ impl<'a> SliceContext<'a> {
                         self.sps.bit_depth_c() as u32
                     };
                     let c_max = (1u32 << (bit_depth.min(10) - 5)) - 1;
-                    // H.265 7.4.9.3: SaoOffsetVal is scaled by the PPS range
-                    // extension's log2_sao_offset_scale (default 0).
                     let log2_offset_scale = if c_idx == 0 {
                         self.pps.log2_sao_offset_scale_luma
                     } else {
@@ -627,7 +544,6 @@ impl<'a> SliceContext<'a> {
                     }
 
                     if sao_type_idx == 1 {
-                        // Band offset: decode signs + band position
                         let mut signed_offsets = [0i8; 4];
                         for i in 0..4 {
                             if offsets_abs[i] != 0 {
@@ -643,7 +559,6 @@ impl<'a> SliceContext<'a> {
                         se_trace("sao_band_position", band_pos as i64, &self.cabac);
                         info.sao_band_position[c_idx] = band_pos as u8;
                     } else {
-                        // Edge offset: store absolute values (sign applied during filtering)
                         for (i, &offset) in offsets_abs.iter().enumerate() {
                             info.sao_offset_val[c_idx][i] = (offset as i32 * offset_scale) as i8;
                         }
@@ -670,7 +585,6 @@ impl<'a> SliceContext<'a> {
         Ok(())
     }
 
-    /// Decode sao_type_idx: context bin + optional bypass bin
     fn decode_sao_type_idx(&mut self) -> Result<u8> {
         let ctx_idx = context::SAO_TYPE_IDX;
         let bit0 = self.cabac.decode_bin(&mut self.ctx[ctx_idx]);
@@ -682,7 +596,6 @@ impl<'a> SliceContext<'a> {
         }
     }
 
-    /// Decode truncated unary with bypass bins (for sao_offset_abs)
     fn decode_cabac_tu_bypass(&mut self, c_max: u32) -> Result<u32> {
         for i in 0..c_max {
             let bit = self.cabac.decode_bypass();
@@ -693,7 +606,6 @@ impl<'a> SliceContext<'a> {
         Ok(c_max)
     }
 
-    /// Decode coding quadtree recursively
     fn decode_coding_quadtree(
         &mut self,
         x0: u32,
@@ -707,12 +619,10 @@ impl<'a> SliceContext<'a> {
         let pic_height = self.sps.pic_height_in_luma_samples;
         let log2_min_cb_size = self.sps.log2_min_cb_size();
 
-        // Determine if we need to split
         let split_flag = if x0 + cb_size <= pic_width
             && y0 + cb_size <= pic_height
             && log2_cb_size > log2_min_cb_size
         {
-            // Decode split_cu_flag
             let flag = self.decode_split_cu_flag(x0, y0, ct_depth)?;
             if self.debug_ctu {
                 let (r, o) = self.cabac.get_state();
@@ -729,7 +639,6 @@ impl<'a> SliceContext<'a> {
             }
             flag
         } else if log2_cb_size > log2_min_cb_size {
-            // Must split if partially outside picture
             if self.debug_ctu {
                 debug_trace!(
                     "  CTU37: forced split at ({},{}) depth={} - outside picture",
@@ -740,7 +649,6 @@ impl<'a> SliceContext<'a> {
             }
             true
         } else {
-            // At minimum size, don't split
             if self.debug_ctu {
                 debug_trace!(
                     "  CTU37: no split at ({},{}) depth={} - min size",
@@ -752,8 +660,6 @@ impl<'a> SliceContext<'a> {
             false
         };
 
-        // Handle QP delta depth: reset at quantization group boundaries
-        // Log2MinCuQpDeltaSize = Log2CtbSizeY - diff_cu_qp_delta_depth
         if self.pps.cu_qp_delta_enabled_flag
             && log2_cb_size >= self.sps.log2_ctb_size() - self.pps.diff_cu_qp_delta_depth
         {
@@ -766,7 +672,6 @@ impl<'a> SliceContext<'a> {
             let x1 = x0 + half;
             let y1 = y0 + half;
 
-            // Decode four sub-CUs
             self.decode_coding_quadtree(x0, y0, log2_cb_size - 1, ct_depth + 1, frame)?;
 
             if x1 < pic_width {
@@ -781,14 +686,12 @@ impl<'a> SliceContext<'a> {
                 self.decode_coding_quadtree(x1, y1, log2_cb_size - 1, ct_depth + 1, frame)?;
             }
         } else {
-            // Decode the coding unit
             self.decode_coding_unit(x0, y0, log2_cb_size, ct_depth, frame)?;
         }
 
         Ok(())
     }
 
-    /// Get ctDepth at a pixel position (returns 0xFF if not yet decoded)
     fn get_ct_depth(&self, x: u32, y: u32) -> u8 {
         let min_cb_size = 1u32 << self.sps.log2_min_cb_size();
         let map_x = x / min_cb_size;
@@ -800,18 +703,16 @@ impl<'a> SliceContext<'a> {
         if map_x >= self.ct_depth_map_stride
             || map_y * self.ct_depth_map_stride + map_x >= self.ct_depth_map.len() as u32
         {
-            return 0xFF; // Out of bounds
+            return 0xFF;
         }
 
         self.ct_depth_map[(map_y * self.ct_depth_map_stride + map_x) as usize]
     }
 
-    /// Set ctDepth for a CU region
     fn set_ct_depth(&mut self, x0: u32, y0: u32, log2_cb_size: u8, ct_depth: u8) {
         let min_cb_size = 1u32 << self.sps.log2_min_cb_size();
         let cb_size = 1u32 << log2_cb_size;
 
-        // Fill the ct_depth_map for this CU region
         let start_x = x0 / min_cb_size;
         let start_y = (y0 - self.map_origin) / min_cb_size;
         let num_blocks = cb_size / min_cb_size;
@@ -830,7 +731,6 @@ impl<'a> SliceContext<'a> {
         }
     }
 
-    /// Check if a neighbor position is available (within picture bounds)
     fn is_neighbor_available(&self, x: i32, y: i32) -> bool {
         x >= 0
             && y >= 0
@@ -838,13 +738,7 @@ impl<'a> SliceContext<'a> {
             && (y as u32) < self.sps.pic_height_in_luma_samples
     }
 
-    /// Decode split_cu_flag using CABAC
     fn decode_split_cu_flag(&mut self, x0: u32, y0: u32, ct_depth: u8) -> Result<bool> {
-        // Context selection based on neighboring CU depths (H.265 9.3.4.2.2)
-        // condTermL: 1 if left neighbor has larger depth (was split more)
-        // condTermA: 1 if above neighbor has larger depth
-        // ctxInc = condTermL + condTermA
-
         let available_l = self.is_neighbor_available(x0 as i32 - 1, y0 as i32);
         let available_a = self.is_neighbor_available(x0 as i32, y0 as i32 - 1);
 
@@ -872,7 +766,6 @@ impl<'a> SliceContext<'a> {
         Ok(bin != 0)
     }
 
-    /// Decode a coding unit
     fn decode_coding_unit(
         &mut self,
         x0: u32,
@@ -882,24 +775,19 @@ impl<'a> SliceContext<'a> {
         frame: &mut DecodedFrame,
     ) -> Result<()> {
         let cb_size = 1u32 << log2_cb_size;
-        let _ = cb_size; // Used in PartNxN
+        let _ = cb_size;
 
-        // Track CU base position for transform unit QP derivation
         self.cu_base_x = x0;
         self.cu_base_y = y0;
         self.cu_log2_size = log2_cb_size;
 
-        // Decode quantization parameters at CU start (H.265 8.6.1)
         self.decode_quantization_parameters(x0, y0, x0, y0);
         self.store_qpy(x0, y0, log2_cb_size, self.current_qpy);
 
-        // Set ct_depth for this CU (used by split_cu_flag context derivation)
         self.set_ct_depth(x0, y0, log2_cb_size, ct_depth);
 
-        // For I-slices, prediction mode is always INTRA
         let pred_mode = PredMode::Intra;
 
-        // Decode transquant_bypass_flag if enabled
         self.cu_transquant_bypass_flag = if self.pps.transquant_bypass_enabled_flag {
             let ctx_idx = context::CU_TRANSQUANT_BYPASS_FLAG;
             self.cabac.decode_bin(&mut self.ctx[ctx_idx]) != 0
@@ -907,11 +795,8 @@ impl<'a> SliceContext<'a> {
             false
         };
 
-        // Decode partition mode
         let part_mode = if log2_cb_size == self.sps.log2_min_cb_size() {
-            // At minimum size, can be 2Nx2N or NxN
             let pm = self.decode_part_mode(pred_mode, log2_cb_size)?;
-            // Debug: log part_mode for first CTU (and count NxN)
             #[cfg(feature = "decoder-tracing")]
             if pm == PartMode::PartNxN {
                 static NXN_COUNT: core::sync::atomic::AtomicU32 =
@@ -944,7 +829,6 @@ impl<'a> SliceContext<'a> {
             }
             pm
         } else {
-            // Larger sizes are always 2Nx2N for intra
             if self.debug_ctu {
                 debug_trace!(
                     "  CTU37: CU at ({},{}) log2={} part_mode=2Nx2N (implicit)",
@@ -956,10 +840,8 @@ impl<'a> SliceContext<'a> {
             PartMode::Part2Nx2N
         };
 
-        // Decode prediction info and get intra modes for scan order
         let (intra_luma_mode, intra_chroma_mode) = match part_mode {
             PartMode::Part2Nx2N => {
-                // Single PU covering entire CU
                 let modes = self.decode_intra_prediction(x0, y0, log2_cb_size, true, frame)?;
                 if self.debug_ctu {
                     let (r, o) = self.cabac.get_state();
@@ -974,12 +856,10 @@ impl<'a> SliceContext<'a> {
                 modes
             }
             PartMode::PartNxN => {
-                // Four PUs (only at minimum CU size for intra)
-                // For 4:2:0, all four 4x4 luma PUs share one 4x4 chroma block
                 let half = cb_size / 2;
                 let log2_pu_size = log2_cb_size - 1;
 
-                // Per H.265 spec 7.3.8.5 and libde265 slice.cc:4385-4458:
+                // Per H.265 spec 7.3.8.5:
                 // FIRST pass: decode ALL prev_intra_luma_pred_flag (context-coded bins)
                 let prev_flags = [
                     self.decode_prev_intra_luma_pred_flag()?,
@@ -1003,9 +883,6 @@ impl<'a> SliceContext<'a> {
                     self.derive_intra_luma_mode(x0 + half, y0 + half, prev_flags[3])?;
                 self.store_intra_mode(x0 + half, y0 + half, log2_pu_size, luma_mode_3);
 
-                // Decode chroma mode(s). For 4:4:4 (ChromaArrayType 3) one
-                // chroma mode is coded per PU (H.265 7.3.8.5); otherwise a
-                // single mode covers the CU.
                 let chroma_mode =
                     if self.sps.chroma_format_idc == 3 && !self.sps.separate_colour_plane_flag {
                         let c0 = self.decode_intra_chroma_mode(luma_mode_0)?;
@@ -1019,27 +896,17 @@ impl<'a> SliceContext<'a> {
                         c0
                     } else {
                         let chroma_mode = self.decode_intra_chroma_mode(luma_mode_0)?;
-                        // Store chroma mode for the whole CU region
                         self.store_intra_chroma_mode(x0, y0, log2_cb_size, chroma_mode);
                         chroma_mode
                     };
 
-                // NOTE: Prediction is NOT done here. It happens in decode_transform_unit_leaf
-                // and the 8x8→4x4 chroma split handler, so each TU is predicted →
-                // reconstructed before the next TU reads its neighbors.
-
                 (luma_mode_0, chroma_mode)
             }
             _ => {
-                // Other partition modes not used for intra
                 return Err(HevcError::InvalidBitstream("invalid intra partition mode"));
             }
         };
 
-        // Decode the transform tree. Per H.265 7.3.8.5 it is parsed for intra
-        // CUs regardless of cu_transquant_bypass_flag; the bypass flag only
-        // disables scaling/transform (handled in decode_and_apply_residual)
-        // and in-loop filtering (handled via the frame's bypass map).
         if self.cu_transquant_bypass_flag {
             frame.store_block_bypass(x0, y0, cb_size);
         }
@@ -1048,7 +915,7 @@ impl<'a> SliceContext<'a> {
             x0,
             y0,
             log2_cb_size,
-            0, // trafo_depth
+            0,
             intra_luma_mode,
             intra_chroma_mode,
             intra_split_flag,
@@ -1070,7 +937,6 @@ impl<'a> SliceContext<'a> {
         Ok(())
     }
 
-    /// Decode transform tree recursively
     #[allow(clippy::too_many_arguments)]
     fn decode_transform_tree(
         &mut self,
@@ -1083,7 +949,6 @@ impl<'a> SliceContext<'a> {
         intra_split_flag: bool,
         frame: &mut DecodedFrame,
     ) -> Result<()> {
-        // For 4:2:0, start with root having chroma responsibility
         self.decode_transform_tree_inner(
             x0,
             y0,
@@ -1098,9 +963,6 @@ impl<'a> SliceContext<'a> {
         )
     }
 
-    /// Inner transform tree decoding
-    /// cbf_cb_parent/cbf_cr_parent: parent chroma CBF bitmask (bit 0 for
-    /// 4:2:0/4:4:4, bits 0+1 for top/bottom 4:2:2 chroma blocks).
     #[allow(clippy::too_many_arguments)]
     fn decode_transform_tree_inner(
         &mut self,
@@ -1115,35 +977,24 @@ impl<'a> SliceContext<'a> {
         cbf_cr_parent: u8,
         frame: &mut DecodedFrame,
     ) -> Result<()> {
-        // Per H.265: MaxTrafoDepth = max_transform_hierarchy_depth_intra + IntraSplitFlag
         let max_trafo_depth =
             self.sps.max_transform_hierarchy_depth_intra + if intra_split_flag { 1 } else { 0 };
         let log2_min_trafo_size = self.sps.log2_min_tb_size();
         let log2_max_trafo_size = self.sps.log2_max_tb_size();
 
-        // Per HEVC spec 7.3.8.7, the order is:
-        // 1. split_transform_flag (if applicable)
-        // 2. cbf_cb (if applicable)
-        // 3. cbf_cr (if applicable)
-
-        // Debug for specific position
         let debug_tt = self.debug_ctu;
 
-        // Step 1: Determine if we should split
-        // Per H.265: decode split_transform_flag only when all conditions met AND
-        // NOT (IntraSplitFlag && trafoDepth == 0)
         let split_transform = if log2_size <= log2_max_trafo_size
             && log2_size > log2_min_trafo_size
             && trafo_depth < max_trafo_depth
             && !(intra_split_flag && trafo_depth == 0)
         {
-            // Decode split_transform_flag
             let ctx_idx = context::SPLIT_TRANSFORM_FLAG + (5 - log2_size as usize).min(2);
             let flag = self.cabac.decode_bin(&mut self.ctx[ctx_idx]) != 0;
             se_trace("split_transform", flag as i64, &self.cabac);
             flag
         } else if log2_size > log2_max_trafo_size || (intra_split_flag && trafo_depth == 0) {
-            true // Must split: larger than max OR IntraSplitFlag at depth 0
+            true
         } else {
             if debug_tt {
                 debug_trace!(
@@ -1158,9 +1009,6 @@ impl<'a> SliceContext<'a> {
             false
         };
 
-        // Step 2: Decode cbf_cb and cbf_cr.
-        // 4:2:2 carries two chroma CBF bits when this node maps to two
-        // vertical chroma transform blocks.
         let chroma_format = frame.chroma_format;
         let has_chroma = chroma_format != 0;
         let decode_chroma_cbf = (log2_size > 2 && has_chroma) || chroma_format == 3;
@@ -1195,8 +1043,6 @@ impl<'a> SliceContext<'a> {
             };
             (cb, cr)
         } else if trafo_depth > 0 && log2_size == 2 {
-            // 4:2:0/4:2:2 chroma at 4x4 luma children is decoded by the
-            // parent 8x8 transform node after all luma children are decoded.
             (cbf_cb_parent, cbf_cr_parent)
         } else {
             (0, 0)
@@ -1256,8 +1102,6 @@ impl<'a> SliceContext<'a> {
                 frame,
             )?;
 
-            // When an 8x8 luma transform splits to 4x4 children, subsampled
-            // chroma is decoded once here after the four luma children.
             if log2_size == 3 && matches!(frame.chroma_format, 1 | 2) {
                 self.decode_split_subsampled_chroma(
                     x0,
@@ -1269,7 +1113,6 @@ impl<'a> SliceContext<'a> {
                 )?;
             }
         } else {
-            // Decode transform unit (leaf node)
             self.decode_transform_unit_leaf(
                 x0,
                 y0,
@@ -1286,12 +1129,6 @@ impl<'a> SliceContext<'a> {
         Ok(())
     }
 
-    /// Decode transform unit at leaf node
-    ///
-    /// Per libde265's decode_TU(): prediction and reconstruction happen PER TU,
-    /// so each TU is fully predicted + reconstructed before the next TU starts.
-    /// This ensures subsequent TUs read reconstructed neighbor samples (not just
-    /// prediction values) for their own intra prediction.
     #[allow(clippy::too_many_arguments)]
     fn decode_transform_unit_leaf(
         &mut self,
@@ -1307,17 +1144,11 @@ impl<'a> SliceContext<'a> {
     ) -> Result<()> {
         let debug_tt = self.debug_ctu;
 
-        // Decode cbf_luma - per H.265 spec 7.3.8.6:
-        // cbf_luma is coded if: CuPredMode == MODE_INTRA || trafoDepth != 0 || cbf_cb || cbf_cr
-        // For INTRA mode (all HEIC images), cbf_luma is ALWAYS coded
-        // Context: offset 0 if trafo_depth > 0, offset 1 if trafo_depth == 0
         let ctx_offset = if trafo_depth == 0 { 1 } else { 0 };
         let ctx_idx = context::CBF_LUMA + ctx_offset;
         let cbf_luma = self.cabac.decode_bin(&mut self.ctx[ctx_idx]) != 0;
         se_trace("cbf_luma", cbf_luma as i64, &self.cabac);
 
-        // Per H.265 7.3.8.11: decode cu_qp_delta before residuals
-        // Condition: (cbf_luma || cbf_cb || cbf_cr) && cu_qp_delta_enabled_flag && !IsCuQpDeltaCoded
         if (cbf_luma || cbf_cb != 0 || cbf_cr != 0)
             && self.pps.cu_qp_delta_enabled_flag
             && !self.is_cu_qp_delta_coded
@@ -1332,12 +1163,10 @@ impl<'a> SliceContext<'a> {
             self.cu_qp_delta = cu_qp_delta_abs as i32 * (1 - 2 * cu_qp_delta_sign as i32);
             se_trace("cu_qp_delta", self.cu_qp_delta as i64, &self.cabac);
 
-            // Re-derive quantization parameters with the actual delta
             let cu_x = self.cu_base_x;
             let cu_y = self.cu_base_y;
             let cu_log2 = self.cu_log2_size;
             self.decode_quantization_parameters(x0, y0, cu_x, cu_y);
-            // Store QPY in the QP map for neighbor lookups
             self.store_qpy(cu_x, cu_y, cu_log2, self.current_qpy);
             // Mirror libde265 behavior: once cu_qp_delta is decoded, QPY applies
             // to the whole CU. Re-stamp the deblock QP map so TU leaves decoded
@@ -1345,17 +1174,13 @@ impl<'a> SliceContext<'a> {
             frame.store_block_qp(cu_x, cu_y, 1u32 << cu_log2, self.current_qpy as i8);
         }
 
-        // Mark TU boundary and store QP for deblocking
         let tu_size = 1u32 << log2_size;
         frame.mark_tu_boundary(x0, y0, tu_size);
         frame.store_block_qp(x0, y0, tu_size, self.current_qpy as i8);
 
-        // Look up intra mode at actual TU position (correct for NxN where sub-TUs differ)
         let actual_luma_mode = self.get_intra_mode_at(x0, y0);
         let sis = self.sps.strong_intra_smoothing_enabled_flag;
 
-        // Predict luma at TU level BEFORE residual application
-        // This ensures each TU reads reconstructed neighbors from prior TUs
         intra::predict_intra(frame, x0, y0, log2_size, actual_luma_mode, 0, sis);
 
         let scan_order = residual::get_scan_order(
@@ -1365,7 +1190,6 @@ impl<'a> SliceContext<'a> {
             self.sps.chroma_format_idc,
         );
 
-        // Decode and apply luma residuals (adds to prediction already in frame)
         if cbf_luma {
             if debug_tt {
                 let (r, o) = self.cabac.get_state();
@@ -1509,8 +1333,6 @@ impl<'a> SliceContext<'a> {
                 )?;
             }
             3 => {
-                // 4:4:4 codes one chroma mode per PU; look it up at this TB
-                // position instead of using the CU-level mode.
                 let mode = self.get_intra_chroma_mode_at(x0, y0);
                 self.decode_chroma_block(x0, y0, log2_size, 1, cbf_cb & 1 != 0, mode, frame)?;
                 self.decode_chroma_block(x0, y0, log2_size, 2, cbf_cr & 1 != 0, mode, frame)?;
@@ -1545,8 +1367,6 @@ impl<'a> SliceContext<'a> {
         Ok(())
     }
 
-    /// Decode cu_qp_delta_abs per H.265 section 7.3.8.11
-    /// TU prefix (up to 5 context-coded bins) + EGk bypass suffix
     fn decode_cu_qp_delta_abs(&mut self) -> Result<u32> {
         let first_bin = self
             .cabac
@@ -1565,7 +1385,6 @@ impl<'a> SliceContext<'a> {
             prefix += 1;
         }
         if prefix == 5 {
-            // EGk(0) bypass suffix
             let suffix = self.cabac.decode_egk_bypass(0)?;
             Ok(suffix + 5)
         } else {
@@ -1573,7 +1392,6 @@ impl<'a> SliceContext<'a> {
         }
     }
 
-    /// Decode residual coefficients and apply to frame
     fn decode_and_apply_residual(
         &mut self,
         x0: u32,
@@ -1583,7 +1401,6 @@ impl<'a> SliceContext<'a> {
         scan_order: ScanOrder,
         frame: &mut DecodedFrame,
     ) -> Result<()> {
-        // Decode coefficients via CABAC
         let (num_nonzero, transform_skip) = residual::decode_residual(
             &mut self.cabac,
             &mut self.ctx,
@@ -1613,8 +1430,6 @@ impl<'a> SliceContext<'a> {
             _ => (self.qp_y, self.sps.bit_depth_y()),
         };
 
-        // cu_transquant_bypass (H.265 8.6.4.1): the coefficients ARE the
-        // residual — no scaling, no inverse transform.
         if self.cu_transquant_bypass_flag {
             let residual = &mut self.residual_buf;
             residual[..num_coeffs].copy_from_slice(&self.coeff_buf[..num_coeffs]);
@@ -1625,7 +1440,6 @@ impl<'a> SliceContext<'a> {
             return Ok(());
         }
 
-        // Dequantize coefficients in-place
         let coeffs = &mut self.coeff_buf;
 
         let dequant_params = transform::DequantParams {
@@ -1634,8 +1448,6 @@ impl<'a> SliceContext<'a> {
             log2_tr_size: log2_size,
         };
 
-        // Use scaling list if enabled (H.265 8.6.3)
-        // Per spec: use PPS scaling list if present, else SPS scaling list.
         // m[x][y] is flat only when scaling lists are off or when
         // transform_skip is used with nTbS > 4; 4x4 transform-skip blocks
         // still use the scaling factors.
@@ -1650,9 +1462,7 @@ impl<'a> SliceContext<'a> {
             };
 
         if let Some(sl) = scaling_list {
-            // matrixId: intra Y=0, Cb=1, Cr=2 (all HEIC is intra)
             let matrix_id = c_idx;
-            // Build scaling matrix in raster order for this TU (reuse persistent buffer)
             let scaling_matrix = &mut self.scaling_buf;
             for py in 0..size {
                 for px in 0..size {
@@ -1669,14 +1479,8 @@ impl<'a> SliceContext<'a> {
             transform::dequantize(&mut coeffs[..num_coeffs], dequant_params);
         }
 
-        // Apply inverse transform (or skip for transform_skip mode)
-        // Reuse persistent buffer — transform writes all size*size elements, no zeroing needed
         let residual = &mut self.residual_buf;
         if transform_skip {
-            // Per H.265 8.6.4.1 / libde265 transform_skip_residual_fallback():
-            // tsShift = 5 + Log2(nTbS)
-            // bdShift = max(20 - bit_depth, 0)
-            // residual = (coeff << tsShift + rnd) >> bdShift
             let ts_shift = 5 + log2_size as i32;
             let bd_shift = (20 - bit_depth as i32).max(0);
             let rnd = if bd_shift > 0 {
@@ -1704,8 +1508,6 @@ impl<'a> SliceContext<'a> {
         Ok(())
     }
 
-    /// Add `self.residual_buf` to the prediction already in the plane,
-    /// clamping to the component bit depth.
     fn add_residual_to_plane(
         &mut self,
         x0: u32,
@@ -1749,32 +1551,24 @@ impl<'a> SliceContext<'a> {
         }
     }
 
-    /// Decode partition mode
     fn decode_part_mode(&mut self, pred_mode: PredMode, log2_cb_size: u8) -> Result<PartMode> {
         if pred_mode == PredMode::Intra {
-            // For intra, first bin distinguishes 2Nx2N from NxN
             let ctx_idx = context::PART_MODE;
             let bin = self.cabac.decode_bin(&mut self.ctx[ctx_idx]);
             se_trace("part_mode", bin as i64, &self.cabac);
 
             if bin != 0 {
                 Ok(PartMode::Part2Nx2N)
+            } else if log2_cb_size == self.sps.log2_min_cb_size() {
+                Ok(PartMode::PartNxN)
             } else {
-                // NxN only allowed at minimum CU size
-                if log2_cb_size == self.sps.log2_min_cb_size() {
-                    Ok(PartMode::PartNxN)
-                } else {
-                    Err(HevcError::InvalidBitstream("NxN not allowed at this size"))
-                }
+                Err(HevcError::InvalidBitstream("NxN not allowed at this size"))
             }
         } else {
-            // Inter partition modes (not implemented)
             Err(HevcError::Unsupported("inter partition modes"))
         }
     }
 
-    /// Decode intra prediction modes and apply prediction
-    /// Returns (luma_mode, chroma_mode)
     fn decode_intra_prediction(
         &mut self,
         x0: u32,
@@ -1786,7 +1580,6 @@ impl<'a> SliceContext<'a> {
         let (intra_luma_mode, intra_chroma_mode) =
             self.decode_intra_prediction_modes(x0, y0, log2_size, frame)?;
 
-        // Store intra modes in the mode map for neighbor lookups and transform tree
         self.store_intra_mode(x0, y0, log2_size, intra_luma_mode);
         self.store_intra_chroma_mode(x0, y0, log2_size, intra_chroma_mode);
 
@@ -1797,7 +1590,6 @@ impl<'a> SliceContext<'a> {
         Ok((intra_luma_mode, intra_chroma_mode))
     }
 
-    /// Re-initialize all CABAC context models from the slice QP (H.265 9.3.1)
     fn reinit_context_models(&mut self) {
         let slice_qp = self.header.slice_qp_y;
         for (i, init_val) in INIT_VALUES.iter().enumerate() {
@@ -1805,7 +1597,6 @@ impl<'a> SliceContext<'a> {
         }
     }
 
-    /// Decode prev_intra_luma_pred_flag (context-coded bin)
     fn decode_prev_intra_luma_pred_flag(&mut self) -> Result<bool> {
         let ctx_idx = context::PREV_INTRA_LUMA_PRED_FLAG;
         let val = self.cabac.decode_bin(&mut self.ctx[ctx_idx]) != 0;
@@ -1813,10 +1604,6 @@ impl<'a> SliceContext<'a> {
         Ok(val)
     }
 
-    /// Derive intra luma mode from prev_flag using neighbor-based MPM candidates
-    ///
-    /// Looks up left and above neighbors from the intra mode map, with proper
-    /// CTB row boundary check for the above neighbor (H.265 8.4.2).
     fn derive_intra_luma_mode(
         &mut self,
         x0: u32,
@@ -1836,17 +1623,11 @@ impl<'a> SliceContext<'a> {
         }
     }
 
-    /// Decode intra luma mode: flag + mpm/rem in one call (for Part2Nx2N)
     fn decode_intra_luma_mode(&mut self, x0: u32, y0: u32) -> Result<IntraPredMode> {
         let prev_flag = self.decode_prev_intra_luma_pred_flag()?;
         self.derive_intra_luma_mode(x0, y0, prev_flag)
     }
 
-    /// Decode intra chroma mode
-    /// Per HEVC spec Table 8-2 and libde265 map_chroma_pred_mode():
-    /// - First bin (context-coded): if 0 → mode 4 (derived from luma)
-    /// - If first bin is 1: read 2 fixed-length bypass bits → modes 0-3
-    /// - If candidate mode collides with luma mode → Angular34
     fn decode_intra_chroma_mode(&mut self, luma_mode: IntraPredMode) -> Result<IntraPredMode> {
         if self.sps.chroma_array_type() == 0 {
             return Ok(luma_mode);
@@ -1854,22 +1635,19 @@ impl<'a> SliceContext<'a> {
         let ctx_idx = context::INTRA_CHROMA_PRED_MODE;
         let first_bin = self.cabac.decode_bin(&mut self.ctx[ctx_idx]);
         let intra_chroma_mode = if first_bin == 0 {
-            // Mode 4: derived from luma
             se_trace("intra_chroma_mode", 4, &self.cabac);
             luma_mode
         } else {
-            // Read 2 fixed-length bypass bits for modes 0-3
             let mode_idx = self.cabac.decode_bypass_bits(2) as u8;
             se_trace("intra_chroma_mode", mode_idx as i64, &self.cabac);
 
             let candidate = match mode_idx {
                 0 => IntraPredMode::Planar,
-                1 => IntraPredMode::Angular26, // Vertical
-                2 => IntraPredMode::Angular10, // Horizontal
-                _ => IntraPredMode::Dc,        // mode_idx == 3
+                1 => IntraPredMode::Angular26,
+                2 => IntraPredMode::Angular10,
+                _ => IntraPredMode::Dc,
             };
 
-            // Per Table 8-2: if candidate collides with luma mode, use Angular34
             if candidate == luma_mode {
                 IntraPredMode::Angular34
             } else {
@@ -1885,8 +1663,6 @@ impl<'a> SliceContext<'a> {
             return mode;
         }
 
-        // H.265 Table 8-3 remaps 4:2:2 chroma intra modes so angular
-        // prediction and chroma coefficient scan selection use the 4:2:2 geometry.
         const MAP_CHROMA_422: [u8; 35] = [
             0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24,
             25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31,
@@ -1895,7 +1671,6 @@ impl<'a> SliceContext<'a> {
         IntraPredMode::from_u8(mapped).unwrap_or(mode)
     }
 
-    /// Decode intra prediction modes (luma + chroma) for Part2Nx2N
     fn decode_intra_prediction_modes(
         &mut self,
         x0: u32,
@@ -1905,7 +1680,6 @@ impl<'a> SliceContext<'a> {
     ) -> Result<(IntraPredMode, IntraPredMode)> {
         let intra_luma_mode = self.decode_intra_luma_mode(x0, y0)?;
 
-        // DEBUG: Print first few intra modes
         if x0 < 16 && y0 < 16 {
             debug_trace!(
                 "DEBUG: intra_mode at ({},{}) size={}: mode={:?}",
@@ -1921,12 +1695,10 @@ impl<'a> SliceContext<'a> {
         Ok((intra_luma_mode, intra_chroma_mode))
     }
 
-    /// Get min PU size (= min_cb_size / 2, at least 1)
     fn min_pu_size(&self) -> u32 {
         ((1u32 << self.sps.log2_min_cb_size()) / 2).max(1)
     }
 
-    /// Store intra luma mode for a region (in min_pu_size units)
     fn store_intra_mode(&mut self, x0: u32, y0: u32, log2_size: u8, mode: IntraPredMode) {
         let min_pu = self.min_pu_size();
         let stride = self.intra_mode_map_stride;
@@ -1943,7 +1715,6 @@ impl<'a> SliceContext<'a> {
         }
     }
 
-    /// Store intra chroma mode for a region (in min_pu_size units)
     fn store_intra_chroma_mode(&mut self, x0: u32, y0: u32, log2_size: u8, mode: IntraPredMode) {
         let min_pu = self.min_pu_size();
         let stride = self.intra_mode_map_stride;
@@ -1960,7 +1731,6 @@ impl<'a> SliceContext<'a> {
         }
     }
 
-    /// Get intra luma prediction mode at a sample position
     fn get_intra_mode_at(&self, x: u32, y: u32) -> IntraPredMode {
         let min_pu = self.min_pu_size();
         let stride = self.intra_mode_map_stride;
@@ -1975,7 +1745,6 @@ impl<'a> SliceContext<'a> {
         }
     }
 
-    /// Get intra chroma prediction mode at a sample position
     #[allow(dead_code)]
     fn get_intra_chroma_mode_at(&self, x: u32, y: u32) -> IntraPredMode {
         let min_pu = self.min_pu_size();
@@ -1991,9 +1760,6 @@ impl<'a> SliceContext<'a> {
         }
     }
 
-    /// Get intra prediction mode of the left neighbor (x0-1, y0)
-    ///
-    /// Returns DC if the left neighbor is outside the picture boundary.
     fn get_neighbor_intra_mode_left(&self, x0: u32, y0: u32) -> IntraPredMode {
         if x0 == 0 {
             return IntraPredMode::Dc;
@@ -2001,17 +1767,10 @@ impl<'a> SliceContext<'a> {
         self.get_intra_mode_at(x0 - 1, y0)
     }
 
-    /// Get intra prediction mode of the above neighbor (x0, y0-1)
-    ///
-    /// Returns DC if:
-    /// - The above neighbor is outside the picture boundary (y0 == 0)
-    /// - The above neighbor is in a different CTB row (H.265 8.4.2 / libde265 intrapred.cc:107-109)
     fn get_neighbor_intra_mode_above(&self, x0: u32, y0: u32) -> IntraPredMode {
         if y0 == 0 {
             return IntraPredMode::Dc;
         }
-        // CTB row boundary check: if the above sample is in a different CTB row, use DC
-        // This implements: y-1 < ((y >> Log2CtbSizeY) << Log2CtbSizeY)
         let ctb_size = self.sps.ctb_size();
         let ctb_y_start = (y0 / ctb_size) * ctb_size;
         if y0 - 1 < ctb_y_start {
@@ -2020,13 +1779,10 @@ impl<'a> SliceContext<'a> {
         self.get_intra_mode_at(x0, y0 - 1)
     }
 
-    /// Map rem_intra_luma_pred_mode to actual mode (excluding MPM candidates)
     fn map_rem_mode_to_intra(&self, rem: u32, mpm: &[IntraPredMode; 3]) -> IntraPredMode {
-        // Sort MPM candidates
         let mut mpm_vals = [mpm[0].as_u8(), mpm[1].as_u8(), mpm[2].as_u8()];
         mpm_vals.sort_unstable();
 
-        // Map remaining mode
         let mut mode = rem as u8;
         for &mpm_val in &mpm_vals {
             if mode >= mpm_val {
@@ -2037,9 +1793,7 @@ impl<'a> SliceContext<'a> {
         IntraPredMode::from_u8(mode).unwrap_or(IntraPredMode::Dc)
     }
 
-    /// Decode mpm_idx (0, 1, or 2)
     fn decode_mpm_idx(&mut self) -> Result<u8> {
-        // Truncated unary: 0, 10, 11
         let val = if self.cabac.decode_bypass() == 0 {
             0
         } else if self.cabac.decode_bypass() == 0 {
@@ -2051,7 +1805,6 @@ impl<'a> SliceContext<'a> {
         Ok(val)
     }
 
-    /// Decode rem_intra_luma_pred_mode (5 bits)
     fn decode_rem_intra_luma_pred_mode(&mut self) -> Result<u32> {
         let mut val = 0u32;
         for _ in 0..5 {
@@ -2061,7 +1814,6 @@ impl<'a> SliceContext<'a> {
         Ok(val)
     }
 
-    /// H.265 Table 8-6: chroma QP mapping for 4:2:0
     fn chroma_qp_from_luma(qpi: i32) -> i32 {
         static TAB8_22: [i32; 13] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37];
         if qpi < 30 {
@@ -2073,7 +1825,6 @@ impl<'a> SliceContext<'a> {
         }
     }
 
-    /// Get QPY at a sample position from the QP map
     fn get_qpy_at(&self, x: u32, y: u32) -> i32 {
         let min_tb = 1u32 << self.sps.log2_min_tb_size();
         let Some(y) = y.checked_sub(self.map_origin) else {
@@ -2087,7 +1838,6 @@ impl<'a> SliceContext<'a> {
         }
     }
 
-    /// Store QPY for a CU region in the QP map
     fn store_qpy(&mut self, x0: u32, y0: u32, log2_cb_size: u8, qpy: i32) {
         let min_tb = 1u32 << self.sps.log2_min_tb_size();
         let count = ((1u32 << log2_cb_size) / min_tb).max(1);
@@ -2103,8 +1853,6 @@ impl<'a> SliceContext<'a> {
         }
     }
 
-    /// Decode quantization parameters (H.265 section 8.6.1)
-    /// Matching libde265's decode_quantization_parameters()
     fn decode_quantization_parameters(
         &mut self,
         x0: u32,
@@ -2115,18 +1863,15 @@ impl<'a> SliceContext<'a> {
         let log2_min_cu_qp_delta_size = self.sps.log2_ctb_size() - self.pps.diff_cu_qp_delta_depth;
         let qg_mask = (1u32 << log2_min_cu_qp_delta_size) - 1;
 
-        // Top-left pixel of current quantization group
         let x_qg = (x_cu_base & !qg_mask) as i32;
         let y_qg = (y_cu_base & !qg_mask) as i32;
 
-        // Track QG transitions
         if x_qg != self.current_qg_x || y_qg != self.current_qg_y {
             self.last_qpy_in_prev_qg = self.current_qpy;
             self.current_qg_x = x_qg;
             self.current_qg_y = y_qg;
         }
 
-        // Determine QP prediction
         let ctb_mask = ((1u32 << self.sps.log2_ctb_size()) - 1) as i32;
         let first_in_ctb_row = x_qg == 0 && (y_qg & ctb_mask) == 0;
 
@@ -2145,17 +1890,13 @@ impl<'a> SliceContext<'a> {
             self.last_qpy_in_prev_qg
         };
 
-        // Get neighbor QP values for averaging
         let qp_y_a = if x_qg > 0 {
-            // Check if left neighbor is in same CTB
             let left_x = (x_qg - 1) as u32;
             let left_y = y_qg as u32;
-            // Simplified: check if in same CTB
             let ctb_size = self.sps.ctb_size();
             let our_ctb_x = x0 / ctb_size;
             let left_ctb_x = left_x / ctb_size;
             if our_ctb_x == left_ctb_x || (x_qg as u32) < ctb_size {
-                // Left neighbor might be in previous CTB, use prediction
                 if left_ctb_x == self.ctb_x {
                     self.get_qpy_at(left_x, left_y)
                 } else {
@@ -2184,7 +1925,6 @@ impl<'a> SliceContext<'a> {
 
         let qp_y_pred = (qp_y_a + qp_y_b + 1) >> 1;
 
-        // Compute final QPY
         let qp_bd_offset_y = 6 * (self.sps.bit_depth_y() as i32 - 8);
         let qpy = ((qp_y_pred + self.cu_qp_delta + 52 + 2 * qp_bd_offset_y)
             % (52 + qp_bd_offset_y))
@@ -2195,7 +1935,6 @@ impl<'a> SliceContext<'a> {
             self.qp_y = 0;
         }
 
-        // Compute chroma QP (4:2:0)
         let qp_bd_offset_c = 6 * (self.sps.bit_depth_c() as i32 - 8);
         let qpi_cb =
             (qpy + self.pps.pps_cb_qp_offset as i32 + self.header.slice_cb_qp_offset as i32)
@@ -2204,8 +1943,6 @@ impl<'a> SliceContext<'a> {
             (qpy + self.pps.pps_cr_qp_offset as i32 + self.header.slice_cr_qp_offset as i32)
                 .clamp(-qp_bd_offset_c, 57);
 
-        // H.265 8.6.1: the Table 8-10 mapping applies to 4:2:0 only; for
-        // 4:2:2/4:4:4 QpC = Min(qPi, 51).
         let (qp_cb_mapped, qp_cr_mapped) = if self.sps.chroma_format_idc == 1 {
             (
                 Self::chroma_qp_from_luma(qpi_cb),

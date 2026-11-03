@@ -52,7 +52,6 @@ const FTYP_FIXED_FIELDS_SIZE: usize = 8;
 const BRAND_FIELD_SIZE: usize = 4;
 const FULL_BOX_HEADER_SIZE: usize = 4;
 
-/// Four-character box type code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct FourCc([u8; 4]);
 
@@ -79,7 +78,6 @@ impl Display for FourCc {
     }
 }
 
-/// Parsed ISO BMFF box header.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoxHeader {
     pub box_type: FourCc,
@@ -94,7 +92,6 @@ impl BoxHeader {
     }
 }
 
-/// Zero-copy parsed box view into an input slice.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedBox<'a> {
     pub header: BoxHeader,
@@ -107,11 +104,7 @@ impl<'a> ParsedBox<'a> {
         self.offset + u64::from(self.header.header_size)
     }
 
-    /// Iterate immediate child boxes inside this box payload.
     pub fn children(&self) -> BoxIter<'a> {
-        // Provenance: mirrors libheif child parsing in
-        // libheif/libheif/box.cc:Box::read_children, where child reads are
-        // range-limited to the parent payload and keep absolute offsets.
         BoxIter::with_offset(self.payload, self.payload_offset())
     }
 
@@ -119,7 +112,6 @@ impl<'a> ParsedBox<'a> {
         self.children().collect()
     }
 
-    /// Parse this box payload as an `ftyp` box.
     pub fn parse_ftyp(&self) -> Result<FileTypeBox, ParseFileTypeBoxError> {
         if self.header.box_type.as_bytes() != FTYP_BOX_TYPE {
             return Err(ParseFileTypeBoxError::UnexpectedBoxType {
@@ -131,12 +123,10 @@ impl<'a> ParsedBox<'a> {
         parse_ftyp_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as a FullBox header.
     pub fn parse_full_box_header(&self) -> Result<FullBoxHeader, ParseFullBoxError> {
         parse_full_box_payload(self.payload, self.payload_offset()).map(|(full_box, _, _)| full_box)
     }
 
-    /// Parse this box payload as a `meta` box.
     pub fn parse_meta(&self) -> Result<MetaBox<'a>, ParseMetaBoxError> {
         if self.header.box_type.as_bytes() != META_BOX_TYPE {
             return Err(ParseMetaBoxError::UnexpectedBoxType {
@@ -145,9 +135,6 @@ impl<'a> ParsedBox<'a> {
             });
         }
 
-        // Provenance: mirrors libheif's FullBox + meta parse sequence in
-        // libheif/libheif/box.cc:FullBox::parse_full_box_header and
-        // libheif/libheif/box.cc:Box_meta::parse.
         let (full_box, meta_payload, meta_payload_offset) =
             parse_full_box_payload(self.payload, self.payload_offset())?;
         if full_box.version != 0 {
@@ -164,7 +151,6 @@ impl<'a> ParsedBox<'a> {
         })
     }
 
-    /// Parse this box payload as a `pitm` box.
     pub fn parse_pitm(&self) -> Result<PrimaryItemBox, ParsePrimaryItemBoxError> {
         if self.header.box_type.as_bytes() != PITM_BOX_TYPE {
             return Err(ParsePrimaryItemBoxError::UnexpectedBoxType {
@@ -176,7 +162,6 @@ impl<'a> ParsedBox<'a> {
         parse_pitm_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as an `iloc` box.
     pub fn parse_iloc(&self) -> Result<ItemLocationBox, ParseItemLocationBoxError> {
         if self.header.box_type.as_bytes() != ILOC_BOX_TYPE {
             return Err(ParseItemLocationBoxError::UnexpectedBoxType {
@@ -188,7 +173,6 @@ impl<'a> ParsedBox<'a> {
         parse_iloc_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as an `infe` box.
     pub fn parse_infe(&self) -> Result<ItemInfoEntryBox, ParseItemInfoEntryBoxError> {
         if self.header.box_type.as_bytes() != INFE_BOX_TYPE {
             return Err(ParseItemInfoEntryBoxError::UnexpectedBoxType {
@@ -200,7 +184,6 @@ impl<'a> ParsedBox<'a> {
         parse_infe_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as an `iinf` box.
     pub fn parse_iinf(&self) -> Result<ItemInfoBox, ParseItemInfoBoxError> {
         if self.header.box_type.as_bytes() != IINF_BOX_TYPE {
             return Err(ParseItemInfoBoxError::UnexpectedBoxType {
@@ -212,7 +195,6 @@ impl<'a> ParsedBox<'a> {
         parse_iinf_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as an `iref` box.
     pub fn parse_iref(&self) -> Result<ItemReferenceBox, ParseItemReferenceBoxError> {
         if self.header.box_type.as_bytes() != IREF_BOX_TYPE {
             return Err(ParseItemReferenceBoxError::UnexpectedBoxType {
@@ -224,7 +206,6 @@ impl<'a> ParsedBox<'a> {
         parse_iref_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as an `ipco` box.
     pub fn parse_ipco(
         &self,
     ) -> Result<ItemPropertyContainerBox<'a>, ParseItemPropertyContainerBoxError> {
@@ -238,7 +219,6 @@ impl<'a> ParsedBox<'a> {
         parse_ipco_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as an `ipma` box.
     pub fn parse_ipma(
         &self,
     ) -> Result<ItemPropertyAssociationBox, ParseItemPropertyAssociationBoxError> {
@@ -252,7 +232,6 @@ impl<'a> ParsedBox<'a> {
         parse_ipma_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as an `iprp` box.
     pub fn parse_iprp(&self) -> Result<ItemPropertiesBox<'a>, ParseItemPropertiesBoxError> {
         if self.header.box_type.as_bytes() != IPRP_BOX_TYPE {
             return Err(ParseItemPropertiesBoxError::UnexpectedBoxType {
@@ -264,7 +243,6 @@ impl<'a> ParsedBox<'a> {
         parse_iprp_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as an `av1C` box.
     pub fn parse_av1c(
         &self,
     ) -> Result<Av1CodecConfigurationBox, ParseAv1CodecConfigurationBoxError> {
@@ -278,7 +256,6 @@ impl<'a> ParsedBox<'a> {
         parse_av1c_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as an `hvcC` box.
     pub fn parse_hvcc(
         &self,
     ) -> Result<HevcDecoderConfigurationBox, ParseHevcDecoderConfigurationBoxError> {
@@ -292,7 +269,6 @@ impl<'a> ParsedBox<'a> {
         parse_hvcc_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as an `ispe` property.
     pub fn parse_ispe(
         &self,
     ) -> Result<ImageSpatialExtentsProperty, ParseImageSpatialExtentsPropertyError> {
@@ -306,7 +282,6 @@ impl<'a> ParsedBox<'a> {
         parse_ispe_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as a `pixi` property.
     pub fn parse_pixi(
         &self,
     ) -> Result<PixelInformationProperty, ParsePixelInformationPropertyError> {
@@ -320,7 +295,6 @@ impl<'a> ParsedBox<'a> {
         parse_pixi_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as a `cmpd` property.
     pub fn parse_cmpd(
         &self,
     ) -> Result<ComponentDefinitionProperty, ParseComponentDefinitionPropertyError> {
@@ -334,7 +308,6 @@ impl<'a> ParsedBox<'a> {
         parse_cmpd_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as an `uncC` property.
     pub fn parse_uncc(
         &self,
     ) -> Result<UncompressedFrameConfigurationProperty, ParseUncompressedFrameConfigurationError>
@@ -351,7 +324,6 @@ impl<'a> ParsedBox<'a> {
         parse_uncc_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as a `colr` property.
     pub fn parse_colr(
         &self,
     ) -> Result<ColorInformationProperty, ParseColorInformationPropertyError> {
@@ -365,7 +337,6 @@ impl<'a> ParsedBox<'a> {
         parse_colr_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as an `irot` property.
     pub fn parse_irot(&self) -> Result<ImageRotationProperty, ParseImageRotationPropertyError> {
         if self.header.box_type.as_bytes() != IROT_BOX_TYPE {
             return Err(ParseImageRotationPropertyError::UnexpectedBoxType {
@@ -377,7 +348,6 @@ impl<'a> ParsedBox<'a> {
         parse_irot_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as an `imir` property.
     pub fn parse_imir(&self) -> Result<ImageMirrorProperty, ParseImageMirrorPropertyError> {
         if self.header.box_type.as_bytes() != IMIR_BOX_TYPE {
             return Err(ParseImageMirrorPropertyError::UnexpectedBoxType {
@@ -389,7 +359,6 @@ impl<'a> ParsedBox<'a> {
         parse_imir_payload(self.payload, self.payload_offset())
     }
 
-    /// Parse this box payload as a `clap` property.
     pub fn parse_clap(
         &self,
     ) -> Result<ImageCleanApertureProperty, ParseImageCleanAperturePropertyError> {
@@ -404,7 +373,6 @@ impl<'a> ParsedBox<'a> {
     }
 }
 
-/// Parsed `ftyp` box payload fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileTypeBox {
     pub major_brand: FourCc,
@@ -412,21 +380,18 @@ pub struct FileTypeBox {
     pub compatible_brands: Vec<FourCc>,
 }
 
-/// Parsed FullBox header fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FullBoxHeader {
     pub version: u8,
     pub flags: u32,
 }
 
-/// Parsed `pitm` (primary item) payload fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PrimaryItemBox {
     pub full_box: FullBoxHeader,
     pub item_id: u32,
 }
 
-/// Parsed `iloc` extent entry fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ItemLocationExtent {
     pub index: u64,
@@ -434,7 +399,6 @@ pub struct ItemLocationExtent {
     pub length: u64,
 }
 
-/// Parsed `iloc` item entry fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ItemLocationItem {
     pub item_id: u32,
@@ -444,7 +408,6 @@ pub struct ItemLocationItem {
     pub extents: Vec<ItemLocationExtent>,
 }
 
-/// Parsed `iloc` payload fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ItemLocationBox {
     pub full_box: FullBoxHeader,
@@ -455,7 +418,6 @@ pub struct ItemLocationBox {
     pub items: Vec<ItemLocationItem>,
 }
 
-/// Parsed `infe` (item info entry) payload fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ItemInfoEntryBox {
     pub full_box: FullBoxHeader,
@@ -469,7 +431,6 @@ pub struct ItemInfoEntryBox {
     pub hidden_item: bool,
 }
 
-/// Parsed `iinf` (item info) payload fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ItemInfoBox {
     pub full_box: FullBoxHeader,
@@ -477,7 +438,6 @@ pub struct ItemInfoBox {
     pub entries: Vec<ItemInfoEntryBox>,
 }
 
-/// Parsed single `iref` typed edge fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ItemReferenceEntry {
     pub reference_type: FourCc,
@@ -485,28 +445,24 @@ pub struct ItemReferenceEntry {
     pub to_item_ids: Vec<u32>,
 }
 
-/// Parsed `iref` (item reference) payload fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ItemReferenceBox {
     pub full_box: FullBoxHeader,
     pub references: Vec<ItemReferenceEntry>,
 }
 
-/// Parsed `ipma` property association entry fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ItemPropertyAssociation {
     pub essential: bool,
     pub property_index: u16,
 }
 
-/// Parsed `ipma` item association entry fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ItemPropertyAssociationEntry {
     pub item_id: u32,
     pub associations: Vec<ItemPropertyAssociation>,
 }
 
-/// Parsed `ipma` (item property association) payload fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ItemPropertyAssociationBox {
     pub full_box: FullBoxHeader,
@@ -514,20 +470,17 @@ pub struct ItemPropertyAssociationBox {
     pub entries: Vec<ItemPropertyAssociationEntry>,
 }
 
-/// Parsed `ipco` (item property container) payload fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ItemPropertyContainerBox<'a> {
     pub properties: Vec<ParsedBox<'a>>,
 }
 
-/// Parsed `iprp` (item properties) payload fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ItemPropertiesBox<'a> {
     pub property_containers: Vec<ItemPropertyContainerBox<'a>>,
     pub associations: Vec<ItemPropertyAssociationBox>,
 }
 
-/// Parsed `meta` payload fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetaBox<'a> {
     pub full_box: FullBoxHeader,
@@ -544,13 +497,9 @@ impl<'a> MetaBox<'a> {
         self.children().collect()
     }
 
-    /// Resolve the primary image item graph from this `meta` payload.
     pub fn resolve_primary_item(
         &self,
     ) -> Result<ResolvedPrimaryItemGraph<'a>, ResolvePrimaryItemGraphError> {
-        // Provenance: mirrors the mandatory image-structure checks and primary
-        // item/property lookups in libheif/libheif/file.cc:HeifFile::parse_heif_images
-        // and libheif/libheif/box.cc:Box_ipco::get_properties_for_item_ID.
         let children = self.parse_children()?;
 
         let pitm_box = find_first_child_box(&children, PITM_BOX_TYPE)
@@ -680,7 +629,6 @@ impl<'a> MetaBox<'a> {
     }
 }
 
-/// Resolved primary-item property from the `meta` item-property graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedPrimaryItemProperty<'a> {
     pub essential: bool,
@@ -688,7 +636,6 @@ pub struct ResolvedPrimaryItemProperty<'a> {
     pub property: ParsedBox<'a>,
 }
 
-/// Resolved primary image item from `meta`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedPrimaryItem<'a> {
     pub item_id: u32,
@@ -698,7 +645,6 @@ pub struct ResolvedPrimaryItem<'a> {
     pub references: Vec<ItemReferenceEntry>,
 }
 
-/// Resolved `meta` item/property/reference graph centered on the primary item.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedPrimaryItemGraph<'a> {
     pub pitm: PrimaryItemBox,
@@ -709,7 +655,6 @@ pub struct ResolvedPrimaryItemGraph<'a> {
     pub primary_item: ResolvedPrimaryItem<'a>,
 }
 
-/// Extracted primary AVIF item payload ready for AV1 decode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AvifPrimaryItemData {
     pub item_id: u32,
@@ -717,7 +662,6 @@ pub struct AvifPrimaryItemData {
     pub payload: Vec<u8>,
 }
 
-/// Extracted primary HEIC item payload ready for HEVC decode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeicPrimaryItemData {
     pub item_id: u32,
@@ -725,7 +669,6 @@ pub struct HeicPrimaryItemData {
     pub payload: Vec<u8>,
 }
 
-/// Parsed HEIC `grid` primary item descriptor payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HeicGridDescriptor {
     pub version: u8,
@@ -735,7 +678,6 @@ pub struct HeicGridDescriptor {
     pub output_height: u32,
 }
 
-/// One resolved `dimg` tile item payload used by a HEIC `grid` primary item.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeicGridTileItemData {
     pub item_id: u32,
@@ -746,7 +688,6 @@ pub struct HeicGridTileItemData {
     pub payload: Vec<u8>,
 }
 
-/// Extracted HEIC `grid` primary item descriptor and resolved tile payloads.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeicGridPrimaryItemData {
     pub item_id: u32,
@@ -757,14 +698,12 @@ pub struct HeicGridPrimaryItemData {
     pub tiles: Vec<HeicGridTileItemData>,
 }
 
-/// Extracted HEIC primary item data, either direct coded payload or `grid`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeicPrimaryItemDataWithGrid {
     Coded(HeicPrimaryItemData),
     Grid(HeicGridPrimaryItemData),
 }
 
-/// Parsed `av1C` codec configuration fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Av1CodecConfigurationBox {
     pub marker: bool,
@@ -783,7 +722,6 @@ pub struct Av1CodecConfigurationBox {
     pub config_obus: Vec<u8>,
 }
 
-/// Parsed `hvcC` NAL array fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HevcNalArray {
     pub array_completeness: bool,
@@ -791,7 +729,6 @@ pub struct HevcNalArray {
     pub nal_units: Vec<Vec<u8>>,
 }
 
-/// Parsed `hvcC` decoder configuration fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HevcDecoderConfigurationBox {
     pub configuration_version: u8,
@@ -814,7 +751,6 @@ pub struct HevcDecoderConfigurationBox {
     pub nal_arrays: Vec<HevcNalArray>,
 }
 
-/// Parsed `ispe` property fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImageSpatialExtentsProperty {
     pub full_box: FullBoxHeader,
@@ -822,27 +758,23 @@ pub struct ImageSpatialExtentsProperty {
     pub height: u32,
 }
 
-/// Parsed `pixi` property fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PixelInformationProperty {
     pub full_box: FullBoxHeader,
     pub bits_per_channel: Vec<u8>,
 }
 
-/// One parsed `cmpd` component definition entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComponentDefinition {
     pub component_type: u16,
     pub component_type_uri: Option<Vec<u8>>,
 }
 
-/// Parsed `cmpd` property fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComponentDefinitionProperty {
     pub components: Vec<ComponentDefinition>,
 }
 
-/// One parsed `uncC` component configuration entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UncompressedFrameComponent {
     pub component_index: u16,
@@ -851,7 +783,6 @@ pub struct UncompressedFrameComponent {
     pub component_align_size: u8,
 }
 
-/// Parsed `uncC` property fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UncompressedFrameConfigurationProperty {
     pub full_box: FullBoxHeader,
@@ -872,7 +803,6 @@ pub struct UncompressedFrameConfigurationProperty {
     pub num_tile_rows: u32,
 }
 
-/// Parsed `colr` NCLX/NCLC color profile fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NclxColorProfile {
     pub colour_primaries: u16,
@@ -884,8 +814,7 @@ pub struct NclxColorProfile {
 impl NclxColorProfile {
     /// libheif treats an all-"unspecified" nclx (primaries 2, transfer 2,
     /// matrix 2, full range) as undefined and keeps decoder-attached colour
-    /// metadata instead (libheif/libheif/nclx.h:nclx_profile::undefined and
-    /// pixelimage.cc:has_nclx_color_profile).
+    /// metadata instead.
     pub fn is_undefined(&self) -> bool {
         self.colour_primaries == 2
             && self.transfer_characteristics == 2
@@ -894,47 +823,40 @@ impl NclxColorProfile {
     }
 }
 
-/// Parsed `colr` ICC profile payload fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IccColorProfile {
     pub profile_type: FourCc,
     pub profile: Vec<u8>,
 }
 
-/// Parsed `colr` payload variants.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ColorInformation {
     Nclx(NclxColorProfile),
     Icc(IccColorProfile),
 }
 
-/// Parsed `colr` property fields.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColorInformationProperty {
     pub colour_type: FourCc,
     pub information: ColorInformation,
 }
 
-/// Parsed `irot` property fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImageRotationProperty {
     pub rotation_ccw_degrees: u16,
 }
 
-/// Mirror direction parsed from an `imir` property.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImageMirrorDirection {
     Horizontal,
     Vertical,
 }
 
-/// Parsed `imir` property fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImageMirrorProperty {
     pub direction: ImageMirrorDirection,
 }
 
-/// Parsed `clap` property fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImageCleanApertureProperty {
     pub clean_aperture_width_num: u32,
@@ -947,7 +869,6 @@ pub struct ImageCleanApertureProperty {
     pub vertical_offset_den: u32,
 }
 
-/// Parsed primary-item transform property in associated-property order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrimaryItemTransformProperty {
     CleanAperture(ImageCleanApertureProperty),
@@ -955,21 +876,18 @@ pub enum PrimaryItemTransformProperty {
     Mirror(ImageMirrorProperty),
 }
 
-/// Aggregated primary-item transform properties in associated-property order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrimaryItemTransformProperties {
     pub item_id: u32,
     pub transforms: Vec<PrimaryItemTransformProperty>,
 }
 
-/// Aggregated primary-item color profiles from associated `colr` properties.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PrimaryItemColorProperties {
     pub nclx: Option<NclxColorProfile>,
     pub icc: Option<IccColorProfile>,
 }
 
-/// Parsed primary AVIF properties needed before decode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AvifPrimaryItemProperties {
     pub item_id: u32,
@@ -979,7 +897,6 @@ pub struct AvifPrimaryItemProperties {
     pub colr: PrimaryItemColorProperties,
 }
 
-/// Parsed primary AVIF properties needed for decoder preflight.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AvifPrimaryItemPreflightProperties {
     pub item_id: u32,
@@ -989,7 +906,6 @@ pub struct AvifPrimaryItemPreflightProperties {
     pub colr: PrimaryItemColorProperties,
 }
 
-/// Parsed primary HEIC properties needed before decode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeicPrimaryItemProperties {
     pub item_id: u32,
@@ -999,7 +915,6 @@ pub struct HeicPrimaryItemProperties {
     pub colr: PrimaryItemColorProperties,
 }
 
-/// Parsed primary HEIC properties needed for decoder preflight.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeicPrimaryItemPreflightProperties {
     pub item_id: u32,
@@ -1009,7 +924,6 @@ pub struct HeicPrimaryItemPreflightProperties {
     pub colr: PrimaryItemColorProperties,
 }
 
-/// Parsed primary uncompressed (`unci`) properties needed before decode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UncompressedPrimaryItemProperties {
     pub item_id: u32,
@@ -1019,7 +933,6 @@ pub struct UncompressedPrimaryItemProperties {
     pub colr: PrimaryItemColorProperties,
 }
 
-/// Extracted primary uncompressed (`unci`) payload from `iloc` extents.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UncompressedPrimaryItemData {
     pub item_id: u32,
@@ -1028,21 +941,18 @@ pub struct UncompressedPrimaryItemData {
     pub payload: Vec<u8>,
 }
 
-/// Raw associated-property payload for uncompressed generic-compression metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenericCompressionPropertyPayload {
     pub offset: u64,
     pub payload: Vec<u8>,
 }
 
-/// Associated generic-compression properties linked to the primary uncompressed item.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UncompressedGenericCompressionProperties {
     pub cmpc: Vec<GenericCompressionPropertyPayload>,
     pub icef: Vec<GenericCompressionPropertyPayload>,
 }
 
-/// Errors returned when parsing an `ftyp` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseFileTypeBoxError {
     UnexpectedBoxType { offset: u64, actual: FourCc },
@@ -1071,7 +981,6 @@ impl Display for ParseFileTypeBoxError {
 
 impl Error for ParseFileTypeBoxError {}
 
-/// Errors returned when parsing a FullBox header.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseFullBoxError {
     PayloadTooSmall { offset: u64, available: usize },
@@ -1090,7 +999,6 @@ impl Display for ParseFullBoxError {
 
 impl Error for ParseFullBoxError {}
 
-/// Errors returned when parsing a `meta` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseMetaBoxError {
     UnexpectedBoxType { offset: u64, actual: FourCc },
@@ -1129,7 +1037,6 @@ impl From<ParseFullBoxError> for ParseMetaBoxError {
     }
 }
 
-/// Errors returned when parsing a `pitm` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsePrimaryItemBoxError {
     UnexpectedBoxType {
@@ -1189,7 +1096,6 @@ impl From<ParseFullBoxError> for ParsePrimaryItemBoxError {
     }
 }
 
-/// Size descriptor fields in an `iloc` box header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ItemLocationField {
     Offset,
@@ -1209,7 +1115,6 @@ impl Display for ItemLocationField {
     }
 }
 
-/// Errors returned when parsing an `iloc` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseItemLocationBoxError {
     UnexpectedBoxType {
@@ -1306,7 +1211,6 @@ impl From<ParseFullBoxError> for ParseItemLocationBoxError {
     }
 }
 
-/// Errors returned when parsing an `infe` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseItemInfoEntryBoxError {
     UnexpectedBoxType {
@@ -1366,7 +1270,6 @@ impl From<ParseFullBoxError> for ParseItemInfoEntryBoxError {
     }
 }
 
-/// Errors returned when parsing an `iinf` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseItemInfoBoxError {
     UnexpectedBoxType {
@@ -1465,7 +1368,6 @@ impl From<ParseItemInfoEntryBoxError> for ParseItemInfoBoxError {
     }
 }
 
-/// Errors returned when parsing an `iref` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseItemReferenceBoxError {
     UnexpectedBoxType {
@@ -1545,7 +1447,6 @@ impl From<ParseBoxError> for ParseItemReferenceBoxError {
     }
 }
 
-/// Errors returned when parsing an `ipco` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseItemPropertyContainerBoxError {
     UnexpectedBoxType { offset: u64, actual: FourCc },
@@ -1579,7 +1480,6 @@ impl From<ParseBoxError> for ParseItemPropertyContainerBoxError {
     }
 }
 
-/// Errors returned when parsing an `ipma` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseItemPropertyAssociationBoxError {
     UnexpectedBoxType {
@@ -1650,7 +1550,6 @@ impl From<ParseFullBoxError> for ParseItemPropertyAssociationBoxError {
     }
 }
 
-/// Errors returned when parsing an `iprp` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseItemPropertiesBoxError {
     UnexpectedBoxType { offset: u64, actual: FourCc },
@@ -1702,7 +1601,6 @@ impl From<ParseItemPropertyAssociationBoxError> for ParseItemPropertiesBoxError 
     }
 }
 
-/// Errors returned when resolving the primary item from a parsed `meta` graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolvePrimaryItemGraphError {
     ChildBox(ParseBoxError),
@@ -1821,7 +1719,6 @@ impl From<ParseItemReferenceBoxError> for ResolvePrimaryItemGraphError {
     }
 }
 
-/// Errors returned when parsing an `av1C` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseAv1CodecConfigurationBoxError {
     UnexpectedBoxType {
@@ -1864,7 +1761,6 @@ impl Display for ParseAv1CodecConfigurationBoxError {
 
 impl Error for ParseAv1CodecConfigurationBoxError {}
 
-/// Errors returned when parsing an `hvcC` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseHevcDecoderConfigurationBoxError {
     UnexpectedBoxType {
@@ -1912,7 +1808,6 @@ impl Display for ParseHevcDecoderConfigurationBoxError {
 
 impl Error for ParseHevcDecoderConfigurationBoxError {}
 
-/// Errors returned when parsing an `ispe` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseImageSpatialExtentsPropertyError {
     UnexpectedBoxType {
@@ -1972,7 +1867,6 @@ impl From<ParseFullBoxError> for ParseImageSpatialExtentsPropertyError {
     }
 }
 
-/// Errors returned when parsing a `pixi` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsePixelInformationPropertyError {
     UnexpectedBoxType {
@@ -2032,7 +1926,6 @@ impl From<ParseFullBoxError> for ParsePixelInformationPropertyError {
     }
 }
 
-/// Errors returned when parsing a `cmpd` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseComponentDefinitionPropertyError {
     UnexpectedBoxType {
@@ -2069,7 +1962,6 @@ impl Display for ParseComponentDefinitionPropertyError {
 
 impl Error for ParseComponentDefinitionPropertyError {}
 
-/// Errors returned when parsing an `uncC` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseUncompressedFrameConfigurationError {
     UnexpectedBoxType {
@@ -2190,7 +2082,6 @@ impl From<ParseFullBoxError> for ParseUncompressedFrameConfigurationError {
     }
 }
 
-/// Errors returned when parsing a `colr` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseColorInformationPropertyError {
     UnexpectedBoxType {
@@ -2238,7 +2129,6 @@ impl Display for ParseColorInformationPropertyError {
 
 impl Error for ParseColorInformationPropertyError {}
 
-/// Errors returned when parsing an `irot` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseImageRotationPropertyError {
     UnexpectedBoxType {
@@ -2273,7 +2163,6 @@ impl Display for ParseImageRotationPropertyError {
 
 impl Error for ParseImageRotationPropertyError {}
 
-/// Errors returned when parsing an `imir` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseImageMirrorPropertyError {
     UnexpectedBoxType {
@@ -2308,7 +2197,6 @@ impl Display for ParseImageMirrorPropertyError {
 
 impl Error for ParseImageMirrorPropertyError {}
 
-/// Errors returned when parsing a `clap` payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseImageCleanAperturePropertyError {
     UnexpectedBoxType {
@@ -2351,7 +2239,6 @@ impl Display for ParseImageCleanAperturePropertyError {
 
 impl Error for ParseImageCleanAperturePropertyError {}
 
-/// Errors returned when parsing primary-item transform properties.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsePrimaryItemTransformPropertiesError {
     TopLevelBoxes(ParseBoxError),
@@ -2393,7 +2280,6 @@ impl Error for ParsePrimaryItemTransformPropertiesError {
     }
 }
 
-/// Errors returned when parsing/validating primary AVIF properties.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsePrimaryAvifPropertiesError {
     TopLevelBoxes(ParseBoxError),
@@ -2512,7 +2398,6 @@ impl Error for ParsePrimaryAvifPropertiesError {
     }
 }
 
-/// Errors returned when parsing/validating primary HEIC properties.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsePrimaryHeicPropertiesError {
     TopLevelBoxes(ParseBoxError),
@@ -2631,7 +2516,6 @@ impl Error for ParsePrimaryHeicPropertiesError {
     }
 }
 
-/// Errors returned when parsing/validating primary uncompressed (`unci`) properties.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParsePrimaryUncompressedPropertiesError {
     TopLevelBoxes(ParseBoxError),
@@ -2755,7 +2639,6 @@ impl Error for ParsePrimaryUncompressedPropertiesError {
     }
 }
 
-/// Errors returned when extracting the primary AVIF payload from BMFF boxes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExtractAvifItemDataError {
     TopLevelBoxes(ParseBoxError),
@@ -2875,7 +2758,6 @@ impl Error for ExtractAvifItemDataError {
     }
 }
 
-/// Errors returned when extracting the primary HEIC payload from BMFF boxes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExtractHeicItemDataError {
     TopLevelBoxes(ParseBoxError),
@@ -3214,7 +3096,6 @@ impl Error for ExtractHeicItemDataError {
     }
 }
 
-/// Errors returned when extracting the primary uncompressed (`unci`) payload from BMFF boxes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExtractUncompressedItemDataError {
     TopLevelBoxes(ParseBoxError),
@@ -3346,7 +3227,6 @@ impl Error for ExtractUncompressedItemDataError {
     }
 }
 
-/// Errors returned by strict BMFF box parsing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ParseBoxError {
     TruncatedHeader {
@@ -3410,7 +3290,6 @@ impl Display for ParseBoxError {
 
 impl Error for ParseBoxError {}
 
-/// Iterate BMFF boxes from an input slice.
 pub struct BoxIter<'a> {
     input: &'a [u8],
     cursor: usize,
@@ -3456,19 +3335,13 @@ impl<'a> Iterator for BoxIter<'a> {
     }
 }
 
-/// Parse all top-level boxes from an input slice.
 pub fn parse_boxes(input: &[u8]) -> Result<Vec<ParsedBox<'_>>, ParseBoxError> {
     BoxIter::new(input).collect()
 }
 
-/// Parse primary-item transforms (`clap`/`irot`/`imir`) in property order.
 pub fn parse_primary_item_transform_properties(
     input: &[u8],
 ) -> Result<PrimaryItemTransformProperties, ParsePrimaryItemTransformPropertiesError> {
-    // Provenance: mirrors `clap`/`irot`/`imir` parse semantics from
-    // libheif/libheif/box.cc:{Box_clap::parse,Box_irot::parse,Box_imir::parse}
-    // and preserves associated-property order used by libheif transform application in
-    // libheif/libheif/image-items/image_item.cc:ImageItem::decode_compressed_image.
     let top_level =
         parse_boxes(input).map_err(ParsePrimaryItemTransformPropertiesError::TopLevelBoxes)?;
     let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
@@ -3518,14 +3391,9 @@ pub(crate) fn parse_primary_item_transform_properties_from_resolved_graph(
     })
 }
 
-/// Parse and validate primary AVIF properties needed before decode.
 pub fn parse_primary_avif_item_properties(
     input: &[u8],
 ) -> Result<AvifPrimaryItemProperties, ParsePrimaryAvifPropertiesError> {
-    // Provenance: mirrors strict av1C/ispe/pixi/colr parse semantics from
-    // libheif/libheif/codecs/avif_boxes.cc:Box_av1C::parse,
-    // libheif/libheif/box.cc:{Box_ispe::parse,Box_pixi::parse},
-    // and libheif/libheif/nclx.cc:Box_colr::parse.
     let top_level = parse_boxes(input).map_err(ParsePrimaryAvifPropertiesError::TopLevelBoxes)?;
     let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
         .ok_or(ParsePrimaryAvifPropertiesError::MissingMetaBox)?;
@@ -3538,15 +3406,9 @@ pub fn parse_primary_avif_item_properties(
     parse_primary_avif_item_properties_from_resolved_graph(&resolved)
 }
 
-/// Parse and validate primary AVIF properties used by decode preflight.
 pub fn parse_primary_avif_item_preflight_properties(
     input: &[u8],
 ) -> Result<AvifPrimaryItemPreflightProperties, ParsePrimaryAvifPropertiesError> {
-    // Provenance: AVIF preflight behavior mirrors
-    // libheif/libheif/image-items/avif.cc:ImageItem_AVIF::initialize_decoder
-    // and property parsing from libheif/libheif/codecs/avif_boxes.cc:Box_av1C::parse,
-    // libheif/libheif/box.cc:{Box_ispe::parse,Box_pixi::parse},
-    // and libheif/libheif/nclx.cc:Box_colr::parse.
     // AVIF preflight accepts missing pixi when av1C/ispe are present so decoder
     // stream assembly can proceed, matching libheif's av1C-driven decode bootstrap.
     let top_level = parse_boxes(input).map_err(ParsePrimaryAvifPropertiesError::TopLevelBoxes)?;
@@ -3704,7 +3566,6 @@ pub(crate) fn parse_primary_avif_item_properties_from_resolved_graph(
     })
 }
 
-/// Parse and validate primary HEIC properties needed before decode.
 pub fn parse_primary_heic_item_properties(
     input: &[u8],
 ) -> Result<HeicPrimaryItemProperties, ParsePrimaryHeicPropertiesError> {
@@ -3725,15 +3586,9 @@ pub fn parse_primary_heic_item_properties(
     })
 }
 
-/// Parse and validate primary HEIC properties used by decode preflight.
 pub fn parse_primary_heic_item_preflight_properties(
     input: &[u8],
 ) -> Result<HeicPrimaryItemPreflightProperties, ParsePrimaryHeicPropertiesError> {
-    // Provenance: mirrors libheif HEIC property preconditions and hvcC/ispe/pixi/colr
-    // parse semantics from libheif/libheif/image-items/hevc.cc:ImageItem_HEVC::initialize_decoder,
-    // libheif/libheif/context.cc (hvcC presence checks), libheif/libheif/codecs/hevc_boxes.cc:HEVCDecoderConfigurationRecord::parse,
-    // libheif/libheif/box.cc:Box_ispe::parse, libheif/libheif/box.cc:Box_pixi::parse,
-    // and libheif/libheif/nclx.cc:Box_colr::parse.
     // HEIC preflight for decoder input accepts missing pixi when hvcC/ispe are
     // valid, matching libheif's hvcC-only decode bootstrap path.
     let top_level = parse_boxes(input).map_err(ParsePrimaryHeicPropertiesError::TopLevelBoxes)?;
@@ -3866,13 +3721,9 @@ pub fn parse_primary_heic_item_preflight_properties(
     })
 }
 
-/// Parse and validate primary uncompressed (`unci`) properties needed before decode.
 pub fn parse_primary_uncompressed_item_properties(
     input: &[u8],
 ) -> Result<UncompressedPrimaryItemProperties, ParsePrimaryUncompressedPropertiesError> {
-    // Provenance: mirrors libheif uncompressed property preconditions and parsing from
-    // libheif/libheif/codecs/uncompressed/unc_codec.cc:UncompressedImageCodec::check_header_validity
-    // and libheif/libheif/codecs/uncompressed/unc_boxes.cc:{Box_cmpd::parse,Box_uncC::parse}.
     let top_level =
         parse_boxes(input).map_err(ParsePrimaryUncompressedPropertiesError::TopLevelBoxes)?;
     let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
@@ -4011,7 +3862,6 @@ pub fn parse_primary_uncompressed_item_properties(
     })
 }
 
-/// Extract the primary AVIF (`av01`) coded payload from `iloc` extents.
 pub fn extract_primary_avif_item_data(
     input: &[u8],
 ) -> Result<AvifPrimaryItemData, ExtractAvifItemDataError> {
@@ -4019,7 +3869,6 @@ pub fn extract_primary_avif_item_data(
     extract_primary_avif_item_data_internal(input, &mut source)
 }
 
-/// Extract the primary AVIF (`av01`) coded payload from `iloc` extents using a random-access source.
 pub fn extract_primary_avif_item_data_from_source<S: RandomAccessSource>(
     source: &mut S,
     input: &[u8],
@@ -4032,9 +3881,6 @@ fn extract_primary_avif_item_data_internal(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
 ) -> Result<AvifPrimaryItemData, ExtractAvifItemDataError> {
-    // Provenance: mirrors the primary-item selection and extent read flow from
-    // libheif/libheif/image-items/avif.cc:ImageItem_AVIF::set_decoder_input_data
-    // and libheif/libheif/box.cc:Box_iloc::read_data.
     let (meta, resolved) = resolve_primary_avif_item_graph(input)?;
 
     let item_id = resolved.primary_item.item_id;
@@ -4193,7 +4039,6 @@ pub(crate) fn extract_avif_item_payload_from_location(
     Ok((location.construction_method, payload))
 }
 
-/// Extract the primary uncompressed (`unci`) payload from `iloc` extents.
 pub fn extract_primary_uncompressed_item_data(
     input: &[u8],
 ) -> Result<UncompressedPrimaryItemData, ExtractUncompressedItemDataError> {
@@ -4201,7 +4046,6 @@ pub fn extract_primary_uncompressed_item_data(
     extract_primary_uncompressed_item_data_internal(input, &mut source)
 }
 
-/// Extract the primary uncompressed (`unci`) payload from `iloc` extents using a random-access source.
 pub fn extract_primary_uncompressed_item_data_from_source<S: RandomAccessSource>(
     source: &mut S,
     input: &[u8],
@@ -4214,9 +4058,6 @@ fn extract_primary_uncompressed_item_data_internal(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
 ) -> Result<UncompressedPrimaryItemData, ExtractUncompressedItemDataError> {
-    // Provenance: mirrors the primary-item selection and uncompressed extent read flow from
-    // libheif/libheif/file.cc:HeifFile::get_uncompressed_item_data and
-    // libheif/libheif/box.cc:{Box_iloc::read_data,Box_idat::read_data}.
     let top_level = parse_boxes(input).map_err(ExtractUncompressedItemDataError::TopLevelBoxes)?;
     let meta_box = find_first_child_box(&top_level, META_BOX_TYPE)
         .ok_or(ExtractUncompressedItemDataError::MissingMetaBox)?;
@@ -4399,7 +4240,6 @@ fn extract_primary_uncompressed_item_data_internal(
     })
 }
 
-/// Extract the primary HEIC (`hvc1`/`hev1`) coded payload from `iloc` extents.
 pub fn extract_primary_heic_item_data(
     input: &[u8],
 ) -> Result<HeicPrimaryItemData, ExtractHeicItemDataError> {
@@ -4407,7 +4247,6 @@ pub fn extract_primary_heic_item_data(
     extract_primary_heic_item_data_internal(input, &mut source)
 }
 
-/// Extract the primary HEIC (`hvc1`/`hev1`) coded payload from `iloc` extents using a random-access source.
 pub fn extract_primary_heic_item_data_from_source<S: RandomAccessSource>(
     source: &mut S,
     input: &[u8],
@@ -4420,10 +4259,6 @@ fn extract_primary_heic_item_data_internal(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
 ) -> Result<HeicPrimaryItemData, ExtractHeicItemDataError> {
-    // Provenance: mirrors the HEIC primary-item selection and extent read flow
-    // from libheif/libheif/image-items/hevc.cc:ImageItem_HEVC::set_decoder_input_data,
-    // libheif/libheif/box.cc:Box_iloc::read_data, and
-    // libheif/libheif/box.cc:Box_idat::read_data.
     let (meta, resolved) = resolve_primary_heic_item_graph(input)?;
 
     let item_id = resolved.primary_item.item_id;
@@ -4454,7 +4289,6 @@ fn extract_primary_heic_item_data_internal(
     })
 }
 
-/// Extract primary HEIC item data, including `grid` item descriptor + tiles.
 pub fn extract_primary_heic_item_data_with_grid(
     input: &[u8],
 ) -> Result<HeicPrimaryItemDataWithGrid, ExtractHeicItemDataError> {
@@ -4462,7 +4296,6 @@ pub fn extract_primary_heic_item_data_with_grid(
     extract_primary_heic_item_data_with_grid_internal(input, &mut source)
 }
 
-/// Extract primary HEIC item data, including `grid` item descriptor + tiles, using a random-access source.
 pub fn extract_primary_heic_item_data_with_grid_from_source<S: RandomAccessSource>(
     source: &mut S,
     input: &[u8],
@@ -4475,10 +4308,6 @@ fn extract_primary_heic_item_data_with_grid_internal(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
 ) -> Result<HeicPrimaryItemDataWithGrid, ExtractHeicItemDataError> {
-    // Provenance: mirrors libheif `grid` descriptor parsing and tile-reference
-    // resolution in libheif/libheif/image-items/grid.cc:{ImageGrid::parse,ImageItem_Grid::read_grid_spec},
-    // with coded tile payload extraction reusing the same iloc/idat data flow as
-    // libheif/libheif/box.cc:{Box_iloc::read_data,Box_idat::read_data}.
     let (meta, resolved) = resolve_primary_heic_item_graph(input)?;
 
     let item_id = resolved.primary_item.item_id;
@@ -4911,11 +4740,6 @@ fn resolve_grid_tile_hvcc_colr_and_transforms_indexed(
     Ok((hvcc, colr, transforms.into()))
 }
 
-/// Colour properties for the primary HEIC item, mirroring libheif: the primary
-/// item's own `colr` properties win; a `grid` primary inherits whatever it
-/// lacks from its first tile, per profile type, with an all-"unspecified" nclx
-/// treated as absent (libheif/libheif/context.cc grid inheritance and
-/// pixelimage.cc:has_nclx_color_profile).
 pub fn primary_heic_color_properties(input: &[u8]) -> Option<PrimaryItemColorProperties> {
     let (_meta, resolved) = resolve_primary_heic_item_graph(input).ok()?;
 
@@ -4941,8 +4765,6 @@ pub fn primary_heic_color_properties(input: &[u8]) -> Option<PrimaryItemColorPro
         .item_type
         .map(|item_type| item_type.as_bytes() == GRID_ITEM_TYPE)
         .unwrap_or(false);
-    // A grid primary only consults its first tile for whatever it lacks: an
-    // ICC profile, or an nclx that is not the all-"unspecified" sentinel.
     let primary_nclx_defined = primary_colr
         .nclx
         .as_ref()
@@ -4950,8 +4772,6 @@ pub fn primary_heic_color_properties(input: &[u8]) -> Option<PrimaryItemColorPro
     if !is_grid_primary || (primary_colr.icc.is_some() && primary_nclx_defined) {
         return (primary_colr.icc.is_some() || primary_colr.nclx.is_some()).then_some(primary_colr);
     }
-    // A grid whose first tile cannot be resolved still keeps the primary
-    // item's own colour properties instead of dropping them.
     let tile_colr = resolved
         .primary_item
         .references
@@ -4980,11 +4800,10 @@ fn merge_primary_and_grid_tile_color_properties(
     primary_colr: PrimaryItemColorProperties,
     tile_colr: Option<PrimaryItemColorProperties>,
 ) -> Option<PrimaryItemColorProperties> {
-    // Mirrors libheif's grid inheritance (libheif/libheif/context.cc): the
-    // ICC and nclx profiles inherit from the first tile independently, and an
-    // all-"unspecified" nclx counts as absent on either side
-    // (pixelimage.cc:has_nclx_color_profile), so the merged properties never
-    // carry the undefined sentinel.
+    // Mirrors libheif's grid inheritance: the ICC and nclx profiles inherit
+    // from the first tile independently, and an all-"unspecified" nclx counts
+    // as absent on either side, so the merged properties never carry the
+    // undefined sentinel.
     let tile_colr = tile_colr.unwrap_or_default();
     let defined = |nclx: Option<NclxColorProfile>| nclx.filter(|nclx| !nclx.is_undefined());
     let merged = PrimaryItemColorProperties {
@@ -4994,9 +4813,6 @@ fn merge_primary_and_grid_tile_color_properties(
     (merged.nclx.is_some() || merged.icc.is_some()).then_some(merged)
 }
 
-/// ICC colour profile for the primary HEIC item, mirroring libheif: the
-/// primary item's own `colr` ICC wins; a `grid` primary without one inherits
-/// the first tile's ICC (libheif/libheif/context.cc).
 pub fn primary_heic_icc_profile(input: &[u8]) -> Option<Vec<u8>> {
     primary_heic_color_properties(input).and_then(|colr| colr.icc.map(|profile| profile.profile))
 }
@@ -5635,9 +5451,6 @@ fn parse_hvcc_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<HevcDecoderConfigurationBox, ParseHevcDecoderConfigurationBoxError> {
-    // Provenance: mirrors HEVCDecoderConfigurationRecord::parse from
-    // libheif/libheif/codecs/hevc_boxes.cc (field extraction order, masking,
-    // nal-array iteration, and tolerance for trailing bytes).
     let mut cursor = 0_usize;
     let configuration_version =
         read_u8_cursor_hvcc(payload, &mut cursor, payload_offset, "configurationVersion")?;
@@ -5770,8 +5583,6 @@ fn parse_ispe_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<ImageSpatialExtentsProperty, ParseImageSpatialExtentsPropertyError> {
-    // Provenance: mirrors libheif/libheif/box.cc:Box_ispe::parse FullBox and
-    // width/height extraction (version 0, then 32-bit width/height).
     let (full_box, ispe_payload, ispe_payload_offset) =
         parse_full_box_payload(payload, payload_offset)?;
     if full_box.version != 0 {
@@ -5801,8 +5612,6 @@ fn parse_pixi_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<PixelInformationProperty, ParsePixelInformationPropertyError> {
-    // Provenance: mirrors libheif/libheif/box.cc:Box_pixi::parse (FullBox
-    // version 0 + 8-bit channel count + N bits_per_channel values).
     let (full_box, pixi_payload, pixi_payload_offset) =
         parse_full_box_payload(payload, payload_offset)?;
     if full_box.version != 0 {
@@ -5842,7 +5651,6 @@ fn parse_cmpd_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<ComponentDefinitionProperty, ParseComponentDefinitionPropertyError> {
-    // Provenance: mirrors libheif/libheif/codecs/uncompressed/unc_boxes.cc:Box_cmpd::parse.
     let mut cursor = 0usize;
     let component_count =
         read_u32_cursor_cmpd(payload, &mut cursor, payload_offset, "component_count")?;
@@ -5869,7 +5677,6 @@ fn parse_uncc_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<UncompressedFrameConfigurationProperty, ParseUncompressedFrameConfigurationError> {
-    // Provenance: mirrors libheif/libheif/codecs/uncompressed/unc_boxes.cc:Box_uncC::parse.
     let (full_box, uncc_payload, uncc_payload_offset) =
         parse_full_box_payload(payload, payload_offset)?;
 
@@ -6094,8 +5901,6 @@ fn parse_colr_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<ColorInformationProperty, ParseColorInformationPropertyError> {
-    // Provenance: mirrors libheif/libheif/nclx.cc:Box_colr::parse handling for
-    // nclx/nclc and ICC (prof/rICC) colour profile payload variants.
     if payload.len() < BRAND_FIELD_SIZE {
         return Err(ParseColorInformationPropertyError::PayloadTooSmall {
             offset: payload_offset,
@@ -6174,8 +5979,6 @@ fn parse_irot_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<ImageRotationProperty, ParseImageRotationPropertyError> {
-    // Provenance: mirrors libheif/libheif/box.cc:Box_irot::parse, where the
-    // low two bits encode rotation units of 90 degrees.
     let required = size_of::<u8>();
     if payload.len() < required {
         return Err(ParseImageRotationPropertyError::PayloadTooSmall {
@@ -6195,8 +5998,6 @@ fn parse_imir_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<ImageMirrorProperty, ParseImageMirrorPropertyError> {
-    // Provenance: mirrors libheif/libheif/box.cc:Box_imir::parse, where bit 0
-    // selects mirror direction (1=horizontal, 0=vertical).
     let required = size_of::<u8>();
     if payload.len() < required {
         return Err(ParseImageMirrorPropertyError::PayloadTooSmall {
@@ -6218,8 +6019,6 @@ fn parse_clap_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<ImageCleanApertureProperty, ParseImageCleanAperturePropertyError> {
-    // Provenance: mirrors libheif/libheif/box.cc:Box_clap::parse field order
-    // and denominator validity checks.
     const CLAP_PAYLOAD_SIZE: usize = 32;
     let required = CLAP_PAYLOAD_SIZE;
     if payload.len() < required {
@@ -6285,8 +6084,6 @@ fn parse_ftyp_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<FileTypeBox, ParseFileTypeBoxError> {
-    // Provenance: mirrors the ftyp field layout and brand iteration used in
-    // libheif/libheif/box.cc:Box_ftyp::parse.
     if payload.len() < FTYP_FIXED_FIELDS_SIZE {
         return Err(ParseFileTypeBoxError::PayloadTooSmall {
             offset: payload_offset,
@@ -6345,9 +6142,6 @@ fn parse_pitm_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<PrimaryItemBox, ParsePrimaryItemBoxError> {
-    // Provenance: mirrors libheif pitm parsing in
-    // libheif/libheif/box.cc:Box_pitm::parse, where version 0 uses a 16-bit
-    // item_ID, version 1 uses a 32-bit item_ID, and versions >1 are rejected.
     let (full_box, pitm_payload, pitm_payload_offset) =
         parse_full_box_payload(payload, payload_offset)?;
     let item_id = match full_box.version {
@@ -6390,9 +6184,6 @@ fn parse_iloc_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<ItemLocationBox, ParseItemLocationBoxError> {
-    // Provenance: mirrors iloc parsing flow in libheif/libheif/box.cc:Box_iloc::parse
-    // (supported versions, size descriptor fields, per-item records, and extents)
-    // while adding explicit field-size validation and truncation errors.
     let (full_box, iloc_payload, iloc_payload_offset) =
         parse_full_box_payload(payload, payload_offset)?;
     if full_box.version > 2 {
@@ -6571,10 +6362,6 @@ fn parse_infe_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<ItemInfoEntryBox, ParseItemInfoEntryBoxError> {
-    // Provenance: mirrors infe field parsing in
-    // libheif/libheif/box.cc:Box_infe::parse, including supported version
-    // handling (0..=3), hidden-item flag decoding for v2+, and conditional
-    // MIME/URI string fields based on item_type.
     let (full_box, infe_payload, infe_payload_offset) =
         parse_full_box_payload(payload, payload_offset)?;
     if full_box.version > 3 {
@@ -6658,8 +6445,6 @@ fn parse_iinf_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<ItemInfoBox, ParseItemInfoBoxError> {
-    // Provenance: mirrors iinf parsing flow in libheif/libheif/box.cc:Box_iinf::parse,
-    // where entry_count width is 16-bit for v0 and 32-bit for v1+.
     let (full_box, iinf_payload, iinf_payload_offset) =
         parse_full_box_payload(payload, payload_offset)?;
     let mut cursor = 0_usize;
@@ -6714,10 +6499,6 @@ fn parse_iref_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<ItemReferenceBox, ParseItemReferenceBoxError> {
-    // Provenance: mirrors iref parsing in libheif/libheif/box.cc:Box_iref::parse,
-    // where versions 0/1 are supported, each typed child box carries one
-    // from_item_ID, a 16-bit reference count, and that many to_item_ID values
-    // using ID width selected by the iref version.
     let (full_box, iref_payload, iref_payload_offset) =
         parse_full_box_payload(payload, payload_offset)?;
     if full_box.version > 1 {
@@ -6784,9 +6565,6 @@ fn parse_ipco_payload<'a>(
     payload: &'a [u8],
     payload_offset: u64,
 ) -> Result<ItemPropertyContainerBox<'a>, ParseItemPropertyContainerBoxError> {
-    // Provenance: mirrors libheif `ipco` handling in
-    // libheif/libheif/box.cc:Box_ipco::parse, which parses all child property
-    // boxes under ipco.
     let properties =
         BoxIter::with_offset(payload, payload_offset).collect::<Result<Vec<_>, ParseBoxError>>()?;
 
@@ -6797,10 +6575,6 @@ fn parse_ipma_payload(
     payload: &[u8],
     payload_offset: u64,
 ) -> Result<ItemPropertyAssociationBox, ParseItemPropertyAssociationBoxError> {
-    // Provenance: mirrors libheif `ipma` entry parsing in
-    // libheif/libheif/box.cc:Box_ipma::parse, including version checks (0/1),
-    // item_ID width selection (v0=16-bit, v1=32-bit), and association entry
-    // decoding controlled by flags bit 0 (8-bit or 16-bit indices).
     let (full_box, ipma_payload, ipma_payload_offset) =
         parse_full_box_payload(payload, payload_offset)?;
     if full_box.version > 1 {
@@ -6897,9 +6671,6 @@ fn parse_iprp_payload<'a>(
     payload: &'a [u8],
     payload_offset: u64,
 ) -> Result<ItemPropertiesBox<'a>, ParseItemPropertiesBoxError> {
-    // Provenance: mirrors libheif `iprp` handling in
-    // libheif/libheif/box.cc:Box_iprp::parse, where all child boxes are read
-    // and `ipco`/`ipma` children are interpreted by downstream consumers.
     let children =
         BoxIter::with_offset(payload, payload_offset).collect::<Result<Vec<_>, ParseBoxError>>()?;
 
@@ -7436,8 +7207,6 @@ fn parse_header(
         });
     }
 
-    // Provenance: this mirrors the libheif header and range checks in
-    // libheif/libheif/box.cc:BoxHeader::parse_header and Box::read.
     let box_size_32 = read_u32_be(&input[0..4]);
     let box_type = FourCc::new([input[4], input[5], input[6], input[7]]);
 
@@ -7526,12 +7295,6 @@ fn read_u64_be(input: &[u8]) -> u64 {
     ])
 }
 
-/// Minimal ISOBMFF builders shared by container-level tests across modules.
-///
-/// These synthesize just enough structure for the paths under test: `meta`
-/// graphs (pitm/iloc/iinf/iprp/iref) for colour-property resolution, and a
-/// complete decodable uncompressed `rgb3` file for the lazy-image-adapter
-/// contract tests in `lib.rs` and `image_integration.rs`.
 #[cfg(test)]
 pub(crate) mod test_support {
     pub(crate) fn plain_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
@@ -7553,30 +7316,26 @@ pub(crate) mod test_support {
         full_box(b"pitm", 0, 0, &item_id.to_be_bytes())
     }
 
-    /// iloc v0 with zero-size offset/length/base_offset fields and no extents:
-    /// enough for graph resolution, which only requires the entry to exist.
     pub(crate) fn iloc_box(item_ids: &[u16]) -> Vec<u8> {
         let mut payload = Vec::new();
-        payload.extend_from_slice(&0_u16.to_be_bytes()); // all size fields zero
+        payload.extend_from_slice(&0_u16.to_be_bytes());
         payload.extend_from_slice(&u16::try_from(item_ids.len()).unwrap().to_be_bytes());
         for item_id in item_ids {
             payload.extend_from_slice(&item_id.to_be_bytes());
-            payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
-            payload.extend_from_slice(&0_u16.to_be_bytes()); // extent_count
+            payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.extend_from_slice(&0_u16.to_be_bytes());
         }
         full_box(b"iloc", 0, 0, &payload)
     }
 
-    /// iloc v0 with one file-absolute extent (construction method 0) per item.
     pub(crate) fn iloc_with_extent_box(items: &[(u16, u32, u32)]) -> Vec<u8> {
         let mut payload = Vec::new();
-        // offset_size 4, length_size 4, base_offset_size 0.
         payload.extend_from_slice(&0x4400_u16.to_be_bytes());
         payload.extend_from_slice(&u16::try_from(items.len()).unwrap().to_be_bytes());
         for (item_id, extent_offset, extent_length) in items {
             payload.extend_from_slice(&item_id.to_be_bytes());
-            payload.extend_from_slice(&0_u16.to_be_bytes()); // data_reference_index
-            payload.extend_from_slice(&1_u16.to_be_bytes()); // extent_count
+            payload.extend_from_slice(&0_u16.to_be_bytes());
+            payload.extend_from_slice(&1_u16.to_be_bytes());
             payload.extend_from_slice(&extent_offset.to_be_bytes());
             payload.extend_from_slice(&extent_length.to_be_bytes());
         }
@@ -7586,9 +7345,9 @@ pub(crate) mod test_support {
     pub(crate) fn infe_box(item_id: u16, item_type: &[u8; 4]) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&item_id.to_be_bytes());
-        payload.extend_from_slice(&0_u16.to_be_bytes()); // item_protection_index
+        payload.extend_from_slice(&0_u16.to_be_bytes());
         payload.extend_from_slice(item_type);
-        payload.push(0); // empty item_name
+        payload.push(0);
         full_box(b"infe", 2, 0, &payload)
     }
 
@@ -7623,15 +7382,12 @@ pub(crate) mod test_support {
         plain_box(b"colr", &payload)
     }
 
-    /// Minimal parseable hvcC: configurationVersion 1, everything else zero,
-    /// zero NAL arrays.
     pub(crate) fn hvcc_box() -> Vec<u8> {
         let mut payload = vec![0_u8; 23];
         payload[0] = 1;
         plain_box(b"hvcC", &payload)
     }
 
-    /// ipma v0/flags0: each entry is (item_id, 1-based ipco property indices).
     pub(crate) fn ipma_box(entries: &[(u16, &[u8])]) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&u32::try_from(entries.len()).unwrap().to_be_bytes());
@@ -7682,8 +7438,8 @@ pub(crate) mod test_support {
     pub(crate) fn ftyp_box(major_brand: &[u8; 4]) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(major_brand);
-        payload.extend_from_slice(&0_u32.to_be_bytes()); // minor_version
-        payload.extend_from_slice(major_brand); // compatible brand
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(major_brand);
         plain_box(b"ftyp", &payload)
     }
 
@@ -7694,7 +7450,6 @@ pub(crate) mod test_support {
         full_box(b"ispe", 0, 0, &payload)
     }
 
-    /// uncC version 1: the whole payload is the profile FourCC.
     pub(crate) fn uncc_v1_box(profile: &[u8; 4]) -> Vec<u8> {
         full_box(b"uncC", 1, 0, profile)
     }
@@ -7839,11 +7594,6 @@ pub(crate) mod test_support {
         )
     }
 
-    /// A complete, decodable uncompressed HEIF file: `mif1` brand, a 2x1
-    /// `unci` primary item with the version-1 `rgb3` (8-bit interleaved RGB)
-    /// profile, and the pixel payload in a trailing `mdat`.
-    ///
-    /// Returns the file bytes and the RGBA8 pixels a decode must produce.
     pub(crate) fn cmpd_box(component_types: &[u16]) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&u32::try_from(component_types.len()).unwrap().to_be_bytes());
@@ -8003,9 +7753,6 @@ pub(crate) mod test_support {
                 ),
             ])
         };
-        // The iloc extent offset is file-absolute and all iloc fields are
-        // fixed-size, so a first pass with a placeholder offset yields the
-        // final layout to compute the real offset from.
         let meta_len = meta_with_pixel_offset(0).len();
         let mdat_header_len = 8;
         let pixel_offset = u32::try_from(ftyp.len() + meta_len + mdat_header_len).unwrap();
@@ -8018,11 +7765,6 @@ pub(crate) mod test_support {
         (file, expected_rgba)
     }
 
-    /// [`minimal_uncompressed_rgb3_heif`] plus a cdsc-linked `Exif` item
-    /// whose big-endian TIFF block carries the given orientation.
-    ///
-    /// Returns the file bytes, the RGBA8 pixels a decode must produce, and
-    /// the raw TIFF block `ImageDecoder::exif_metadata` must hand back.
     #[cfg(feature = "image-integration")]
     pub(crate) fn minimal_uncompressed_rgb3_heif_with_exif_orientation(
         orientation: u16,
@@ -8035,12 +7777,6 @@ pub(crate) mod test_support {
         plain_box(b"irot", &[rotation_ccw_quarter_turns & 0x03])
     }
 
-    /// [`minimal_uncompressed_rgb3_heif_with_exif_orientation`] with extra
-    /// transform property boxes (`irot`/`imir`/`clap`) associated with the
-    /// primary item after `ispe` and `uncC`.
-    ///
-    /// The returned RGBA pixels are the untransformed samples; callers that
-    /// pass transforms derive their own expected output.
     #[cfg(feature = "image-integration")]
     pub(crate) fn minimal_uncompressed_rgb3_heif_with_exif_orientation_and_transforms(
         orientation: u16,
@@ -8049,8 +7785,6 @@ pub(crate) mod test_support {
         let pixels_rgb: [u8; 6] = [10, 20, 30, 200, 150, 100];
         let expected_rgba: Vec<u8> = vec![10, 20, 30, 255, 200, 150, 100, 255];
 
-        // Big-endian TIFF: header, one IFD with a single SHORT orientation
-        // entry (value left-justified in the 4-byte field), no next IFD.
         let mut tiff = Vec::new();
         tiff.extend_from_slice(b"MM\x00\x2A");
         tiff.extend_from_slice(&8_u32.to_be_bytes());
@@ -8062,7 +7796,6 @@ pub(crate) mod test_support {
         tiff.extend_from_slice(&[0, 0]);
         tiff.extend_from_slice(&0_u32.to_be_bytes());
 
-        // HEIF EXIF item payload: 4-byte exif_tiff_header_offset, then TIFF.
         let mut exif_payload = Vec::new();
         exif_payload.extend_from_slice(&0_u32.to_be_bytes());
         exif_payload.extend_from_slice(&tiff);
@@ -8084,9 +7817,6 @@ pub(crate) mod test_support {
                 iprp_box(&properties, &[(1, &association_indices)]),
             ])
         };
-        // The iloc extent offsets are file-absolute and all iloc fields are
-        // fixed-size, so a first pass with placeholder offsets yields the
-        // final layout to compute the real offsets from.
         let meta_len = meta_with_data_offsets(0, 0).len();
         let mdat_header_len = 8;
         let pixel_offset = u32::try_from(ftyp.len() + meta_len + mdat_header_len).unwrap();
@@ -8122,8 +7852,6 @@ mod tests {
         primary_heic_color_properties,
     };
     use std::sync::Arc;
-
-    // -- Container-level colour resolution tests ----------------------------
 
     #[test]
     fn resolves_primary_nclx_and_icc_from_container_bytes() {
@@ -8176,8 +7904,6 @@ mod tests {
 
     #[test]
     fn grid_with_undefined_nclx_inherits_tile_nclx_from_container_bytes() {
-        // The grid item carries only the all-"unspecified" sentinel; the real
-        // colour metadata lives on the first tile, as libheif inherits it.
         let file = meta_file(&[
             pitm_box(1),
             iloc_box(&[1, 2]),
@@ -8224,8 +7950,6 @@ mod tests {
 
     #[test]
     fn grid_keeps_own_nclx_when_tile_is_unresolvable_in_container_bytes() {
-        // The tile has no hvcC, so tile resolution fails; the primary item's
-        // own nclx must survive instead of being dropped.
         let file = meta_file(&[
             pitm_box(1),
             iloc_box(&[1, 2]),

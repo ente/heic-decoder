@@ -1,89 +1,48 @@
-//! HEVC bitstream and NAL unit parsing
-
 use crate::heic_decoder::error::HevcError;
 use alloc::vec::Vec;
 
 type Result<T> = core::result::Result<T, HevcError>;
 
-/// NAL unit types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum NalType {
-    /// Trailing picture, non-reference
     TrailN = 0,
-    /// Trailing picture, reference
     TrailR = 1,
-    /// Temporal sub-layer access, non-reference
     TsaN = 2,
-    /// Temporal sub-layer access, reference
     TsaR = 3,
-    /// Step-wise temporal sub-layer access, non-reference
     StsaN = 4,
-    /// Step-wise temporal sub-layer access, reference
     StsaR = 5,
-    /// Random access decodable leading, non-reference
     RadlN = 6,
-    /// Random access decodable leading, reference
     RadlR = 7,
-    /// Random access skipped leading, non-reference
     RaslN = 8,
-    /// Random access skipped leading, reference
     RaslR = 9,
-    /// Reserved VCL non-reference (10)
     RsvVclN10 = 10,
-    /// Reserved VCL reference (11)
     RsvVclR11 = 11,
-    /// Reserved VCL non-reference (12)
     RsvVclN12 = 12,
-    /// Reserved VCL reference (13)
     RsvVclR13 = 13,
-    /// Reserved VCL non-reference (14)
     RsvVclN14 = 14,
-    /// Reserved VCL reference (15)
     RsvVclR15 = 15,
-    /// Broken link access, no leading pictures
     BlaNLp = 16,
-    /// Broken link access, with leading pictures
     BlaWLp = 17,
-    /// Broken link access, with RADL
     BlaWRadl = 18,
-    /// Instantaneous decoding refresh, with RADL
     IdrWRadl = 19,
-    /// Instantaneous decoding refresh, no leading pictures
     IdrNLp = 20,
-    /// Clean random access
     CraNut = 21,
-    /// Reserved IRAP (22)
     RsvIrap22 = 22,
-    /// Reserved IRAP (23)
     RsvIrap23 = 23,
-    // Reserved 24-31
-    /// Video parameter set
     VpsNut = 32,
-    /// Sequence parameter set
     SpsNut = 33,
-    /// Picture parameter set
     PpsNut = 34,
-    /// Access unit delimiter
     AudNut = 35,
-    /// End of sequence
     EosNut = 36,
-    /// End of bitstream
     EobNut = 37,
-    /// Filler data
     FdNut = 38,
-    /// SEI (prefix)
     PrefixSeiNut = 39,
-    /// SEI (suffix)
     SuffixSeiNut = 40,
-    // Reserved 41-47
-    // Unspecified 48-63
-    /// Unknown or unrecognized NAL unit type
     Unknown = 255,
 }
 
 impl NalType {
-    /// Create from raw NAL unit type value
     pub fn from_u8(val: u8) -> Self {
         match val {
             0 => Self::TrailN,
@@ -123,7 +82,6 @@ impl NalType {
         }
     }
 
-    /// Check if this is a VCL (slice) NAL unit
     pub fn is_slice(self) -> bool {
         matches!(
             self,
@@ -146,7 +104,6 @@ impl NalType {
         )
     }
 
-    /// Check if this is an IDR or BLA picture
     pub fn is_idr(self) -> bool {
         matches!(
             self,
@@ -154,19 +111,16 @@ impl NalType {
         )
     }
 
-    /// Check if this is a RASL picture
     #[allow(dead_code)]
     pub fn is_rasl(self) -> bool {
         matches!(self, Self::RaslN | Self::RaslR)
     }
 
-    /// Check if this is a RADL picture
     #[allow(dead_code)]
     pub fn is_radl(self) -> bool {
         matches!(self, Self::RadlN | Self::RadlR)
     }
 
-    /// Check if this is an IRAP picture
     pub fn is_irap(self) -> bool {
         matches!(
             self,
@@ -182,28 +136,21 @@ impl NalType {
     }
 }
 
-/// Parsed NAL unit
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct NalUnit<'a> {
-    /// NAL unit type
     pub nal_type: NalType,
-    /// Layer ID
     pub nuh_layer_id: u8,
-    /// Temporal ID plus 1
     pub nuh_temporal_id_plus1: u8,
-    /// NAL unit payload (after header, emulation bytes removed)
     pub payload: Vec<u8>,
     /// Positions of removed emulation prevention bytes, expressed as byte
     /// offsets into the transmitted payload (i.e. `raw_data[2..]`, before
     /// removal). Needed to convert slice-header entry point offsets, which
     /// count transmitted bytes, into offsets into `payload`.
     pub skipped_byte_positions: Vec<u32>,
-    /// Raw data reference
     pub raw_data: &'a [u8],
 }
 
-/// Parse length-prefixed format (public version)
 pub fn parse_length_prefixed_ext(data: &[u8], length_size: usize) -> Result<Vec<NalUnit<'_>>> {
     let mut nals = Vec::new();
     let mut i = 0;
@@ -238,7 +185,6 @@ pub fn parse_length_prefixed_ext(data: &[u8], length_size: usize) -> Result<Vec<
     Ok(nals)
 }
 
-/// Parse a single NAL unit (for hvcC parameter sets)
 pub fn parse_single_nal(data: &[u8]) -> Result<NalUnit<'_>> {
     parse_nal_header(data)
 }
@@ -270,17 +216,10 @@ pub(crate) fn parse_single_nal_bounded(data: &[u8]) -> Result<NalUnit<'_>> {
     Ok(nal)
 }
 
-/// Parse NAL unit header and remove emulation prevention bytes
 fn parse_nal_header(raw_data: &[u8]) -> Result<NalUnit<'_>> {
     if raw_data.len() < 2 {
         return Err(HevcError::InvalidNalUnit("too short"));
     }
-
-    // NAL unit header (2 bytes):
-    // forbidden_zero_bit (1 bit) - must be 0
-    // nal_unit_type (6 bits)
-    // nuh_layer_id (6 bits)
-    // nuh_temporal_id_plus1 (3 bits)
 
     if (raw_data[0] & 0x80) != 0 {
         return Err(HevcError::InvalidNalUnit("forbidden_zero_bit is set"));
@@ -294,7 +233,6 @@ fn parse_nal_header(raw_data: &[u8]) -> Result<NalUnit<'_>> {
         return Err(HevcError::InvalidNalUnit("temporal_id_plus1 is zero"));
     }
 
-    // Remove emulation prevention bytes (0x00 0x00 0x03 -> 0x00 0x00)
     let (payload, skipped_byte_positions) = remove_emulation_prevention(&raw_data[2..]);
 
     Ok(NalUnit {
@@ -307,10 +245,6 @@ fn parse_nal_header(raw_data: &[u8]) -> Result<NalUnit<'_>> {
     })
 }
 
-/// Remove emulation prevention bytes (0x03) from RBSP.
-///
-/// Returns the stripped payload plus the positions of the removed 0x03 bytes
-/// in the input (transmitted) byte coordinates.
 fn remove_emulation_prevention(data: &[u8]) -> (Vec<u8>, Vec<u32>) {
     let mut result = Vec::with_capacity(data.len());
     let mut skipped = Vec::new();
@@ -318,11 +252,10 @@ fn remove_emulation_prevention(data: &[u8]) -> (Vec<u8>, Vec<u32>) {
 
     while i < data.len() {
         if i + 2 < data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 3 {
-            // Emulation prevention byte found
             result.push(0);
             result.push(0);
             skipped.push((i + 2) as u32);
-            i += 3; // Skip the 0x03
+            i += 3;
         } else {
             result.push(data[i]);
             i += 1;
@@ -332,7 +265,6 @@ fn remove_emulation_prevention(data: &[u8]) -> (Vec<u8>, Vec<u32>) {
     (result, skipped)
 }
 
-/// Bitstream reader for parsing RBSP data
 #[allow(dead_code)]
 pub struct BitstreamReader<'a> {
     data: &'a [u8],
@@ -341,7 +273,6 @@ pub struct BitstreamReader<'a> {
 }
 
 impl<'a> BitstreamReader<'a> {
-    /// Create a new bitstream reader
     pub fn new(data: &'a [u8]) -> Self {
         Self {
             data,
@@ -350,13 +281,11 @@ impl<'a> BitstreamReader<'a> {
         }
     }
 
-    /// Check if at byte boundary
     #[allow(dead_code)]
     pub fn is_byte_aligned(&self) -> bool {
         self.bit_offset == 0
     }
 
-    /// Skip to next byte boundary
     pub fn byte_align(&mut self) {
         if self.bit_offset != 0 {
             self.bit_offset = 0;
@@ -364,7 +293,6 @@ impl<'a> BitstreamReader<'a> {
         }
     }
 
-    /// Read a single bit
     pub fn read_bit(&mut self) -> Result<u8> {
         if self.byte_offset >= self.data.len() {
             return Err(HevcError::InvalidBitstream("unexpected end of data"));
@@ -380,7 +308,6 @@ impl<'a> BitstreamReader<'a> {
         Ok(bit)
     }
 
-    /// Read up to 32 bits
     pub fn read_bits(&mut self, n: u8) -> Result<u32> {
         if n > 32 {
             return Err(HevcError::InvalidBitstream("too many bits requested"));
@@ -393,7 +320,6 @@ impl<'a> BitstreamReader<'a> {
         Ok(value)
     }
 
-    /// Read unsigned Exp-Golomb code
     pub fn read_ue(&mut self) -> Result<u32> {
         let mut leading_zeros = 0u32;
         while self.read_bit()? == 0 {
@@ -411,32 +337,26 @@ impl<'a> BitstreamReader<'a> {
         Ok((1 << leading_zeros) - 1 + suffix)
     }
 
-    /// Read signed Exp-Golomb code
     pub fn read_se(&mut self) -> Result<i32> {
         let ue = self.read_ue()?;
         let value = ue.div_ceil(2) as i32;
         if ue & 1 == 0 { Ok(-value) } else { Ok(value) }
     }
 
-    /// Check if more RBSP data is available
     #[allow(dead_code)]
     pub fn more_rbsp_data(&self) -> bool {
         if self.byte_offset >= self.data.len() {
             return false;
         }
 
-        // Check for RBSP trailing bits (1 followed by zeros)
         let remaining_bits = (self.data.len() - self.byte_offset) * 8 - self.bit_offset as usize;
         if remaining_bits == 0 {
             return false;
         }
 
-        // Look for rbsp_stop_one_bit followed by alignment zeros
-        // This is a simplified check
         remaining_bits > 8
     }
 
-    /// Remaining bytes
     #[allow(dead_code)]
     pub fn remaining(&self) -> usize {
         if self.byte_offset >= self.data.len() {
@@ -446,7 +366,6 @@ impl<'a> BitstreamReader<'a> {
         }
     }
 
-    /// Get current byte position (only valid if byte-aligned)
     pub fn byte_position(&self) -> usize {
         self.byte_offset
     }

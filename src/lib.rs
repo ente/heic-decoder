@@ -1,11 +1,3 @@
-//! Pure Rust HEIF/HEIC/AVIF decoding APIs.
-//!
-//! For production usage, prefer the `*_with_guardrails` entry points and set
-//! explicit [`DecodeGuardrails`] values for input bytes, decoded pixels, and
-//! non-seek temp spool limits.
-//!
-//! See `API.md` in the crate root for an integration-oriented API guide.
-
 extern crate alloc;
 
 use brotli::Decompressor as BrotliDecompressor;
@@ -65,7 +57,6 @@ pub mod image_integration;
 pub mod isobmff;
 pub mod source;
 
-/// Stable high-level decoder error categories for callers and tooling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodeErrorCategory {
     Io,
@@ -78,7 +69,6 @@ pub enum DecodeErrorCategory {
 }
 
 impl DecodeErrorCategory {
-    /// Stable machine-readable label for CLI/script integration.
     pub fn as_str(self) -> &'static str {
         match self {
             DecodeErrorCategory::Io => "io",
@@ -98,7 +88,6 @@ impl Display for DecodeErrorCategory {
     }
 }
 
-/// Structured decode guardrail failures for bounded ingestion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DecodeGuardrailError {
     InputTooLarge {
@@ -190,7 +179,6 @@ impl Display for DecodeGuardrailError {
     }
 }
 
-/// Errors returned by the decoder entry points.
 #[derive(Debug)]
 pub enum DecodeError {
     Io(std::io::Error),
@@ -208,7 +196,6 @@ pub enum DecodeError {
     Unsupported(String),
 }
 
-/// Structured transform/input validation failures in the RGBA output path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransformGuardError {
     RgbaSampleCountMismatch {
@@ -380,7 +367,6 @@ impl Display for TransformGuardError {
 }
 
 impl DecodeError {
-    /// Return the stable high-level category for this decode failure.
     pub fn category(&self) -> DecodeErrorCategory {
         match self {
             DecodeError::Io(_) => DecodeErrorCategory::Io,
@@ -477,7 +463,6 @@ impl From<png::EncodingError> for DecodeError {
     }
 }
 
-/// Decoded AVIF chroma layout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AvifPixelLayout {
     Yuv400,
@@ -486,14 +471,12 @@ pub enum AvifPixelLayout {
     Yuv444,
 }
 
-/// Decoded YCbCr sample range derived from nclx signalling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum YCbCrRange {
     Full,
     Limited,
 }
 
-/// Decoded matrix metadata derived from nclx signalling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct YCbCrMatrixCoefficients {
     pub matrix_coefficients: u16,
@@ -502,8 +485,6 @@ pub struct YCbCrMatrixCoefficients {
 
 impl Default for YCbCrMatrixCoefficients {
     fn default() -> Self {
-        // Provenance: matches libheif undefined-profile defaults from
-        // libheif/libheif/nclx.cc:nclx_profile::set_undefined.
         Self {
             matrix_coefficients: 2,
             colour_primaries: 2,
@@ -511,14 +492,12 @@ impl Default for YCbCrMatrixCoefficients {
     }
 }
 
-/// Decoded AVIF plane samples.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AvifPlaneSamples {
     U8(Vec<u8>),
     U16(Vec<u16>),
 }
 
-/// One decoded AVIF image plane in row-major order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AvifPlane {
     pub width: u32,
@@ -526,7 +505,6 @@ pub struct AvifPlane {
     pub samples: AvifPlaneSamples,
 }
 
-/// Decoded AVIF auxiliary alpha samples.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AvifAuxiliaryAlphaPlane {
     pub width: u32,
@@ -535,7 +513,6 @@ pub struct AvifAuxiliaryAlphaPlane {
     pub samples: AvifPlaneSamples,
 }
 
-/// Decoded AVIF image in planar YUV form.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedAvifImage {
     pub width: u32,
@@ -550,7 +527,6 @@ pub struct DecodedAvifImage {
     pub alpha_plane: Option<AvifAuxiliaryAlphaPlane>,
 }
 
-/// Decoded HEIC chroma layout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HeicPixelLayout {
     Yuv400,
@@ -559,7 +535,6 @@ pub enum HeicPixelLayout {
     Yuv444,
 }
 
-/// One decoded HEIC image plane in row-major order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeicPlane {
     pub width: u32,
@@ -567,7 +542,6 @@ pub struct HeicPlane {
     pub samples: Vec<u16>,
 }
 
-/// Decoded HEIC image in planar YUV form.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedHeicImage {
     pub width: u32,
@@ -582,7 +556,6 @@ pub struct DecodedHeicImage {
     pub v_plane: Option<HeicPlane>,
 }
 
-/// Decoded uncompressed HEIF image materialized as RGBA samples.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedUncompressedImage {
     pub width: u32,
@@ -592,7 +565,6 @@ pub struct DecodedUncompressedImage {
     pub icc_profile: Option<Vec<u8>>,
 }
 
-/// Stable decoded RGBA pixel storage for image-crate handoff.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DecodedRgbaPixels {
     U8(Vec<u8>),
@@ -600,7 +572,6 @@ pub enum DecodedRgbaPixels {
 }
 
 impl DecodedRgbaPixels {
-    /// Return the storage bit depth of this RGBA buffer (8 or 16).
     pub fn storage_bit_depth(&self) -> u8 {
         match self {
             DecodedRgbaPixels::U8(_) => 8,
@@ -608,7 +579,6 @@ impl DecodedRgbaPixels {
         }
     }
 
-    /// Borrow RGBA8 samples when this buffer is 8-bit.
     pub fn as_rgba8(&self) -> Option<&[u8]> {
         match self {
             DecodedRgbaPixels::U8(pixels) => Some(pixels.as_slice()),
@@ -616,7 +586,6 @@ impl DecodedRgbaPixels {
         }
     }
 
-    /// Borrow RGBA16 samples when this buffer is 16-bit.
     pub fn as_rgba16(&self) -> Option<&[u16]> {
         match self {
             DecodedRgbaPixels::U8(_) => None,
@@ -624,7 +593,6 @@ impl DecodedRgbaPixels {
         }
     }
 
-    /// Consume this buffer and return owned RGBA8 samples when present.
     pub fn into_rgba8(self) -> Option<Vec<u8>> {
         match self {
             DecodedRgbaPixels::U8(pixels) => Some(pixels),
@@ -632,7 +600,6 @@ impl DecodedRgbaPixels {
         }
     }
 
-    /// Consume this buffer and return owned RGBA16 samples when present.
     pub fn into_rgba16(self) -> Option<Vec<u16>> {
         match self {
             DecodedRgbaPixels::U8(_) => None,
@@ -641,7 +608,6 @@ impl DecodedRgbaPixels {
     }
 }
 
-/// Decoded RGBA image buffer with metadata suitable for zero-copy handoff.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedRgbaImage {
     pub width: u32,
@@ -651,11 +617,6 @@ pub struct DecodedRgbaImage {
     pub icc_profile: Option<Vec<u8>>,
 }
 
-/// Decoded RGB8 image buffer for consumers that intentionally discard alpha.
-///
-/// Pixels are byte-for-byte equivalent to converting this decoder's final
-/// RGBA output through `image::DynamicImage::into_rgb8`, but the RGB path does
-/// not allocate or write an unused alpha channel.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedRgbImage {
     pub width: u32,
@@ -675,12 +636,6 @@ pub(crate) struct DecodedRgbaLayout {
     pub icc_profile: Option<Vec<u8>>,
 }
 
-/// HEIF EXIF-orientation inspection result for caller-controlled display transforms.
-///
-/// `exif_orientation` is the raw EXIF orientation value (`1..=8`) when present.
-/// `primary_item_has_orientation_transform` reports whether `irot`/`imir` is already
-/// signalled on the primary item. When this is true, applying EXIF orientation on top
-/// may double-rotate or double-mirror the decoded output.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExifOrientationHint {
     pub exif_orientation: Option<u8>,
@@ -688,12 +643,10 @@ pub struct ExifOrientationHint {
 }
 
 impl ExifOrientationHint {
-    /// Return true when EXIF orientation should be applied by the caller.
     pub fn should_apply_exif_orientation(self) -> bool {
         matches!(self.exif_orientation, Some(2..=8)) && !self.primary_item_has_orientation_transform
     }
 
-    /// Return the EXIF orientation value to apply, if any.
     pub fn orientation_to_apply(self) -> Option<u8> {
         if self.should_apply_exif_orientation() {
             return self.exif_orientation;
@@ -703,35 +656,26 @@ impl ExifOrientationHint {
 }
 
 impl DecodedRgbaImage {
-    /// Return the storage bit depth of the RGBA pixel buffer (8 or 16).
     pub fn storage_bit_depth(&self) -> u8 {
         self.pixels.storage_bit_depth()
     }
 
-    /// Borrow RGBA8 samples when this image stores 8-bit pixels.
     pub fn as_rgba8(&self) -> Option<&[u8]> {
         self.pixels.as_rgba8()
     }
 
-    /// Borrow RGBA16 samples when this image stores 16-bit pixels.
     pub fn as_rgba16(&self) -> Option<&[u16]> {
         self.pixels.as_rgba16()
     }
 
-    /// Consume this image and return owned RGBA8 samples when present.
     pub fn into_rgba8(self) -> Option<Vec<u8>> {
         self.pixels.into_rgba8()
     }
 
-    /// Consume this image and return owned RGBA16 samples when present.
     pub fn into_rgba16(self) -> Option<Vec<u16>> {
         self.pixels.into_rgba16()
     }
 
-    /// Apply a raw EXIF orientation (`1..=8`) to this decoded RGBA image.
-    ///
-    /// This is useful when you keep decode parity with libheif and want to apply
-    /// orientation at the UI/application layer.
     pub fn apply_exif_orientation(self, exif_orientation: u8) -> Result<Self, DecodeError> {
         let Some(transforms) =
             exif_orientation_to_primary_item_transforms(u16::from(exif_orientation))
@@ -778,7 +722,6 @@ impl DecodedRgbaImage {
     }
 }
 
-/// Parsed HEIC image metadata extracted from the primary HEVC SPS.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedHeicImageMetadata {
     pub width: u32,
@@ -788,7 +731,6 @@ pub struct DecodedHeicImageMetadata {
     pub layout: HeicPixelLayout,
 }
 
-/// Classification of a parsed HEVC NAL unit for backend frame handoff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HevcNalClass {
     Vcl,
@@ -799,7 +741,6 @@ enum HevcNalClass {
     Unknown,
 }
 
-/// One NAL unit parsed from an assembled 4-byte length-prefixed HEVC stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LengthPrefixedHevcNalUnit<'a> {
     offset: usize,
@@ -831,7 +772,6 @@ impl<'a> LengthPrefixedHevcNalUnit<'a> {
     }
 }
 
-/// Errors from the AVIF decode path and internal image model conversion.
 #[derive(Debug)]
 pub enum DecodeAvifError {
     Guardrail(DecodeGuardrailError),
@@ -904,7 +844,6 @@ pub enum DecodeAvifError {
 }
 
 impl DecodeAvifError {
-    /// Return the stable high-level category for this AVIF decode failure.
     pub fn category(&self) -> DecodeErrorCategory {
         match self {
             DecodeAvifError::Guardrail(error) => error.category(),
@@ -1061,7 +1000,6 @@ impl From<isobmff::ExtractAvifItemDataError> for DecodeAvifError {
     }
 }
 
-/// Errors from HEIC primary-item bitstream assembly for decoder handoff.
 #[derive(Debug)]
 pub enum DecodeHeicError {
     Guardrail(DecodeGuardrailError),
@@ -1137,7 +1075,6 @@ pub enum DecodeHeicError {
 }
 
 impl DecodeHeicError {
-    /// Return the stable high-level category for this HEIC decode failure.
     pub fn category(&self) -> DecodeErrorCategory {
         match self {
             DecodeHeicError::Guardrail(error) => error.category(),
@@ -1297,7 +1234,6 @@ impl From<isobmff::ExtractHeicItemDataError> for DecodeHeicError {
     }
 }
 
-/// Errors from uncompressed (`unci`) primary-item decode.
 #[derive(Debug)]
 pub enum DecodeUncompressedError {
     ParsePrimaryProperties(isobmff::ParsePrimaryUncompressedPropertiesError),
@@ -1309,7 +1245,6 @@ pub enum DecodeUncompressedError {
 }
 
 impl DecodeUncompressedError {
-    /// Return the stable high-level category for this uncompressed decode failure.
     pub fn category(&self) -> DecodeErrorCategory {
         match self {
             DecodeUncompressedError::ExtractPrimaryPayload(
@@ -1365,7 +1300,6 @@ impl From<isobmff::ExtractUncompressedItemDataError> for DecodeUncompressedError
     }
 }
 
-/// Decode the primary AVIF item into an internal planar YUV image model.
 pub fn decode_primary_avif_to_image(input: &[u8]) -> Result<DecodedAvifImage, DecodeAvifError> {
     let mut source: Option<&mut dyn RandomAccessSource> = None;
     decode_primary_avif_to_image_internal(input, &mut source)
@@ -1386,10 +1320,6 @@ fn decode_primary_avif_to_image_from_resolved_graph(
     resolved: &isobmff::ResolvedPrimaryItemGraph<'_>,
     max_pixels: Option<u64>,
 ) -> Result<DecodedAvifImage, DecodeAvifError> {
-    // Provenance: mirrors libheif configuration+payload bitstream assembly in
-    // libheif/libheif/codecs/decoder.cc:Decoder::get_compressed_data and
-    // AVIF configuration extraction in
-    // libheif/libheif/codecs/avif_dec.cc:Decoder_AVIF::read_bitstream_configuration_data.
     let item_id = resolved.primary_item.item_id;
     let item_type = resolved
         .primary_item
@@ -1448,19 +1378,12 @@ fn decode_primary_avif_to_image_from_resolved_graph(
     Ok(decoded)
 }
 
-/// Assemble primary HEIC coded data as a decoder-ready HEVC stream.
 pub fn assemble_primary_heic_hevc_stream(input: &[u8]) -> Result<Vec<u8>, DecodeHeicError> {
-    // Provenance: mirrors libheif's decoder input assembly flow from
-    // libheif/libheif/codecs/decoder.cc:Decoder::get_compressed_data and
-    // libheif/libheif/codecs/hevc_dec.cc:Decoder_HEVC::read_bitstream_configuration_data,
-    // with hvcC header NAL packing semantics from
-    // libheif/libheif/codecs/hevc_boxes.cc:Box_hvcC::get_header_nals.
     let properties = isobmff::parse_primary_heic_item_preflight_properties(input)?;
     let item_data = isobmff::extract_primary_heic_item_data(input)?;
     assemble_heic_hevc_stream_from_components(&properties.hvcc, &item_data.payload)
 }
 
-/// Decode the primary HEIC item into an internal planar YUV image model.
 pub fn decode_primary_heic_to_image(input: &[u8]) -> Result<DecodedHeicImage, DecodeHeicError> {
     let mut source: Option<&mut dyn RandomAccessSource> = None;
     decode_primary_heic_to_image_internal(input, &mut source)
@@ -1492,7 +1415,6 @@ fn decode_primary_heic_to_image_internal(
     }
 }
 
-/// Parse primary HEIC stream metadata from the first SPS NAL in the assembled HEVC stream.
 pub fn decode_primary_heic_to_metadata(
     input: &[u8],
 ) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
@@ -1762,7 +1684,6 @@ impl<'a> UncompressedBitReader<'a> {
     }
 }
 
-/// Decode the primary uncompressed (`unci`) item into an internal RGBA model.
 pub fn decode_primary_uncompressed_to_image(
     input: &[u8],
 ) -> Result<DecodedUncompressedImage, DecodeUncompressedError> {
@@ -1940,12 +1861,6 @@ impl DecodedUncompressedChannels {
     }
 }
 
-/// Expand the `uncC` component layout (v1 profile shorthand or v0/v2 `cmpd`
-/// mapping) into per-component decode specs plus the effective sampling and
-/// interleave types.
-///
-/// Shared by the decode path and the image-hook layout probe so component
-/// validation cannot drift between them.
 fn uncompressed_component_layout_from_properties(
     properties: &isobmff::UncompressedPrimaryItemProperties,
 ) -> Result<(Vec<UncompressedComponentDecodeSpec>, u8, u8), DecodeUncompressedError> {
@@ -1953,9 +1868,6 @@ fn uncompressed_component_layout_from_properties(
     let mut sampling_type = properties.unc_c.sampling_type;
     let mut component_specs = Vec::new();
     if properties.unc_c.full_box.version == 1 {
-        // Provenance: mirrors profile expansion from
-        // libheif/libheif/codecs/uncompressed/unc_boxes.cc:fill_uncC_and_cmpd_from_profile
-        // for the baseline RGB profiles used in this decoder pass.
         let profile = properties.unc_c.profile;
         match profile.as_bytes() {
             bytes if bytes == *b"rgb3" => {
@@ -2091,20 +2003,12 @@ fn uncompressed_component_layout_from_properties(
     Ok((component_specs, sampling_type, interleave_type))
 }
 
-/// Per-channel presence, bit depth, and component count resolved from the
-/// `uncC` component list.
 struct UncompressedChannelMap {
     has_channel: [bool; UNCOMPRESSED_CHANNEL_COUNT],
     channel_bit_depths: [u8; UNCOMPRESSED_CHANNEL_COUNT],
     channel_component_counts: [u8; UNCOMPRESSED_CHANNEL_COUNT],
 }
 
-/// Fold component decode specs into the per-channel map, enforcing the
-/// duplicate-component rules (only multi-Y luma may repeat, and only at a
-/// single bit depth).
-///
-/// Shared by the decode path and the image-hook layout probe so the two
-/// cannot drift.
 fn resolve_uncompressed_channel_map(
     component_specs: &[UncompressedComponentDecodeSpec],
     interleave_type: u8,
@@ -2158,12 +2062,6 @@ fn decode_primary_uncompressed_to_channels_internal(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
 ) -> Result<DecodedUncompressedChannels, DecodeUncompressedError> {
-    // Provenance: baseline decode flow mirrors libheif uncompressed handling in
-    // libheif/libheif/codecs/uncompressed/unc_codec.cc:
-    // UncompressedImageCodec::{check_header_validity,decode_uncompressed_image}
-    // and decoder dispatch constraints from
-    // libheif/libheif/codecs/uncompressed/unc_decoder.cc:
-    // unc_decoder_factory::{check_common_requirements,get_unc_decoder}.
     let properties = isobmff::parse_primary_uncompressed_item_properties(input)?;
 
     let (component_specs, sampling_type, interleave_type) =
@@ -2236,8 +2134,6 @@ fn decode_primary_uncompressed_to_channels_internal(
         })?;
     let tile_cols = properties.unc_c.num_tile_cols;
     let tile_rows = properties.unc_c.num_tile_rows;
-    // Provenance: mirrors libheif/libheif/codecs/uncompressed/unc_codec.cc:
-    // UncompressedImageCodec::check_header_validity tile-grid checks.
     if tile_cols > width || tile_rows > height {
         return Err(DecodeUncompressedError::InvalidInput {
             detail: format!(
@@ -2304,10 +2200,6 @@ fn decode_primary_uncompressed_to_channels_internal(
     let has_full_rgb = has_channel[UNCOMPRESSED_CHANNEL_RED]
         && has_channel[UNCOMPRESSED_CHANNEL_GREEN]
         && has_channel[UNCOMPRESSED_CHANNEL_BLUE];
-    // Provenance: channel-set detection mirrors libheif uncompressed
-    // chroma/colorspace derivation in
-    // libheif/libheif/codecs/uncompressed/unc_codec.cc:
-    // UncompressedImageCodec::get_heif_chroma_uncompressed.
     if has_monochrome && (has_rgb || has_ycbcr) {
         return Err(DecodeUncompressedError::UnsupportedFeature {
             detail:
@@ -2544,8 +2436,6 @@ fn decode_primary_uncompressed_to_channels_internal(
         )?;
     } else {
         let mut reader = UncompressedBitReader::new(&payload);
-        // Provenance: mirrors libheif/libheif/codecs/uncompressed/unc_decoder.cc:
-        // unc_decoder::decode_image tile iteration order (row-major grid traversal).
         for tile_row in 0..tile_rows_usize {
             let tile_origin_y = tile_row.checked_mul(tile_height_usize).ok_or_else(|| {
                 DecodeUncompressedError::InvalidInput {
@@ -2694,9 +2584,6 @@ fn uncompressed_minimum_payload_bits(
 fn uncompressed_chroma_subsampling(
     sampling_type: u8,
 ) -> Result<(usize, usize), DecodeUncompressedError> {
-    // Provenance: mirrors chroma plane sizing in
-    // libheif/libheif/codecs/uncompressed/unc_decoder_legacybase.cc:
-    // unc_decoder_legacybase::buildChannelListEntry.
     match sampling_type {
         UNCOMPRESSED_SAMPLING_NO_SUBSAMPLING => Ok((1, 1)),
         UNCOMPRESSED_SAMPLING_422 => Ok((2, 1)),
@@ -2884,9 +2771,6 @@ fn decode_uncompressed_mixed_interleave(
     sampling_type: u8,
     channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
 ) -> Result<(), DecodeUncompressedError> {
-    // Provenance: mixed (semi-planar) uncompressed YCbCr decode mirrors
-    // libheif/libheif/codecs/uncompressed/unc_decoder_mixed_interleave.cc:
-    // unc_decoder_mixed_interleave::{get_tile_data_sizes,processTile}.
     let mut decoded_chroma_pair = false;
 
     for spec in specs {
@@ -3064,11 +2948,6 @@ fn decode_uncompressed_multi_y_interleave(
     sampling_type: u8,
     channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
 ) -> Result<(), DecodeUncompressedError> {
-    // Provenance: multi-Y grouped sample ordering follows
-    // libheif/libheif/codecs/uncompressed/unc_types.h (interleave_mode_multi_y)
-    // plus uncC profile definitions in
-    // libheif/libheif/codecs/uncompressed/unc_boxes.cc
-    // (e.g. 2vuy/yuv2/yvyu/vyuy tuple ordering for 4:2:2 groups).
     let (subsample_x, subsample_y) = uncompressed_chroma_subsampling(sampling_type)?;
     if !tile_region.width.is_multiple_of(subsample_x)
         || !tile_region.height.is_multiple_of(subsample_y)
@@ -3206,12 +3085,6 @@ fn decode_uncompressed_tile_component_interleave(
     sampling_type: u8,
     channel_samples: &mut [Option<Vec<u16>>; UNCOMPRESSED_CHANNEL_COUNT],
 ) -> Result<(), DecodeUncompressedError> {
-    // Provenance: mirrors libheif tile-component handling in
-    // libheif/libheif/codecs/uncompressed/unc_decoder.cc:unc_decoder::fetch_tile_data
-    // and libheif/libheif/codecs/uncompressed/unc_decoder_component_interleave.cc:
-    // {unc_decoder_component_interleave::get_tile_data_sizes,decode_tile}
-    // by re-addressing per-component tile payload segments from the full item
-    // payload into per-tile component streams.
     let tile_count = uncompressed_tile_count(&tile_layout)?;
     let (component_tile_sizes, per_tile_size) = uncompressed_component_tile_sizes(
         specs,
@@ -3797,11 +3670,6 @@ fn select_uncompressed_output_bit_depth(
         return Ok(max_bit_depth);
     }
 
-    // Provenance: mirrors libheif output conversion behavior for mixed RGB
-    // channel bit depths via heifio/encoder_png.h:PngEncoder::chroma (8-bit
-    // interleaved output for <=8-bit content, 16-bit for >8-bit) and
-    // libheif/libheif/color-conversion/hdr_sdr.cc:Op_to_sdr_planes::convert_colorspace
-    // (channel-wise normalization before interleaving).
     if max_bit_depth <= 8 { Ok(8) } else { Ok(16) }
 }
 
@@ -3861,9 +3729,6 @@ fn scale_uncompressed_sample_bit_depth(
         });
     }
     if source_bit_depth < target_bit_depth {
-        // Provenance: mirrors libheif/libheif/color-conversion/hdr_sdr.cc:
-        // Op_to_sdr_planes::convert_colorspace bit-pattern expansion for
-        // source bit depths below the output bit depth.
         let source_bits = u32::from(source_bit_depth);
         let target_bits = u32::from(target_bit_depth);
         let mut expanded = sample_u32;
@@ -3918,12 +3783,6 @@ fn maybe_decode_primary_uncompressed_generic_compression_payload<'a>(
     payload: &'a [u8],
     limits: impl FnOnce() -> Result<GenericCompressionLimits, DecodeUncompressedError>,
 ) -> Result<Cow<'a, [u8]>, DecodeUncompressedError> {
-    // Provenance: generic compression handling mirrors libheif
-    // uncompressed decode flow and cmpC/icef semantics in
-    // libheif/libheif/codecs/uncompressed/unc_decoder.cc:
-    // unc_decoder::{get_compressed_image_data_uncompressed,do_decompress_data}
-    // and libheif/libheif/codecs/uncompressed/unc_boxes.cc:
-    // {Box_cmpC::parse,Box_icef::parse}.
     let Some(generic_compression) =
         parse_primary_uncompressed_generic_compression(item_id, generic_compression_properties)?
     else {
@@ -4453,9 +4312,6 @@ type PrimaryHeicStreamDecodeContext = (
     Option<YCbCrMatrixCoefficients>,
 );
 
-/// Parse the primary coded item's preflight properties and cross-check the
-/// item id against the extracted payload. Shared by the stream-assembling
-/// decode path and the image-hook layout probe.
 fn parse_and_validate_heic_coded_item_preflight(
     input: &[u8],
     item_data: &isobmff::HeicPrimaryItemData,
@@ -4489,9 +4345,6 @@ fn decode_primary_heic_stream_and_metadata_from_coded_item_data(
     Ok((stream, decoded, ycbcr_range_override, ycbcr_matrix_override))
 }
 
-/// Decode the primary coded (non-grid) HEIC item: assemble and decode its
-/// HEVC stream, apply the container's nclx range/matrix overrides, and
-/// validate the decoded frame against the container metadata.
 fn decode_primary_heic_coded_item_to_image(
     input: &[u8],
     item_data: &isobmff::HeicPrimaryItemData,
@@ -4509,8 +4362,6 @@ fn decode_primary_heic_coded_item_to_image(
     Ok(decoded)
 }
 
-/// Decode the primary coded HEIC item, enforce the pixel-count guardrail,
-/// and resolve its auxiliary alpha plane.
 fn decode_primary_heic_coded_item_with_alpha(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
@@ -4531,8 +4382,6 @@ fn decode_primary_heic_coded_item_with_alpha(
     Ok((decoded, auxiliary_alpha))
 }
 
-/// Enforce the pixel-count guardrail on the grid descriptor and resolve the
-/// grid's auxiliary alpha plane before any tile is decoded.
 fn decode_primary_heic_grid_auxiliary_alpha(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
@@ -4563,12 +4412,6 @@ fn decoded_heic_image_to_metadata(decoded: &DecodedHeicImage) -> DecodedHeicImag
 fn decode_primary_heic_grid_to_image(
     grid_data: &isobmff::HeicGridPrimaryItemData,
 ) -> Result<DecodedHeicImage, DecodeHeicError> {
-    // Provenance: mirrors libheif grid decode flow in
-    // libheif/libheif/image-items/grid.cc:
-    // ImageItem_Grid::{decode_full_grid_image,decode_and_paste_tile_image}
-    // by decoding each `dimg` tile independently, requiring uniform tile
-    // geometry/layout, and pasting tile planes into an output canvas clipped to
-    // the descriptor's output dimensions.
     if grid_data.descriptor.output_width == 0 || grid_data.descriptor.output_height == 0 {
         return Err(DecodeHeicError::InvalidDecodedFrame {
             detail: format!(
@@ -4743,10 +4586,9 @@ fn estimate_heic_grid_sps_decode_bytes(
         .saturating_mul(working_bytes_per_pixel))
 }
 
-/// Estimate the normalized decoder stream plus retained YUV output and decoder
-/// working storage for one tile. Raw SPS geometry is deliberately used here:
-/// a tile-level clean aperture may make the final tile small, but the decoder
-/// must still materialize the uncropped frame first.
+/// Raw SPS geometry is deliberately used here: a tile-level clean aperture
+/// may make the final tile small, but the decoder must still materialize the
+/// uncropped frame first.
 #[cfg(feature = "parallel-grid")]
 fn estimate_heic_grid_tile_decode_bytes(
     tile: &isobmff::HeicGridTileItemData,
@@ -4777,8 +4619,6 @@ fn estimate_heic_grid_tile_decode_bytes(
         .max(1))
 }
 
-/// Choose a pool-aware worker ceiling. Per-tile estimates enforce the memory
-/// bound dynamically in the ordered streaming scheduler.
 #[cfg(feature = "parallel-grid")]
 fn heic_grid_tile_decode_window(remaining_tiles: &[isobmff::HeicGridTileItemData]) -> usize {
     if remaining_tiles.len() <= 1 || cfg!(feature = "decoder-tracing") {
@@ -4844,10 +4684,6 @@ where
         let mut next_estimate = None::<Option<u64>>;
 
         while next_to_consume < inputs.len() {
-            // Prefer a result already buffered for the next row-major
-            // position before admitting more work. Results that race with
-            // admission may still allow bounded speculative decoding, but
-            // they are never exposed to the consumer out of order.
             while let Ok(completion) = receiver.try_recv() {
                 let tile_index = match &completion {
                     HeicGridTileDecodeCompletion::Decoded { tile_index, .. }
@@ -4918,9 +4754,6 @@ where
                 next_estimate = None;
             }
 
-            // An unestimable tile is deliberately not admitted beside other
-            // work. Once all preceding permits drain, decode it synchronously
-            // so its original decoder error remains the next visible result.
             if next_to_schedule == next_to_consume && retained_estimates.is_empty() {
                 let tile_index = first_index + next_to_consume;
                 let tile = decode(&inputs[next_to_consume]).map_err(E::from)?;
@@ -4945,10 +4778,6 @@ where
     })
 }
 
-/// Decode grid tiles with a bounded number of in-flight jobs, but deliver them
-/// to the caller in row-major order. Keeping validation and paste work on the
-/// caller thread preserves deterministic errors and output while independent
-/// HEVC payloads use the available cores.
 fn for_each_decoded_heic_grid_tile<E>(
     grid_data: &isobmff::HeicGridPrimaryItemData,
     first_tile: DecodedHeicImage,
@@ -5078,8 +4907,6 @@ fn decode_primary_heic_grid_to_rgba_image(
 
     let (first_tile, source_bit_depth) = decode_and_validate_heic_grid_first_tile(grid_data)?;
     let reference = HeicGridTileReference::from_first_tile(&first_tile, &grid_data.colr);
-    // Direct orientation is safe for opaque grids. Alpha and clean aperture
-    // stay on the existing source-coordinate transform path.
     let (direct_orientation_transform, output_width, output_height) = if auxiliary_alpha.is_none() {
         heic_grid_rgba_orientation_and_output_dims(descriptor, transforms)?
     } else {
@@ -5295,8 +5122,6 @@ fn validate_heic_grid_descriptor_and_tile_count(
     Ok(())
 }
 
-/// Decode and validate the grid's first tile, returning it together with its
-/// PNG-conversion source bit depth.
 fn decode_and_validate_heic_grid_first_tile(
     grid_data: &isobmff::HeicGridPrimaryItemData,
 ) -> Result<(DecodedHeicImage, u8), DecodeHeicError> {
@@ -5315,9 +5140,6 @@ fn decode_and_validate_heic_grid_first_tile(
     Ok((first_tile, source_bit_depth))
 }
 
-/// Resolve the direct orientation transform for a grid RGBA decode together
-/// with the output dimensions it implies (descriptor dimensions when no
-/// direct transform applies).
 fn heic_grid_rgba_orientation_and_output_dims(
     descriptor: &isobmff::HeicGridDescriptor,
     transforms: &[isobmff::PrimaryItemTransformProperty],
@@ -5340,9 +5162,6 @@ fn heic_grid_rgba_orientation_and_output_dims(
     Ok((orientation_transform, output_width, output_height))
 }
 
-/// Shared 8/16-bit tail of the owned grid RGBA decode: paste every tile,
-/// then either return the directly oriented canvas or run the RGBA-domain
-/// alpha and transform path.
 #[allow(clippy::too_many_arguments)]
 fn finish_heic_grid_rgba_decode<T: Copy + Default>(
     grid_data: &isobmff::HeicGridPrimaryItemData,
@@ -5362,10 +5181,8 @@ fn finish_heic_grid_rgba_decode<T: Copy + Default>(
     let descriptor = &grid_data.descriptor;
     let mut output = vec![T::default(); checked_rgba_sample_count(output_width, output_height)?];
     if !heic_grid_tiles_cover_descriptor(descriptor, reference) {
-        // Match libheif (and the plane-canvas path): pixels no tile covers
-        // are the converted zero-YUV color, not transparent black. The gap
-        // color is uniform, so filling the (possibly oriented) canvas before
-        // pasting is exact.
+        // The gap color is uniform, so filling the (possibly oriented) canvas
+        // before pasting is exact.
         let gap_pixel = heic_grid_gap_rgba_pixel(reference, convert_tile)?;
         for pixel in output.chunks_exact_mut(4) {
             pixel.copy_from_slice(&gap_pixel);
@@ -5448,9 +5265,6 @@ fn validate_decoded_heic_grid_first_tile(
     Ok(())
 }
 
-/// Per-grid reference metadata every tile must match, plus the YCbCr
-/// interpretation used for RGBA conversion (the grid-level colr override,
-/// falling back to the first tile's bitstream metadata).
 #[derive(Clone, Copy, Debug)]
 struct HeicGridTileReference {
     tile_width: u32,
@@ -5484,9 +5298,6 @@ impl HeicGridTileReference {
         }
     }
 
-    /// Reference assembled from the plane-canvas grid output: tiles must
-    /// match the canvas metadata exactly, and no conversion-time colr
-    /// override applies at paste time.
     fn from_output_canvas(output: &DecodedHeicImage, tile_width: u32, tile_height: u32) -> Self {
         Self {
             tile_width,
@@ -5502,8 +5313,6 @@ impl HeicGridTileReference {
     }
 }
 
-/// True when the uniform tile lattice covers every descriptor pixel, so the
-/// paste loops leave no gap pixels behind.
 fn heic_grid_tiles_cover_descriptor(
     descriptor: &isobmff::HeicGridDescriptor,
     reference: &HeicGridTileReference,
@@ -5604,11 +5413,6 @@ fn validate_decoded_heic_grid_tile_reference(
     Ok(())
 }
 
-/// Drive the shared per-tile grid loop: decode each tile (reusing the
-/// pre-decoded first tile), validate it against the reference, apply the
-/// grid-level colr conversion overrides, convert it to RGBA, and compute the
-/// aligned tile origin — then hand it to `paste`. Shared by the owned and
-/// caller-buffer grid paths so their per-tile semantics cannot drift.
 fn for_each_heic_grid_tile_rgba<T: Copy>(
     grid_data: &isobmff::HeicGridPrimaryItemData,
     first_tile: DecodedHeicImage,
@@ -5754,12 +5558,6 @@ struct RgbaOrientationTransform {
     destination_y_offset: i64,
 }
 
-/// A resolved primary-item transform sequence that can map pixels in either
-/// direction without materializing intermediate RGBA images.
-///
-/// Keeping every step (rather than collapsing the sequence into one affine
-/// transform) makes clean-aperture clipping explicit and preserves the exact
-/// transform order used by `apply_primary_item_transforms_rgba`.
 #[derive(Clone, Debug)]
 struct RgbaTransformPlan {
     source_width: u32,
@@ -5889,9 +5687,6 @@ impl RgbaTransformPlan {
         })
     }
 
-    /// True when the plan maps every pixel to itself: no steps were
-    /// recorded, so destination dimensions equal source dimensions by
-    /// construction.
     fn is_identity(&self) -> bool {
         self.steps.is_empty()
     }
@@ -5992,9 +5787,6 @@ impl RgbaTransformPlan {
         source_x: usize,
         source_y: usize,
     ) -> Result<Option<(usize, usize)>, DecodeError> {
-        // Identity fast path, mirroring `map_destination_pixel`: the grid
-        // paste and alpha-seeding loops call this once per pixel and stay
-        // within the plan's source dimensions.
         if self.is_identity() {
             return Ok(Some((source_x, source_y)));
         }
@@ -6329,8 +6121,6 @@ fn rgba_orientation_transform_from_primary_transforms(
     }))
 }
 
-/// Validate that an RGBA paste buffer holds exactly `width x height` pixels
-/// (4 samples per pixel). `role` is "source" or "destination".
 #[allow(clippy::too_many_arguments)]
 fn validate_rgba_paste_buffer_len(
     actual_len: usize,
@@ -6672,11 +6462,6 @@ fn apply_heic_grid_tile_transforms(
     mut decoded: DecodedHeicImage,
     transforms: &[isobmff::PrimaryItemTransformProperty],
 ) -> Result<DecodedHeicImage, DecodeHeicError> {
-    // Provenance: mirrors libheif grid tile decode behavior where each tile
-    // item is decoded with its own item transforms before pasting into the
-    // grid canvas (libheif/libheif/image-items/grid.cc:
-    // ImageItem_Grid::decode_and_paste_tile_image, which calls tile image-item
-    // decode flow applying clap/irot/imir transforms).
     for transform in transforms {
         match transform {
             isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture) => {
@@ -6707,15 +6492,10 @@ fn apply_heic_grid_tile_transforms(
     Ok(decoded)
 }
 
-/// Whether a clean-aperture crop can be applied to the subsampled Y/U/V
-/// planes without shifting the chroma phase of the converted RGBA output.
-///
-/// Provenance: mirrors libheif's crop guard in
-/// libheif/libheif/pixelimage.cc:HeifPixelImage::crop, which converts to
-/// 4:4:4 before cropping when a 4:2:2 crop has an odd left offset or a 4:2:0
-/// crop has an odd left/top offset. Cropping the subsampled planes in those
-/// cases floors the chroma origin, so the later RGBA conversion samples
-/// chroma half a luma sample off from heif-dec output.
+/// libheif converts to 4:4:4 before cropping when a 4:2:2 crop has an odd
+/// left offset or a 4:2:0 crop has an odd left/top offset. Cropping the
+/// subsampled planes in those cases floors the chroma origin, so the later
+/// RGBA conversion samples chroma half a luma sample off from heif-dec output.
 fn heic_clean_aperture_crop_preserves_chroma_phase(
     decoded: &DecodedHeicImage,
     clean_aperture: isobmff::ImageCleanApertureProperty,
@@ -6725,19 +6505,11 @@ fn heic_clean_aperture_crop_preserves_chroma_phase(
         return true;
     }
     let Ok(crop) = clean_aperture_crop_bounds(decoded.width, decoded.height, clean_aperture) else {
-        // Invalid crops also fall back to the RGBA transform path, which
-        // recomputes the bounds and reports the error.
         return false;
     };
     crop.left % i128::from(subsample_x) == 0 && crop.top % i128::from(subsample_y) == 0
 }
 
-/// Apply leading clean-aperture transforms to the subsampled planes when the
-/// crop is chroma-phase-preserving, returning the cropped image and the
-/// transforms that remain for the RGBA path. Cropping before RGBA conversion
-/// keeps peak memory proportional to the cropped geometry; unaligned crops
-/// stay on the RGBA path for pixel parity with libheif (see
-/// [`heic_clean_aperture_crop_preserves_chroma_phase`]).
 fn crop_heic_by_leading_chroma_aligned_clean_apertures(
     mut decoded: DecodedHeicImage,
     mut transforms: &[isobmff::PrimaryItemTransformProperty],
@@ -6758,8 +6530,6 @@ fn crop_heic_by_clean_aperture(
     decoded: DecodedHeicImage,
     clean_aperture: isobmff::ImageCleanApertureProperty,
 ) -> Result<DecodedHeicImage, DecodeHeicError> {
-    // Bounds come from the same helper as the RGBA transform path so the two
-    // crop semantics cannot drift; only the error type differs here.
     let crop = clean_aperture_crop_bounds(decoded.width, decoded.height, clean_aperture).map_err(
         |source| DecodeHeicError::InvalidDecodedFrame {
             detail: format!(
@@ -7029,11 +6799,6 @@ fn validate_decoded_heic_image_against_metadata(
     decoded: &DecodedHeicImage,
     metadata: &DecodedHeicImageMetadata,
 ) -> Result<(), DecodeHeicError> {
-    // Provenance: mirrors libheif's decoder metadata expectations where HEVC
-    // coded-image chroma/bit-depth metadata is exposed by
-    // Decoder_HEVC::{get_coded_image_colorspace,get_luma_bits_per_pixel,get_chroma_bits_per_pixel}
-    // and backend output planes are materialized in
-    // plugins/decoder_libde265.cc:convert_libde265_image_to_heif_image.
     if decoded.width != metadata.width || decoded.height != metadata.height {
         return Err(DecodeHeicError::DecodedGeometryMismatch {
             expected_width: metadata.width,
@@ -7181,10 +6946,6 @@ fn heic_frame_to_internal_image(frame: HeicFrame) -> Result<DecodedHeicImage, De
         bit_depth_luma: bit_depth,
         bit_depth_chroma: bit_depth,
         layout,
-        // Provenance: mirror libheif decoder-plugin color handoff where
-        // bitstream-derived range/matrix metadata is attached when available
-        // (libheif/libheif/plugins/decoder_libde265.cc:
-        // de265_get_image_{full_range_flag,matrix_coefficients}).
         ycbcr_range,
         ycbcr_matrix,
         y_plane,
@@ -7387,10 +7148,6 @@ fn parse_length_prefixed_hevc_nal_units(
 fn decode_hevc_stream_metadata_from_sps(
     stream: &[u8],
 ) -> Result<DecodedHeicImageMetadata, DecodeHeicError> {
-    // Provenance: length-prefixed NAL iteration mirrors libheif's decoder
-    // plugin handoff loop in libheif/libheif/plugins/decoder_libde265.cc
-    // (libde265_v2_push_data/libde265_v1_push_data2), while SPS parsing is
-    // delegated to the pure-Rust scuffle-h265 backend.
     for nal_unit in parse_length_prefixed_hevc_nal_units(stream)? {
         if nal_unit.class() != HevcNalClass::ParameterSet {
             continue;
@@ -7404,8 +7161,6 @@ fn decode_hevc_stream_metadata_from_sps(
     Err(DecodeHeicError::MissingSpsNalUnit)
 }
 
-/// Parse decoded-image metadata from a single SPS NAL unit; `nal_offset` is
-/// only used to locate parse failures in error details.
 fn hevc_metadata_from_sps_nal(
     nal_bytes: &[u8],
     nal_offset: usize,
@@ -7469,10 +7224,6 @@ fn hevc_metadata_from_sps(
     })
 }
 
-/// Parse the SPS from the hvcC parameter-set arrays alone, or return `None`
-/// when the arrays carry no SPS (`hev1` items may keep parameter sets only
-/// in-stream). Selection matches the assembled-stream scan: first NAL whose
-/// own header says SPS, in hvcC array order.
 #[cfg(feature = "image-integration")]
 fn hevc_sps_from_hvcc_nal_arrays(
     hvcc: &isobmff::HevcDecoderConfigurationBox,
@@ -7492,8 +7243,6 @@ fn hevc_sps_from_hvcc_nal_arrays(
     Ok(None)
 }
 
-/// Visit hvcC and in-stream NAL units in the same order used to assemble the
-/// decoder stream. Returning `true` stops the walk after the current unit.
 fn walk_hevc_nals_from_hvcc_or_payload(
     hvcc: &isobmff::HevcDecoderConfigurationBox,
     payload: &[u8],
@@ -7522,10 +7271,6 @@ fn hevc_metadata_from_hvcc_nal_arrays(
         .transpose()
 }
 
-/// Parse the SPS without assembling a decoder stream: prefer the hvcC
-/// parameter-set arrays, then scan the item payload's length-prefixed NAL
-/// units in place. This visits NAL units in the same order as assembling the
-/// stream and scanning it, but copies no payload bytes.
 #[cfg(feature = "image-integration")]
 fn decode_hevc_sps_from_hvcc_or_payload(
     hvcc: &isobmff::HevcDecoderConfigurationBox,
@@ -7641,10 +7386,6 @@ const ALPHA_AUX_TYPES: [&[u8]; 3] = [
     b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha",
 ];
 
-/// Return `true` when the primary item already carries `irot` or `imir`.
-///
-/// When this is `true`, applying EXIF orientation in addition to decode output may
-/// double-rotate or double-mirror the image.
 pub fn primary_item_has_orientation_transform(input: &[u8]) -> bool {
     let Ok(transforms) = isobmff::parse_primary_item_transform_properties(input) else {
         return false;
@@ -7652,9 +7393,6 @@ pub fn primary_item_has_orientation_transform(input: &[u8]) -> bool {
     transforms_include_orientation(&transforms.transforms)
 }
 
-/// Parse the raw EXIF orientation (`1..=8`) associated with the primary HEIF item.
-///
-/// Returns `None` when no primary-linked EXIF orientation is present.
 pub fn primary_exif_orientation(input: &[u8]) -> Option<u8> {
     let mut source: Option<&mut dyn RandomAccessSource> = None;
     primary_exif_orientation_from_heif(input, &mut source)
@@ -7662,7 +7400,6 @@ pub fn primary_exif_orientation(input: &[u8]) -> Option<u8> {
         .filter(|orientation| (1..=8).contains(orientation))
 }
 
-/// Inspect EXIF orientation and primary-item transform signalling for caller-controlled orientation handling.
 pub fn exif_orientation_hint(input: &[u8]) -> ExifOrientationHint {
     ExifOrientationHint {
         exif_orientation: primary_exif_orientation(input),
@@ -7670,18 +7407,10 @@ pub fn exif_orientation_hint(input: &[u8]) -> ExifOrientationHint {
     }
 }
 
-/// Parse the raw EXIF orientation (`1..=8`) from a HEIF/HEIC file path without decoding pixel data.
-///
-/// This reads container metadata and the EXIF item payload (when present), but does
-/// not decode image planes into RGB/RGBA.
 pub fn primary_exif_orientation_from_path(input_path: &Path) -> Result<Option<u8>, DecodeError> {
     Ok(exif_orientation_hint_from_path(input_path)?.exif_orientation)
 }
 
-/// Inspect EXIF orientation and primary-item transform signalling from a file path.
-///
-/// This path-based variant avoids loading the whole file into memory and avoids
-/// full image decode.
 pub fn exif_orientation_hint_from_path(
     input_path: &Path,
 ) -> Result<ExifOrientationHint, DecodeError> {
@@ -7692,8 +7421,6 @@ pub fn exif_orientation_hint_from_path(
         )));
     }
 
-    // Cheap caller-facing gate: only HEIF/HEIC extensions participate in EXIF
-    // orientation handling. AVIF and unknown extensions short-circuit.
     if !path_extension_is_heif(input_path) {
         return Ok(ExifOrientationHint {
             exif_orientation: None,
@@ -7729,10 +7456,6 @@ pub fn exif_orientation_hint_from_path(
     })
 }
 
-/// Whether an `irot` angle is a no-op rotation. The parser only produces
-/// 0/90/180/270, so only 0 matches in practice; the multiple-of-360 check
-/// keeps this robust should the domain ever widen. Some muxers write the
-/// property redundantly with angle 0.
 fn is_identity_rotation(rotation_ccw_degrees: u16) -> bool {
     rotation_ccw_degrees.is_multiple_of(360)
 }
@@ -7763,8 +7486,6 @@ fn primary_exif_orientation_from_heif(
     None
 }
 
-/// Collect the payloads of every cdsc-linked EXIF candidate item that
-/// describes the primary item (usually zero or one).
 fn primary_exif_item_payloads(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
@@ -7829,9 +7550,6 @@ fn primary_exif_item_payloads(
     payloads
 }
 
-/// Raw TIFF-aligned EXIF block for the primary item, in the shape
-/// `ImageDecoder::exif_metadata` consumers expect (starting at the TIFF
-/// byte-order marker, i.e. what `Orientation::from_exif_chunk` parses).
 #[cfg(feature = "image-integration")]
 pub(crate) fn primary_exif_tiff_payload(input: &[u8]) -> Option<Vec<u8>> {
     let mut source: Option<&mut dyn RandomAccessSource> = None;
@@ -7921,9 +7639,6 @@ fn parse_exif_orientation_from_item_payload(payload: &[u8]) -> Option<u16> {
     None
 }
 
-/// Candidate offsets of the TIFF block inside a HEIF EXIF item payload: the
-/// 4-byte exif_tiff_header_offset prefix, an embedded "Exif\0\0" marker, and
-/// the payload start itself.
 fn exif_item_payload_tiff_start_candidates(payload: &[u8]) -> Vec<usize> {
     let mut candidates = Vec::new();
     if payload.len() >= 4
@@ -7946,8 +7661,6 @@ fn exif_item_payload_tiff_start_candidates(payload: &[u8]) -> Vec<usize> {
     candidates
 }
 
-/// First candidate offset that carries a valid TIFF header, i.e. where the
-/// EXIF block handed to image-crate consumers must start.
 #[cfg(feature = "image-integration")]
 fn exif_item_payload_tiff_start(payload: &[u8]) -> Option<usize> {
     exif_item_payload_tiff_start_candidates(payload)
@@ -7970,8 +7683,6 @@ enum TiffByteOrder {
     BigEndian,
 }
 
-/// Byte order of the TIFF header at `tiff_start`, or `None` when no valid
-/// TIFF header (byte-order marker plus magic) starts there.
 fn tiff_byte_order_at(payload: &[u8], tiff_start: usize) -> Option<TiffByteOrder> {
     let byte_order = payload.get(tiff_start..tiff_start.checked_add(2)?)?;
     let byte_order = match byte_order {
@@ -8061,10 +7772,6 @@ fn decode_primary_avif_auxiliary_alpha_plane(
     expected_height: u32,
     max_pixels: Option<u64>,
 ) -> Option<AvifAuxiliaryAlphaPlane> {
-    // Provenance: mirrors libheif auxiliary alpha linkage in
-    // libheif/libheif/context.cc (`auxl` reference direction and aux-type
-    // filtering) and ImageItem alpha composition flow in
-    // libheif/libheif/image-items/image_item.cc (`decode_image`).
     let iref = resolved.iref.as_ref()?;
     let primary_item_id = resolved.primary_item.item_id;
 
@@ -8190,9 +7897,6 @@ fn decode_primary_heic_auxiliary_alpha_plane_internal(
     expected_height: u32,
     guardrails: &DecodeGuardrails,
 ) -> Result<Option<HeicAuxiliaryAlphaPlane>, DecodeHeicError> {
-    // Provenance: mirrors libheif auxiliary alpha linkage in
-    // libheif/libheif/context.cc (auxl reference direction, auxC alpha-type
-    // filtering) and auxC payload parsing in libheif/libheif/box.cc:Box_auxC::parse.
     let Ok(top_level) = isobmff::parse_boxes(input) else {
         return Ok(None);
     };
@@ -8760,7 +8464,6 @@ fn heic_grid_source_bit_depth_for_png_conversion(
     heic_bit_depth_for_png_conversion_metadata(&metadata)
 }
 
-/// RGBA storage width (8 or 16 bits per sample) for a HEIC source bit depth.
 #[cfg(feature = "image-integration")]
 fn heic_storage_bit_depth(source_bit_depth: u8) -> u8 {
     if source_bit_depth <= 8 { 8 } else { 16 }
@@ -8784,10 +8487,6 @@ fn decoded_rgba_layout_from_heic_geometry(
     })
 }
 
-/// Layout-probe result: the advertised layout plus any primary-item payload
-/// extraction the probe had to perform to compute it. Returning the
-/// extraction lets the deferred pixel decode reuse it instead of copying
-/// every payload out of the container a second time.
 #[cfg(feature = "image-integration")]
 pub(crate) struct RgbaLayoutProbe {
     pub(crate) layout: DecodedRgbaLayout,
@@ -8882,10 +8581,6 @@ fn decode_heif_bytes_to_rgba_layout(
             )?
         }
         isobmff::HeicPrimaryItemDataWithGrid::Coded(item_data) => {
-            // Same preflight and geometry validations as the decode path,
-            // but read the SPS by walking the hvcC arrays / payload NALs in
-            // place instead of assembling (and dropping) a normalized copy
-            // of the whole coded payload.
             let properties = parse_and_validate_heic_coded_item_preflight(input, item_data)?;
             let metadata =
                 decode_hevc_metadata_from_hvcc_or_payload(&properties.hvcc, &item_data.payload)?;
@@ -9054,11 +8749,6 @@ fn decode_primary_heic_grid_to_rgba_output<T: Copy + Default, O: RgbaSampleOutpu
         grid_data.descriptor.output_height,
         transforms,
     )?;
-    // Orientation-only grids map the complete source canvas bijectively. The
-    // tile paste can therefore advance through the destination with one
-    // affine stride per source row instead of interpreting the transform plan
-    // and rechecking coordinates for every pixel. Clean apertures and alpha
-    // composition retain the generic path below.
     let direct_orientation = if auxiliary_alpha.is_none()
         && transforms.iter().all(|transform| {
             !matches!(
@@ -9091,8 +8781,6 @@ fn decode_primary_heic_grid_to_rgba_output<T: Copy + Default, O: RgbaSampleOutpu
     }
 
     let reference = HeicGridTileReference::from_first_tile(&first_tile, &grid_data.colr);
-    // The paste loop indexes the alpha plane's samples directly, so validate
-    // it up front regardless of tile coverage.
     if let Some(alpha) = auxiliary_alpha {
         validate_auxiliary_alpha_plane(
             alpha,
@@ -9307,11 +8995,10 @@ fn paste_heic_grid_tiles_to_transformed_rgba_slice<T: Copy, O: RgbaSampleOutput<
     )
 }
 
-/// Paste one already-converted grid tile when the primary transform is only
-/// an orientation (or identity). Such transforms are affine permutations of
-/// the source canvas, so the destination sample stride is constant across a
-/// source row. All geometry and buffer lengths have been validated by the
-/// caller before entering this hot loop.
+/// Orientation-only transforms are affine permutations of the source canvas,
+/// so the destination sample stride is constant across a source row. All
+/// geometry and buffer lengths have been validated by the caller before
+/// entering this hot loop.
 #[cfg(feature = "image-integration")]
 #[allow(clippy::too_many_arguments)]
 fn paste_direct_grid_rgba_tile_to_output<T: Copy, O: RgbaSampleOutput<T>>(
@@ -9391,10 +9078,6 @@ fn decoded_heic_to_rgba8_slice(
     auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
-    // Identity and clean-aperture-only coded images remain rectangular source
-    // regions. Route those directly through the shared contiguous converter
-    // so its architecture-specific 4:2:0 kernel writes the caller's buffer
-    // without materializing a full-frame RGBA intermediate.
     if auxiliary_alpha.is_none() || transforms.is_empty() {
         let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
         if heic_storage_bit_depth(source_bit_depth) != 8 {
@@ -9745,10 +9428,6 @@ fn decoded_avif_to_rgba16_output<O: RgbaSampleOutput<u16>>(
     )
 }
 
-/// Shared AVIF caller-buffer conversion: transform-plan mapping, YCbCr
-/// conversion, and auxiliary alpha, generic over the source plane sample
-/// type `S` (u8/u16, gated by the wrappers' bit-depth checks) and the RGBA
-/// output sink.
 #[cfg(feature = "image-integration")]
 #[allow(clippy::too_many_arguments)]
 fn decoded_avif_to_rgba_output<S, T, O>(
@@ -10054,9 +9733,6 @@ fn decode_heif_bytes_to_rgba_slice<T>(
         .map_err(DecodeHeicError::ParsePrimaryTransforms)?
         .transforms;
     let mut source: Option<&mut dyn RandomAccessSource> = None;
-    // Reuse the extraction the layout probe already performed (`input` is the
-    // same immutable buffer, so re-extracting could only produce the same
-    // payload copies again).
     let primary_with_grid = match preextracted {
         Some(primary_with_grid) => primary_with_grid,
         None => isobmff::extract_primary_heic_item_data_with_grid(input)
@@ -10085,8 +9761,6 @@ fn decode_heif_bytes_to_rgba_slice<T>(
     }
 }
 
-/// Enforce the input-size guardrail and resolve the input family from the
-/// ftyp brands, falling back to the caller-provided hint.
 fn enforce_and_resolve_input_family(
     input: &[u8],
     hint: Option<HeifInputFamily>,
@@ -10192,15 +9866,10 @@ fn extension_family_hint(path: &Path) -> Option<HeifInputFamily> {
     None
 }
 
-/// Return `true` when the path extension is `.heif`, `.heic`, or `.hif`.
-///
-/// This helper is intended as a cheap caller-side gate before HEIF-specific
-/// metadata handling such as EXIF orientation inspection.
 pub fn path_extension_is_heif(path: &Path) -> bool {
     matches!(extension_family_hint(path), Some(HeifInputFamily::Heif))
 }
 
-/// Return `true` when the path extension is one of `.heif`, `.heic`, `.hif`, or `.avif`.
 pub fn path_extension_is_heif_family(path: &Path) -> bool {
     extension_family_hint(path).is_some()
 }
@@ -10249,8 +9918,6 @@ fn parse_source_top_level_box_header(
         )));
     }
 
-    // Provenance: mirrors libheif header/range checks in
-    // libheif/libheif/box.cc:BoxHeader::parse_header and Box::read.
     let size32 = read_u32_be_from(&probe[0..4]);
     let box_type = [probe[4], probe[5], probe[6], probe[7]];
 
@@ -10429,19 +10096,11 @@ fn detect_input_family_from_ftyp(input: &[u8]) -> Option<HeifInputFamily> {
     None
 }
 
-/// Configurable decode guardrails for bounded ingestion.
-///
-/// Default values are fully unbounded (`None` for all fields). For production
-/// environments, set explicit limits.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DecodeGuardrails {
-    /// Optional maximum accepted input size in bytes for all decode entry points.
     pub max_input_bytes: Option<u64>,
-    /// Optional maximum decoded image area in pixels before RGBA materialization.
     pub max_pixels: Option<u64>,
-    /// Optional cap for bytes spooled from non-seek `Read`/`BufRead` inputs.
     pub max_temp_spool_bytes: Option<u64>,
-    /// Optional directory used for non-seek temp spooling.
     pub temp_spool_directory: Option<PathBuf>,
 }
 
@@ -10627,7 +10286,6 @@ fn decode_read_to_png_with_hint_and_guardrails<R: Read>(
     decode_source_to_png_with_hint_and_guardrails(&mut source, hint, output_path, guardrails)
 }
 
-/// Decode bytes with configurable guardrails into an owned RGBA buffer.
 pub fn decode_bytes_to_rgba_with_guardrails(
     input: &[u8],
     guardrails: DecodeGuardrails,
@@ -10635,13 +10293,10 @@ pub fn decode_bytes_to_rgba_with_guardrails(
     decode_bytes_to_rgba_with_hint_and_guardrails(input, None, guardrails)
 }
 
-/// Decode a HEIF/HEIC/AVIF image from bytes into an owned RGBA buffer.
 pub fn decode_bytes_to_rgba(input: &[u8]) -> Result<DecodedRgbaImage, DecodeError> {
     decode_bytes_to_rgba_with_guardrails(input, DecodeGuardrails::default())
 }
 
-/// Decode coded HEIC/HEIF bytes directly into RGB8, intentionally discarding
-/// auxiliary alpha without allocating an intermediate RGBA buffer.
 pub fn decode_bytes_to_rgb8_with_guardrails(
     input: &[u8],
     guardrails: DecodeGuardrails,
@@ -10649,12 +10304,10 @@ pub fn decode_bytes_to_rgb8_with_guardrails(
     decode_bytes_to_rgb8_with_hint_and_guardrails(input, Some(HeifInputFamily::Heif), guardrails)
 }
 
-/// Decode coded HEIC/HEIF bytes directly into an owned RGB8 buffer.
 pub fn decode_bytes_to_rgb8(input: &[u8]) -> Result<DecodedRgbImage, DecodeError> {
     decode_bytes_to_rgb8_with_guardrails(input, DecodeGuardrails::default())
 }
 
-/// Decode a `Read` source with configurable guardrails into an owned RGBA buffer.
 pub fn decode_read_to_rgba_with_guardrails<R: Read>(
     input_reader: R,
     guardrails: DecodeGuardrails,
@@ -10662,12 +10315,10 @@ pub fn decode_read_to_rgba_with_guardrails<R: Read>(
     decode_read_to_rgba_with_hint_and_guardrails(input_reader, None, guardrails)
 }
 
-/// Decode a HEIF/HEIC/AVIF image from a `Read` input into an owned RGBA buffer.
 pub fn decode_read_to_rgba<R: Read>(input_reader: R) -> Result<DecodedRgbaImage, DecodeError> {
     decode_read_to_rgba_with_guardrails(input_reader, DecodeGuardrails::default())
 }
 
-/// Decode a `BufRead` source with configurable guardrails into an owned RGBA buffer.
 pub fn decode_bufread_to_rgba_with_guardrails<R: BufRead>(
     input_reader: R,
     guardrails: DecodeGuardrails,
@@ -10675,14 +10326,12 @@ pub fn decode_bufread_to_rgba_with_guardrails<R: BufRead>(
     decode_read_to_rgba_with_hint_and_guardrails(input_reader, None, guardrails)
 }
 
-/// Decode a HEIF/HEIC/AVIF image from a `BufRead` input into an owned RGBA buffer.
 pub fn decode_bufread_to_rgba<R: BufRead>(
     input_reader: R,
 ) -> Result<DecodedRgbaImage, DecodeError> {
     decode_bufread_to_rgba_with_guardrails(input_reader, DecodeGuardrails::default())
 }
 
-/// Decode `input_path` with configurable guardrails into an owned RGBA buffer.
 pub fn decode_path_to_rgba_with_guardrails(
     input_path: &Path,
     guardrails: DecodeGuardrails,
@@ -10701,13 +10350,10 @@ pub fn decode_path_to_rgba_with_guardrails(
     )
 }
 
-/// Decode a HEIF/HEIC/AVIF image from `input_path` into an owned RGBA buffer.
 pub fn decode_path_to_rgba(input_path: &Path) -> Result<DecodedRgbaImage, DecodeError> {
     decode_path_to_rgba_with_guardrails(input_path, DecodeGuardrails::default())
 }
 
-/// Decode a coded HEIC/HEIF path directly into RGB8 with configurable
-/// guardrails, intentionally discarding auxiliary alpha.
 pub fn decode_path_to_rgb8_with_guardrails(
     input_path: &Path,
     guardrails: DecodeGuardrails,
@@ -10726,17 +10372,14 @@ pub fn decode_path_to_rgb8_with_guardrails(
     )
 }
 
-/// Decode a coded HEIC/HEIF path directly into an owned RGB8 buffer.
 pub fn decode_path_to_rgb8(input_path: &Path) -> Result<DecodedRgbImage, DecodeError> {
     decode_path_to_rgb8_with_guardrails(input_path, DecodeGuardrails::default())
 }
 
-/// Backward-compatible alias for [`decode_path_to_rgba`].
 pub fn decode_file_to_rgba(input_path: &Path) -> Result<DecodedRgbaImage, DecodeError> {
     decode_path_to_rgba(input_path)
 }
 
-/// Decode bytes with configurable guardrails and write a PNG to `output_path`.
 pub fn decode_bytes_to_png_with_guardrails(
     input: &[u8],
     output_path: &Path,
@@ -10745,12 +10388,10 @@ pub fn decode_bytes_to_png_with_guardrails(
     decode_bytes_to_png_with_hint_and_guardrails(input, None, output_path, guardrails)
 }
 
-/// Decode a HEIF/HEIC/AVIF image from bytes and write a PNG to `output_path`.
 pub fn decode_bytes_to_png(input: &[u8], output_path: &Path) -> Result<(), DecodeError> {
     decode_bytes_to_png_with_guardrails(input, output_path, DecodeGuardrails::default())
 }
 
-/// Decode a `Read` source with configurable guardrails and write a PNG.
 pub fn decode_read_to_png_with_guardrails<R: Read>(
     input_reader: R,
     output_path: &Path,
@@ -10759,12 +10400,10 @@ pub fn decode_read_to_png_with_guardrails<R: Read>(
     decode_read_to_png_with_hint_and_guardrails(input_reader, None, output_path, guardrails)
 }
 
-/// Decode a HEIF/HEIC/AVIF image from a `Read` input and write a PNG to `output_path`.
 pub fn decode_read_to_png<R: Read>(input_reader: R, output_path: &Path) -> Result<(), DecodeError> {
     decode_read_to_png_with_guardrails(input_reader, output_path, DecodeGuardrails::default())
 }
 
-/// Decode a `BufRead` source with configurable guardrails and write a PNG.
 pub fn decode_bufread_to_png_with_guardrails<R: BufRead>(
     input_reader: R,
     output_path: &Path,
@@ -10773,7 +10412,6 @@ pub fn decode_bufread_to_png_with_guardrails<R: BufRead>(
     decode_read_to_png_with_hint_and_guardrails(input_reader, None, output_path, guardrails)
 }
 
-/// Decode a HEIF/HEIC/AVIF image from a `BufRead` input and write a PNG to `output_path`.
 pub fn decode_bufread_to_png<R: BufRead>(
     input_reader: R,
     output_path: &Path,
@@ -10781,7 +10419,6 @@ pub fn decode_bufread_to_png<R: BufRead>(
     decode_bufread_to_png_with_guardrails(input_reader, output_path, DecodeGuardrails::default())
 }
 
-/// Decode `input_path` with configurable guardrails and write a PNG to `output_path`.
 pub fn decode_path_to_png_with_guardrails(
     input_path: &Path,
     output_path: &Path,
@@ -10802,17 +10439,14 @@ pub fn decode_path_to_png_with_guardrails(
     )
 }
 
-/// Decode a HEIF/HEIC/AVIF image from `input_path` and write a PNG to `output_path`.
 pub fn decode_path_to_png(input_path: &Path, output_path: &Path) -> Result<(), DecodeError> {
     decode_path_to_png_with_guardrails(input_path, output_path, DecodeGuardrails::default())
 }
 
-/// Backward-compatible alias for [`decode_path_to_png`].
 pub fn decode_file_to_png(input_path: &Path, output_path: &Path) -> Result<(), DecodeError> {
     decode_path_to_png(input_path, output_path)
 }
 
-/// Write an already-decoded RGBA image buffer to PNG.
 pub fn write_decoded_rgba_to_png(
     decoded: &DecodedRgbaImage,
     output_path: &Path,
@@ -10823,9 +10457,6 @@ pub fn write_decoded_rgba_to_png(
 fn primary_icc_profile_from_resolved_avif_graph(
     resolved: &isobmff::ResolvedPrimaryItemGraph<'_>,
 ) -> Option<Vec<u8>> {
-    // Provenance: primary-item colr extraction follows libheif item-property
-    // traversal in libheif/libheif/context.cc, with colr payload parsing from
-    // libheif/libheif/nclx.cc:Box_colr::parse.
     let mut colr = isobmff::PrimaryItemColorProperties::default();
     for property in &resolved.primary_item.properties {
         if property.property.header.box_type.as_bytes() != *b"colr" {
@@ -10849,10 +10480,6 @@ fn primary_icc_profile_from_resolved_avif_graph(
 }
 
 fn primary_icc_profile_from_heic(input: &[u8]) -> Option<Vec<u8>> {
-    // Provenance: primary-item colr extraction follows libheif item-property
-    // traversal in libheif/libheif/context.cc (including the grid item's
-    // first-tile ICC inheritance), with colr payload parsing from
-    // libheif/libheif/nclx.cc:Box_colr::parse.
     isobmff::primary_heic_color_properties(input)
         .and_then(|colr| icc_profile_from_color_properties(&colr))
 }
@@ -10867,8 +10494,6 @@ fn icc_profile_from_color_properties(
     colr.nclx.as_ref().and_then(nclx_to_icc_profile)
 }
 
-/// Canonical ICC PCS D50 illuminant, as the exact s15Fixed16 values required
-/// by ICC.1 (0x0000F6D6, 0x00010000, 0x0000D32D).
 const ICC_D50_X: f64 = 63190.0 / 65536.0;
 const ICC_D50_Z: f64 = 54061.0 / 65536.0;
 
@@ -10943,14 +10568,9 @@ fn nclx_to_icc_profile(nclx: &isobmff::NclxColorProfile) -> Option<Vec<u8>> {
     // stamps the current wall-clock time into bytes 24..36 of every encoded
     // ICC header, ignoring ColorProfile::creation_date_time. Normalize that
     // dateTimeNumber so separate direct and hook decodes are byte-identical.
-    encoded.get_mut(24..36)?.copy_from_slice(&[
-        0x07, 0xB2, // 1970
-        0, 1, // January
-        0, 1, // first day
-        0, 0, // 00 hours
-        0, 0, // 00 minutes
-        0, 0, // 00 seconds
-    ]);
+    encoded
+        .get_mut(24..36)?
+        .copy_from_slice(&[0x07, 0xB2, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
     Some(encoded)
 }
 
@@ -10961,11 +10581,6 @@ fn ycbcr_range_from_primary_colr(colr: &isobmff::PrimaryItemColorProperties) -> 
 fn ycbcr_range_override_from_primary_colr(
     colr: &isobmff::PrimaryItemColorProperties,
 ) -> Option<YCbCrRange> {
-    // Provenance: mirrors libheif container color-profile override semantics:
-    // if no primary-item nclx exists (or it is "undefined"), decoder-provided
-    // stream metadata remains in effect (libheif/libheif/color-conversion/
-    // yuv2rgb.cc:Op_YCbCr_to_RGB::convert_colorspace and
-    // libheif/libheif/plugins/decoder_libde265.cc color-profile population).
     colr.nclx
         .as_ref()
         .filter(|nclx| !nclx.is_undefined())
@@ -10987,8 +10602,6 @@ fn ycbcr_matrix_from_primary_colr(
 fn ycbcr_matrix_override_from_primary_colr(
     colr: &isobmff::PrimaryItemColorProperties,
 ) -> Option<YCbCrMatrixCoefficients> {
-    // Provenance: default/parsed matrix metadata mirrors libheif nclx handling in
-    // libheif/libheif/nclx.cc:{nclx_profile::set_undefined,Box_colr::parse}.
     colr.nclx
         .as_ref()
         .filter(|nclx| !nclx.is_undefined())
@@ -11010,8 +10623,6 @@ struct YCbCrToRgbCoefficients {
     g_cb_fp8: i32,
     g_cr_fp8: i32,
     b_cb_fp8: i32,
-    // f32 coefficients computed with f32 arithmetic, matching libheif's
-    // get_YCbCr_to_RGB_coefficients exactly (used by the float kernels).
     r_cr_f32: f32,
     g_cb_f32: f32,
     g_cr_f32: f32,
@@ -11030,9 +10641,6 @@ struct ColourPrimaries {
     white_y: f32,
 }
 
-// Provenance: default conversion constants/mapping align with libheif's
-// YCbCr->RGB defaults in libheif/libheif/nclx.cc
-// (YCbCr_to_RGB_coefficients::defaults).
 const DEFAULT_YCBCR_TO_RGB_COEFFICIENTS: YCbCrToRgbCoefficients = YCbCrToRgbCoefficients {
     r_cr_fp8: 359,
     g_cb_fp8: -88,
@@ -11047,15 +10655,12 @@ const DEFAULT_YCBCR_TO_RGB_COEFFICIENTS: YCbCrToRgbCoefficients = YCbCrToRgbCoef
 fn ycbcr_transform_from_matrix(
     matrix: YCbCrMatrixCoefficients,
 ) -> Result<YCbCrToRgbTransform, u16> {
-    // Provenance: unsupported-matrix behavior follows libheif's RGB-conversion
-    // operation selection in libheif/libheif/color-conversion/yuv2rgb.cc:
-    // Op_YCbCr_to_RGB::state_after_conversion (matrix 11/14 rejected) and the
-    // dedicated matrix-specific paths in convert_colorspace (identity=0, YCgCo=8,
-    // ICTCP=16).
     if matrix.matrix_coefficients == 0 {
         return Ok(YCbCrToRgbTransform::Identity);
     }
 
+    // libheif rejects 11 and 14, and converts 8 (YCgCo) and 16 (ICtCp) through
+    // dedicated paths this decoder does not implement.
     if matches!(matrix.matrix_coefficients, 8 | 11 | 14 | 16) {
         return Err(matrix.matrix_coefficients);
     }
@@ -11070,8 +10675,6 @@ fn ycbcr_coefficients_from_matrix(
     matrix_coefficients: u16,
     colour_primaries: u16,
 ) -> YCbCrToRgbCoefficients {
-    // Provenance: coefficient derivation mirrors
-    // libheif/libheif/nclx.cc:{get_Kr_Kb,get_YCbCr_to_RGB_coefficients}.
     let Some((kr, kb)) = kr_kb_from_matrix(matrix_coefficients, colour_primaries) else {
         return DEFAULT_YCBCR_TO_RGB_COEFFICIENTS;
     };
@@ -11149,7 +10752,6 @@ fn chromaticity_derived_kr_kb(colour_primaries: u16) -> Option<(f32, f32)> {
 }
 
 fn colour_primaries_from_index(primaries_idx: u16) -> Option<ColourPrimaries> {
-    // Provenance: primaries table mirrors libheif/libheif/nclx.cc:get_colour_primaries.
     match primaries_idx {
         1 => Some(ColourPrimaries {
             green_x: 0.300,
@@ -11912,10 +11514,6 @@ fn clean_aperture_crop_bounds(
         ));
     }
 
-    // Provenance: crop rounding/clamp order mirrors libheif's primary decode
-    // transform path in libheif/libheif/image-items/image_item.cc:
-    // ImageItem::decode_image and Box_clap border math in
-    // libheif/libheif/box.cc:{Box_clap::left_rounded,right_rounded,top_rounded,bottom_rounded}.
     let mut left = clap_left_rounded(clean_aperture, width);
     let mut right = clap_right_rounded(clean_aperture, width);
     let mut top = clap_top_rounded(clean_aperture, height);
@@ -12257,9 +11855,6 @@ fn append_normalized_hevc_payload_nals(
     })
 }
 
-/// Walk the length-prefixed NAL units of an item payload in place, calling
-/// `visit` with each unit's payload offset and bytes until it returns `true`
-/// to stop early.
 fn walk_length_prefixed_payload_nals(
     payload: &[u8],
     nal_length_size: usize,
@@ -12840,8 +12435,6 @@ fn convert_heic_to_interleaved_rgb8_region_slice<const CHANNELS: usize>(
                 }
             };
 
-            // 8-bit grayscale: libheif's Op_mono_to_RGB24_32 copies Y to
-            // R=G=B verbatim with no range expansion; mirror that.
             let (r, g, b) = if mono_verbatim {
                 let y_u16 = y_sample.clamp(0, 255) as u16;
                 (y_u16, y_u16, y_u16)
@@ -13530,11 +13123,6 @@ impl PreparedYcbcrToRgb {
                 clip_to_bit_depth(i64::from(cb_sample), self.bit_depth),
             ),
             PreparedYcbcrTransform::IdentityLimited { limited_offset } => {
-                // Provenance: limited-range identity handling mirrors
-                // libheif/libheif/color-conversion/yuv2rgb.cc:
-                // Op_YCbCr_to_RGB::convert_colorspace and
-                // libheif/libheif/common_utils.h:clip_f_u16, in f32 like
-                // libheif itself.
                 let r = (cr_sample as f32 - limited_offset) * 1.1429_f32;
                 let g = (y_sample as f32 - limited_offset) * 1.1689_f32;
                 let b = (cb_sample as f32 - limited_offset) * 1.1429_f32;
@@ -13590,11 +13178,7 @@ impl PreparedYcbcrToRgb {
                 limited_offset,
                 chroma_midpoint,
             } => {
-                // Provenance: limited-range matrix conversion mirrors
-                // libheif/libheif/color-conversion/yuv2rgb.cc:
-                // Op_YCbCr_to_RGB::convert_colorspace and
-                // libheif/libheif/common_utils.h:clip_f_u16, evaluated in f32
-                // (with FMA fusion) exactly like libheif's compiled kernel.
+                // Evaluated in f32 (with FMA fusion) exactly like libheif's compiled kernel.
                 let yv = (y_sample as f32 - limited_offset) * 1.1689_f32;
                 let cb = (cb_sample as f32 - chroma_midpoint) * 1.1429_f32;
                 let cr = (cr_sample as f32 - chroma_midpoint) * 1.1429_f32;
@@ -13732,8 +13316,6 @@ impl Drop for DecoderPictureGuard {
     }
 }
 
-/// Parse the coded bit depth (8, 10, or 12) from the AV1 sequence header in
-/// raw OBU bytes, or `None` when the bytes contain no sequence header.
 #[cfg(feature = "image-integration")]
 fn av1_sequence_header_bit_depth(obus: &[u8]) -> Option<u8> {
     if obus.is_empty() {
@@ -14151,8 +13733,6 @@ mod tests {
         };
 
         let icc = nclx_to_icc_profile(&nclx).expect("expected synthesized ICC");
-        // ICC requires 4-byte-aligned tag data; moxcms writes tags unpadded,
-        // so misalignment would surface as an unpadded profile length.
         assert_eq!(icc.len() % 4, 0);
         let parsed = ColorProfile::new_from_slice(&icc).expect("synthesized ICC should parse");
 
@@ -14160,10 +13740,8 @@ mod tests {
         let cicp = parsed.cicp.expect("synthesized ICC should carry CICP");
         assert_eq!(cicp.color_primaries, CicpColorPrimaries::Smpte432);
         assert_eq!(cicp.transfer_characteristics, TransferCharacteristics::Srgb);
-        // The cicp tag describes the decoded RGB output, not the coded YCbCr.
         assert_eq!(cicp.matrix_coefficients, MatrixCoefficients::Identity);
         assert!(cicp.full_range);
-        // ICC v4 required tags (ColorSync's validator flags their absence).
         assert!(parsed.media_white_point.is_some());
         assert!(parsed.description.is_some());
         assert!(parsed.copyright.is_some());
@@ -14613,20 +14191,12 @@ mod tests {
         }
     }
 
-    /// The layout probe's assembly-free SPS read: hvcC parameter sets are
-    /// preferred, and `hev1`-style payloads whose parameter sets live only
-    /// in-stream are scanned in place. Exercised here because real hev1
-    /// files are rare enough that the verify corpus may not cover the
-    /// fallback.
     #[cfg(feature = "image-integration")]
     #[test]
     fn hevc_probe_metadata_scans_payload_when_hvcc_lacks_sps() {
         use super::DecodeHeicError;
         use super::isobmff::HevcNalArray;
 
-        // hvcC carrying only a VPS (type 32): the probe must fall back to
-        // the payload, find the SPS NAL (type 33) by its own header, and
-        // report its parse failure at the payload offset.
         let vps_only = test_hvcc(
             vec![HevcNalArray {
                 array_completeness: true,
@@ -14641,15 +14211,12 @@ mod tests {
             Err(DecodeHeicError::SpsParseFailed { offset: 4, .. })
         ));
 
-        // No SPS in hvcC or payload.
         let payload_without_sps = [0, 0, 0, 2, 0x40, 0x01];
         assert!(matches!(
             super::decode_hevc_metadata_from_hvcc_or_payload(&vps_only, &payload_without_sps),
             Err(DecodeHeicError::MissingSpsNalUnit)
         ));
 
-        // An hvcC SPS wins before any payload bytes are considered: the
-        // truncated SPS in hvcC is reported at offset 0, not the payload's.
         let sps_in_hvcc = test_hvcc(
             vec![HevcNalArray {
                 array_completeness: true,
@@ -14663,7 +14230,6 @@ mod tests {
             Err(DecodeHeicError::SpsParseFailed { offset: 0, .. })
         ));
 
-        // Malformed payload structure still fails loudly during the scan.
         assert!(matches!(
             super::decode_hevc_metadata_from_hvcc_or_payload(&vps_only, &[0, 0]),
             Err(DecodeHeicError::TruncatedNalLengthField { .. })
@@ -14673,8 +14239,6 @@ mod tests {
             Err(DecodeHeicError::TruncatedNalUnit { .. })
         ));
 
-        // nal_length_size outside 1..=4 is rejected up front, matching the
-        // stream-assembly path.
         let bad_length_size = test_hvcc(Vec::new(), 0);
         assert!(matches!(
             super::decode_hevc_metadata_from_hvcc_or_payload(&bad_length_size, &payload_with_sps),
@@ -14693,15 +14257,11 @@ mod tests {
         assert_eq!(super::av1_sequence_header_bit_depth(&eight_bit), Some(8));
         assert_eq!(super::av1_sequence_header_bit_depth(&ten_bit), Some(10));
         assert_eq!(super::av1_sequence_header_bit_depth(&[]), None);
-        // A lone temporal delimiter has no sequence header to find.
         assert_eq!(super::av1_sequence_header_bit_depth(&[0x12, 0x00]), None);
     }
 
     #[test]
     fn grid_gap_pixel_matches_plane_canvas_conversion() {
-        // libheif composes grids on a zero-filled YUV canvas and converts the
-        // whole canvas, so tile-uncovered pixels must decode to the converted
-        // all-zero sample (opaque), never transparent black.
         let reference = super::HeicGridTileReference {
             tile_width: 3,
             tile_height: 2,
@@ -14717,8 +14277,6 @@ mod tests {
             super::heic_grid_gap_rgba_pixel(&reference, super::convert_heic_to_rgba8_into)
                 .expect("gap pixel conversion should succeed");
 
-        // Reference: a zero-filled 2x2 plane canvas converted whole, exactly
-        // what the plane-canvas grid path produces for gap pixels.
         let zero_canvas = super::DecodedHeicImage {
             width: 2,
             height: 2,
@@ -14746,8 +14304,6 @@ mod tests {
         let converted =
             super::convert_heic_to_rgba8(&zero_canvas).expect("zero canvas should convert");
         assert_eq!(gap_pixel.as_slice(), &converted[..4]);
-        // Opaque, unlike the transparent black a zero-filled RGBA buffer
-        // would produce.
         assert_eq!(gap_pixel[3], u8::MAX);
 
         let descriptor = super::isobmff::HeicGridDescriptor {
@@ -14757,7 +14313,6 @@ mod tests {
             output_width: 10,
             output_height: 2,
         };
-        // 3x3 tiles cover 9 of 10 columns: gap fill required.
         assert!(!super::heic_grid_tiles_cover_descriptor(
             &descriptor,
             &reference
@@ -14774,9 +14329,6 @@ mod tests {
 
     #[test]
     fn unaligned_grid_tile_origin_is_rejected() {
-        // Mirrors the plane-canvas paste path: tile origins that are not
-        // chroma-aligned must fail loudly instead of silently pasting tiles
-        // whose seams sample chroma with a shifted phase.
         assert!(
             super::validate_heic_grid_tile_origin_alignment(super::HeicPixelLayout::Yuv420, 99, 0)
                 .is_err()
@@ -14790,7 +14342,6 @@ mod tests {
                 .is_ok()
         );
 
-        // 4:2:2 chroma is only horizontally subsampled.
         assert!(
             super::validate_heic_grid_tile_origin_alignment(super::HeicPixelLayout::Yuv422, 99, 0)
                 .is_err()
@@ -14800,7 +14351,6 @@ mod tests {
                 .is_ok()
         );
 
-        // 4:4:4 and monochrome have no subsampling to misalign.
         assert!(
             super::validate_heic_grid_tile_origin_alignment(super::HeicPixelLayout::Yuv444, 99, 99)
                 .is_ok()
@@ -14811,15 +14361,6 @@ mod tests {
         );
     }
 
-    // Clean-aperture chroma-phase tests: libheif refuses to crop subsampled
-    // planes when the crop origin is chroma-unaligned and converts to 4:4:4
-    // first (libheif/libheif/pixelimage.cc:HeifPixelImage::crop), so the
-    // YUV-space clap fast path must only run for aligned crops; unaligned
-    // crops fall back to cropping after RGBA conversion.
-
-    /// 8x8 test image whose luma and chroma gradients stay far from the
-    /// clamping range, so a one-sample chroma phase shift always changes the
-    /// converted RGBA output.
     fn synthetic_yuv_image(layout: super::HeicPixelLayout) -> super::DecodedHeicImage {
         let width = 8_u32;
         let height = 8_u32;
@@ -14866,8 +14407,6 @@ mod tests {
         }
     }
 
-    /// 4x4 clean aperture on the 8x8 test image: the crop origin lands at
-    /// `(horizontal_offset + 2, vertical_offset + 2)`.
     fn synthetic_clean_aperture(
         horizontal_offset: i32,
         vertical_offset: i32,
@@ -14884,8 +14423,6 @@ mod tests {
         }
     }
 
-    /// Reference pixels: full-frame RGBA conversion followed by RGBA-domain
-    /// transforms, the path whose output the clap fast path must reproduce.
     fn rgba8_reference_after_transforms(
         image: &super::DecodedHeicImage,
         transforms: &[isobmff::PrimaryItemTransformProperty],
@@ -14969,7 +14506,7 @@ mod tests {
     #[test]
     fn odd_clean_aperture_crop_falls_back_to_rgba_transform_path() {
         let image = synthetic_yuv_image(super::HeicPixelLayout::Yuv420);
-        let clean_aperture = synthetic_clean_aperture(-1, -1); // origin (1, 1)
+        let clean_aperture = synthetic_clean_aperture(-1, -1);
         assert!(!super::heic_clean_aperture_crop_preserves_chroma_phase(
             &image,
             clean_aperture
@@ -14982,9 +14519,6 @@ mod tests {
             rgba8_reference_after_transforms(&image, &transforms);
         assert_eq!((reference_width, reference_height), (4, 4));
 
-        // The YUV-space crop floors the chroma origin, so its output must
-        // differ from the reference; otherwise this fixture could not detect
-        // a regression that re-enables the fast path for odd offsets.
         let yuv_cropped = super::crop_heic_by_clean_aperture(image.clone(), clean_aperture)
             .expect("YUV clap crop should succeed");
         let phase_shifted =
@@ -15006,7 +14540,7 @@ mod tests {
     #[test]
     fn chroma_aligned_clean_aperture_yuv_crop_matches_rgba_transform_path() {
         let image = synthetic_yuv_image(super::HeicPixelLayout::Yuv420);
-        let clean_aperture = synthetic_clean_aperture(0, 0); // origin (2, 2)
+        let clean_aperture = synthetic_clean_aperture(0, 0);
         assert!(super::heic_clean_aperture_crop_preserves_chroma_phase(
             &image,
             clean_aperture
@@ -15028,9 +14562,9 @@ mod tests {
 
     #[test]
     fn clean_aperture_chroma_phase_guard_mirrors_libheif_conditions() {
-        let odd_left = synthetic_clean_aperture(-1, 0); // origin (1, 2)
-        let odd_top = synthetic_clean_aperture(0, -1); // origin (2, 1)
-        let aligned = synthetic_clean_aperture(0, 0); // origin (2, 2)
+        let odd_left = synthetic_clean_aperture(-1, 0);
+        let odd_top = synthetic_clean_aperture(0, -1);
+        let aligned = synthetic_clean_aperture(0, 0);
 
         let yuv420 = synthetic_yuv_image(super::HeicPixelLayout::Yuv420);
         assert!(!super::heic_clean_aperture_crop_preserves_chroma_phase(
@@ -15043,8 +14577,6 @@ mod tests {
             &yuv420, aligned
         ));
 
-        // 4:2:2 chroma is only horizontally subsampled: an odd top offset
-        // keeps the chroma phase, matching libheif's left-only check.
         let yuv422 = synthetic_yuv_image(super::HeicPixelLayout::Yuv422);
         assert!(!super::heic_clean_aperture_crop_preserves_chroma_phase(
             &yuv422, odd_left
@@ -15053,7 +14585,6 @@ mod tests {
             &yuv422, odd_top
         ));
 
-        // 4:4:4 has no subsampling to misalign.
         let yuv444 = synthetic_yuv_image(super::HeicPixelLayout::Yuv444);
         assert!(super::heic_clean_aperture_crop_preserves_chroma_phase(
             &yuv444, odd_left
@@ -15067,7 +14598,7 @@ mod tests {
     #[test]
     fn odd_clean_aperture_slice_decode_matches_rgba_transform_path() {
         let image = synthetic_yuv_image(super::HeicPixelLayout::Yuv420);
-        let clean_aperture = synthetic_clean_aperture(-1, -1); // origin (1, 1)
+        let clean_aperture = synthetic_clean_aperture(-1, -1);
         let transforms = [isobmff::PrimaryItemTransformProperty::CleanAperture(
             clean_aperture,
         )];
@@ -15284,9 +14815,6 @@ mod tests {
     fn display_p3_profile_expands_red_and_keeps_grays_neutral_in_qcms() {
         let icc = synthesize_nclx_icc(12, 13, 1).expect("expected synthesized ICC");
 
-        // P3 red is more saturated than sRGB red, so mapping into sRGB must
-        // push the red channel up (measured 200 -> 219) without bleeding into
-        // green/blue.
         let red = qcms_through_to_srgb(&icc, [200, 0, 0]);
         assert!(
             (210..=228).contains(&red[0]) && red[1] <= 3 && red[2] <= 3,
@@ -15341,9 +14869,6 @@ mod tests {
 
     #[test]
     fn remaps_bt709_family_transfers_to_srgb() {
-        // H.273 codes 1/6/14/15 share the 709 OETF; still-image consumers
-        // (Apple ColorSync foremost) render that curve as sRGB, so the
-        // synthesized profile must encode sRGB to match them.
         for transfer in [1u16, 6, 14, 15] {
             let nclx = isobmff::NclxColorProfile {
                 colour_primaries: 1,
@@ -15366,7 +14891,6 @@ mod tests {
 
     #[test]
     fn preserves_genuinely_different_transfer_curves() {
-        // PQ is not part of the 709-OETF family and must survive unmapped.
         let nclx = isobmff::NclxColorProfile {
             colour_primaries: 9,
             transfer_characteristics: 16,
@@ -15386,8 +14910,6 @@ mod tests {
 
     #[test]
     fn synthesizes_icc_profile_despite_exotic_matrix_coefficients() {
-        // Matrix coefficients are irrelevant to the RGB colorimetry, so an
-        // unsupported value must not abort ICC synthesis.
         let nclx = isobmff::NclxColorProfile {
             colour_primaries: 1,
             transfer_characteristics: 13,
@@ -15427,10 +14949,6 @@ mod tests {
             "ICC dateTimeNumber must stay pinned to 1970-01-01T00:00:00"
         );
     }
-
-    // Lazy-image-adapter contract tests: uncompressed HEIF must expose a
-    // layout without decoding to owned RGBA, then write pixel-identical output
-    // directly into the caller's slice.
 
     #[test]
     fn eager_decode_supports_minimal_uncompressed_heif() {
