@@ -207,6 +207,210 @@ fn hevc_payload() -> Vec<u8> {
     [&(slice.len() as u32).to_be_bytes()[..], &slice].concat()
 }
 
+fn grid_alpha_fixture(candidates: &[(u16, bool)], tiles_per_side: u8) -> Vec<u8> {
+    grid_alpha_fixture_with_tile(
+        candidates,
+        tiles_per_side,
+        small_hevc_sps(),
+        16,
+        hevc_payload(),
+    )
+}
+
+fn grid_alpha_fixture_with_tile(
+    candidates: &[(u16, bool)],
+    tiles_per_side: u8,
+    sps: Vec<u8>,
+    tile_extent: u16,
+    tile_payload: Vec<u8>,
+) -> Vec<u8> {
+    let candidate_ids: Vec<u16> = (3..).take(candidates.len()).collect();
+    let count = 2 + candidate_ids.len() as u16;
+    let mut info = count.to_be_bytes().to_vec();
+    let mut locations = [vec![0x44, 0], count.to_be_bytes().to_vec()].concat();
+    let mut associations = u32::from(count).to_be_bytes().to_vec();
+    let mut references = Vec::new();
+    let mut data = Vec::new();
+    let output = (tile_extent * u16::from(tiles_per_side)).to_be_bytes();
+    let last_tile = tiles_per_side - 1;
+    let descriptor = [&[0, 0, last_tile, last_tile][..], &output, &output].concat();
+    let coded = [
+        (1, b"hvc1", hevc_payload(), true),
+        (2, b"hvc1", tile_payload, true),
+    ];
+    let grids = candidate_ids
+        .iter()
+        .zip(candidates)
+        .map(|(&id, &(_, alpha))| (id, b"grid", descriptor.clone(), alpha));
+    for (id, kind, payload, alpha) in coded.into_iter().chain(grids) {
+        info.extend(full_box(
+            b"infe",
+            2,
+            &[&id.to_be_bytes()[..], &[0, 0], kind, &[0]].concat(),
+        ));
+        locations.extend_from_slice(&id.to_be_bytes());
+        locations.extend_from_slice(&[0, 1, 0, 0, 0, 1]);
+        locations.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        locations.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        data.extend(payload);
+        associations.extend_from_slice(&id.to_be_bytes());
+        associations.extend_from_slice(match (kind, alpha) {
+            (b"hvc1", _) => &[2, 0x81, 0x82],
+            (_, true) => &[2, 0x82, 0x83],
+            (_, false) => &[1, 0x82],
+        });
+    }
+    for (&id, &(tile_references, _)) in candidate_ids.iter().zip(candidates) {
+        references.extend(boxed(
+            b"auxl",
+            &[id.to_be_bytes(), 1u16.to_be_bytes(), 1u16.to_be_bytes()].concat(),
+        ));
+        let tiles = [2u16.to_be_bytes()].repeat(usize::from(tile_references));
+        references.extend(boxed(
+            b"dimg",
+            &[
+                &id.to_be_bytes()[..],
+                &tile_references.to_be_bytes(),
+                &tiles.concat(),
+            ]
+            .concat(),
+        ));
+    }
+    let properties = [
+        hevc_configuration(sps),
+        ispe(u32::from(tile_extent), u32::from(tile_extent)),
+        full_box(b"auxC", 0, b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0"),
+    ]
+    .concat();
+    let meta = [
+        full_box(b"pitm", 0, &1u16.to_be_bytes()),
+        full_box(b"iinf", 0, &info),
+        full_box(b"iloc", 1, &locations),
+        boxed(
+            b"iprp",
+            &[
+                boxed(b"ipco", &properties),
+                full_box(b"ipma", 0, &associations),
+            ]
+            .concat(),
+        ),
+        boxed(b"idat", &data),
+        full_box(b"iref", 0, &references),
+    ]
+    .concat();
+    [
+        boxed(b"ftyp", &[&b"heic"[..], &[0, 0, 0, 0], b"mif1"].concat()),
+        full_box(b"meta", 0, &meta),
+    ]
+    .concat()
+}
+
+fn decode_grid_alpha_fixture(
+    candidates: &[(u16, bool)],
+    tiles_per_side: u8,
+    guardrails: &DecodeGuardrails,
+) -> Option<HeicAuxiliaryAlphaPlane> {
+    decode_primary_heic_auxiliary_alpha_plane_internal(
+        &grid_alpha_fixture(candidates, tiles_per_side),
+        &mut None,
+        16,
+        16,
+        guardrails,
+    )
+    .unwrap()
+}
+
+fn decode_default_grid_alpha_fixture(
+    candidates: &[(u16, bool)],
+) -> Option<HeicAuxiliaryAlphaPlane> {
+    decode_grid_alpha_fixture(candidates, 1, &DecodeGuardrails::default())
+}
+
+#[test]
+fn coded_primary_keeps_grid_alpha() {
+    let alpha = decode_default_grid_alpha_fixture(&[(1, true)]).unwrap();
+    assert_eq!(
+        (alpha.width, alpha.height, alpha.samples.len()),
+        (16, 16, 256)
+    );
+}
+
+#[test]
+fn only_the_first_grid_alpha_candidate_is_extracted() {
+    assert!(decode_default_grid_alpha_fixture(&[(1, true), (2, true)]).is_some());
+    assert!(decode_default_grid_alpha_fixture(&[(2, true), (1, true)]).is_none());
+}
+
+#[test]
+fn grids_without_alpha_auxc_do_not_use_the_grid_alpha_attempt() {
+    assert!(decode_default_grid_alpha_fixture(&[(1, false), (1, true)]).is_some());
+}
+
+#[test]
+fn grid_alpha_is_held_to_the_callers_guardrails() {
+    let guardrails = DecodeGuardrails {
+        max_pixels: Some(64),
+        ..Default::default()
+    };
+    assert!(decode_grid_alpha_fixture(&[(1, true)], 1, &guardrails).is_none());
+}
+
+#[test]
+fn grid_alpha_of_another_size_is_dropped_before_its_tiles_are_copied() {
+    let tile_payload = [hevc_payload(), vec![0; 256 * 1024]].concat();
+    let input = grid_alpha_fixture_with_tile(&[(4, true)], 2, small_hevc_sps(), 16, tile_payload);
+    let (alpha, largest) = tracked(|| {
+        decode_primary_heic_auxiliary_alpha_plane_internal(
+            &input,
+            &mut None,
+            16,
+            16,
+            &DecodeGuardrails::default(),
+        )
+        .unwrap()
+    });
+    assert!(alpha.is_none());
+    assert!(largest < 256 * 1024, "copied a tile: {largest}");
+}
+
+#[test]
+fn grid_alpha_that_fails_to_decode_is_dropped() {
+    let input = grid_alpha_fixture_with_tile(
+        &[(1, true)],
+        1,
+        small_hevc_sps(),
+        16,
+        hevc_payload_with_nal_header([0x28, 0x09]),
+    );
+    let alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
+        &input,
+        &mut None,
+        16,
+        16,
+        &DecodeGuardrails::default(),
+    );
+    assert!(matches!(alpha, Ok(None)));
+}
+
+#[test]
+fn grid_alpha_allocation_failure_is_propagated() {
+    let input =
+        grid_alpha_fixture_with_tile(&[(1, true)], 1, large_hevc_sps(), 126, hevc_payload());
+    let result = with_allocations_failing_at(128 * 128 * 2, || {
+        decode_primary_heic_auxiliary_alpha_plane_internal(
+            &input,
+            &mut None,
+            126,
+            126,
+            &DecodeGuardrails::default(),
+        )
+    });
+    assert!(matches!(
+        result,
+        Err(DecodeHeicError::AllocationFailed { .. })
+    ));
+}
+
 #[test]
 fn heic_alpha_rejects_coded_geometry_before_plane_allocation() {
     let input = image_fixture(
@@ -262,7 +466,7 @@ fn grid_fixture() -> isobmff::HeicGridPrimaryItemData {
             hvcc: hvcc.into(),
             colr: Default::default(),
             transforms: Default::default(),
-            payload: hevc_payload(),
+            payload: hevc_payload().into(),
         }],
     }
 }
@@ -519,7 +723,8 @@ fn heic_grid_checks_replacement_sps_in_payload() {
         &replacement,
         &hevc_payload(),
     ]
-    .concat();
+    .concat()
+    .into();
     let (result, largest) = tracked(|| decode_primary_heic_grid_to_image(&grid));
     assert!(result.is_err());
     assert!(largest < 128 * 128 * 2);
@@ -836,7 +1041,8 @@ fn grid_with_filler(tile_count: u16, filler_bytes: usize) -> isobmff::HeicGridPr
         &filler,
         &hevc_payload(),
     ]
-    .concat();
+    .concat()
+    .into();
     grid.descriptor.columns = tile_count;
     grid.descriptor.output_width = 16 * u32::from(tile_count);
     for index in 1..tile_count {
@@ -1145,7 +1351,7 @@ fn grid_tile_streams_with_hidden_parameter_sets_decode_strictly() {
             .into(),
         colr: Default::default(),
         transforms: Default::default(),
-        payload: hevc_payload(),
+        payload: hevc_payload().into(),
     };
     let (decoded, largest) = tracked(|| crate::decode_heic_grid_tile_to_image(&tile).unwrap());
     assert_eq!((decoded.width, decoded.height), (16, 16));
@@ -1362,7 +1568,7 @@ fn tiled_grid(
         hvcc: hvcc.into(),
         colr: Default::default(),
         transforms: Default::default(),
-        payload: hevc_payload(),
+        payload: hevc_payload().into(),
     };
     let tile_count = u32::from(columns) * u32::from(rows);
     isobmff::HeicGridPrimaryItemData {
@@ -1470,15 +1676,19 @@ fn heic_grid_narrow_budget_stays_capped_by_max_pixels() {
     ));
 }
 
-fn assert_alpha_ramp(input: &[u8], width: u32, height: u32, x_step: u32) {
-    let decoded = decode_bytes_to_rgba(input).unwrap();
+fn assert_alpha_ramp(
+    decoded: DecodedRgbaImage,
+    width: u32,
+    height: u32,
+    expected_alpha: impl Fn(u32, u32) -> u32,
+) {
     assert_eq!((decoded.width, decoded.height), (width, height));
     let DecodedRgbaPixels::U8(pixels) = decoded.pixels else {
         panic!("expected 8-bit RGBA output");
     };
     for (index, pixel) in pixels.chunks_exact(4).enumerate() {
         let (x, y) = (index as u32 % width, index as u32 / width);
-        let expected = x_step * x + y;
+        let expected = expected_alpha(x, y);
         assert!(
             u32::from(pixel[3]).abs_diff(expected) <= 2,
             "alpha at ({x}, {y}) is {}, expected {expected}",
@@ -1489,15 +1699,30 @@ fn assert_alpha_ramp(input: &[u8], width: u32, height: u32, x_step: u32) {
 
 #[test]
 fn apple_monochrome_alpha_plane_decodes() {
-    assert_alpha_ramp(
-        include_bytes!("testdata/apple-alpha-192x64.heic"),
-        192,
-        64,
-        1,
-    );
+    let decoded = decode_bytes_to_rgba(include_bytes!("testdata/apple-alpha-192x64.heic")).unwrap();
+    assert_alpha_ramp(decoded, 192, 64, |x, y| x + y);
 }
 
 #[test]
 fn apple_alpha_coded_at_the_minimum_frame_size_is_kept() {
-    assert_alpha_ramp(include_bytes!("testdata/apple-alpha-40x30.heic"), 40, 30, 5);
+    let decoded = decode_bytes_to_rgba(include_bytes!("testdata/apple-alpha-40x30.heic")).unwrap();
+    assert_alpha_ramp(decoded, 40, 30, |x, y| 5 * x + y);
+}
+
+#[test]
+fn apple_grid_alpha_is_composed_from_its_tiles() {
+    let input = include_bytes!("testdata/apple-alpha-grid-1030x520.heic");
+    let expected_alpha = |x: u32, y: u32| x * 160 / 1029 + y * 80 / 519;
+    assert_alpha_ramp(
+        decode_bytes_to_rgba(input).unwrap(),
+        1030,
+        520,
+        expected_alpha,
+    );
+    assert_alpha_ramp(
+        decode_read_to_rgba(&input[..]).unwrap(),
+        1030,
+        520,
+        expected_alpha,
+    );
 }

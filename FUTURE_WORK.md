@@ -48,15 +48,12 @@ Pre-existing, unchanged by the audit, measured July 2026:
 A memory-diet pass on the decode pipeline is the biggest resource win
 available if decoding runs server-side.
 
-## 4. Grid-typed and size-mismatched alpha channels
+## 4. Size-mismatched alpha channels
 
-The last known *silent* wrong-output class: an auxiliary alpha image that is
-itself a `grid` item (tiled image with alpha), or an alpha plane whose
-dimensions differ from the primary image, is currently ignored — the output
-renders fully opaque with no error. libheif decodes grid alpha via its
-generic item decode and nearest-neighbor-scales mismatched planes. Either
-implement (route aux items through the grid decode path; scale mismatched
-planes) or at least fail loudly.
+The last known *silent* wrong-output class: an auxiliary alpha plane whose
+dimensions differ from the primary image is currently ignored — the output
+renders fully opaque with no error. libheif nearest-neighbor-scales
+mismatched planes. Either scale them or at least fail loudly.
 
 ## 5. Continuous integration
 
