@@ -2248,6 +2248,7 @@ pub enum ParsePrimaryItemTransformPropertiesError {
     ImageCleanAperture(ParseImageCleanAperturePropertyError),
     ImageRotation(ParseImageRotationPropertyError),
     ImageMirror(ParseImageMirrorPropertyError),
+    DuplicateTransform { item_id: u32, property_type: FourCc },
 }
 
 impl Display for ParsePrimaryItemTransformPropertiesError {
@@ -2262,6 +2263,13 @@ impl Display for ParsePrimaryItemTransformPropertiesError {
             ParsePrimaryItemTransformPropertiesError::ImageCleanAperture(err) => write!(f, "{err}"),
             ParsePrimaryItemTransformPropertiesError::ImageRotation(err) => write!(f, "{err}"),
             ParsePrimaryItemTransformPropertiesError::ImageMirror(err) => write!(f, "{err}"),
+            ParsePrimaryItemTransformPropertiesError::DuplicateTransform {
+                item_id,
+                property_type,
+            } => write!(
+                f,
+                "primary item_ID {item_id} has multiple {property_type} properties"
+            ),
         }
     }
 }
@@ -3371,31 +3379,44 @@ pub fn parse_primary_item_transform_properties(
 pub(crate) fn parse_primary_item_transform_properties_from_resolved_graph(
     resolved: &ResolvedPrimaryItemGraph<'_>,
 ) -> Result<PrimaryItemTransformProperties, ParsePrimaryItemTransformPropertiesError> {
+    let mut transform_types = Vec::new();
     let mut transforms = Vec::new();
     for property in &resolved.primary_item.properties {
         let property_type = property.property.header.box_type;
-        if property_type.as_bytes() == CLAP_BOX_TYPE {
-            transforms.push(PrimaryItemTransformProperty::CleanAperture(
+        let transform = if property_type.as_bytes() == CLAP_BOX_TYPE {
+            PrimaryItemTransformProperty::CleanAperture(
                 property
                     .property
                     .parse_clap()
                     .map_err(ParsePrimaryItemTransformPropertiesError::ImageCleanAperture)?,
-            ));
+            )
         } else if property_type.as_bytes() == IROT_BOX_TYPE {
-            transforms.push(PrimaryItemTransformProperty::Rotation(
+            PrimaryItemTransformProperty::Rotation(
                 property
                     .property
                     .parse_irot()
                     .map_err(ParsePrimaryItemTransformPropertiesError::ImageRotation)?,
-            ));
+            )
         } else if property_type.as_bytes() == IMIR_BOX_TYPE {
-            transforms.push(PrimaryItemTransformProperty::Mirror(
+            PrimaryItemTransformProperty::Mirror(
                 property
                     .property
                     .parse_imir()
                     .map_err(ParsePrimaryItemTransformPropertiesError::ImageMirror)?,
-            ));
+            )
+        } else {
+            continue;
+        };
+        if transform_types.contains(&property_type) {
+            return Err(
+                ParsePrimaryItemTransformPropertiesError::DuplicateTransform {
+                    item_id: resolved.primary_item.item_id,
+                    property_type,
+                },
+            );
         }
+        transform_types.push(property_type);
+        transforms.push(transform);
     }
 
     Ok(PrimaryItemTransformProperties {
@@ -7874,14 +7895,15 @@ mod tests {
     };
     use super::{
         ExtractHeicItemDataError, ExtractUncompressedItemDataError, FourCc,
-        HeicGridPrimaryItemData, HeicPrimaryItemDataWithGrid, IROT_BOX_TYPE, IccColorProfile,
-        NclxColorProfile, ParseItemLocationBoxError, ParseItemPropertyAssociationBoxError,
+        HeicGridPrimaryItemData, HeicPrimaryItemDataWithGrid, IMIR_BOX_TYPE, IROT_BOX_TYPE,
+        IccColorProfile, NclxColorProfile, ParseItemLocationBoxError,
+        ParseItemPropertyAssociationBoxError, ParsePrimaryItemTransformPropertiesError,
         PrimaryItemColorProperties, PrimaryItemTransformProperty,
         extract_primary_heic_item_data_with_grid,
         extract_primary_heic_item_data_with_grid_from_source,
         extract_primary_uncompressed_item_data, extract_primary_uncompressed_item_data_from_source,
         merge_primary_and_grid_tile_color_properties, parse_boxes, parse_iloc_payload,
-        parse_ipma_payload, primary_heic_color_properties,
+        parse_ipma_payload, parse_primary_item_transform_properties, primary_heic_color_properties,
     };
     use std::sync::Arc;
 
@@ -8404,6 +8426,98 @@ mod tests {
                         .unwrap()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn primary_repeated_transform_associations_are_rejected() {
+        let repeats = [2_u8; 255];
+        let extra_repeats: Vec<(u16, &[u8])> = (0..257).map(|_| (1_u16, &repeats[..])).collect();
+
+        for property in [
+            identity_clap_box(),
+            plain_box(b"irot", &[0]),
+            plain_box(b"imir", &[0]),
+        ] {
+            let property_type = FourCc::new(property[4..8].try_into().unwrap());
+            let err = parse_primary_item_transform_properties(&minimal_heic_grid_file(
+                (1, 1),
+                (16, 16),
+                &[2],
+                &[0x11; 16],
+                &[hvcc_box(), property],
+                &[1],
+                &extra_repeats,
+            ))
+            .expect_err("repeated primary transform must be rejected");
+            assert!(
+                matches!(
+                    err,
+                    ParsePrimaryItemTransformPropertiesError::DuplicateTransform {
+                        item_id: 1,
+                        property_type: actual,
+                    } if actual == property_type
+                ),
+                "{property_type}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn primary_distinct_properties_of_one_transform_type_are_rejected() {
+        let err = parse_primary_item_transform_properties(&minimal_heic_grid_file(
+            (1, 1),
+            (16, 16),
+            &[2],
+            &[0x11; 16],
+            &[
+                hvcc_box(),
+                plain_box(b"imir", &[0]),
+                identity_clap_box(),
+                plain_box(b"imir", &[1]),
+            ],
+            &[1],
+            &[(1, &[2, 3, 4])],
+        ))
+        .expect_err("second imir must be rejected");
+        assert!(matches!(
+            err,
+            ParsePrimaryItemTransformPropertiesError::DuplicateTransform {
+                property_type,
+                ..
+            } if property_type.as_bytes() == IMIR_BOX_TYPE
+        ));
+    }
+
+    #[test]
+    fn primary_transforms_keep_one_of_each_type_in_order() {
+        let transforms = parse_primary_item_transform_properties(&minimal_heic_grid_file(
+            (1, 1),
+            (16, 16),
+            &[2],
+            &[0x11; 16],
+            &[
+                hvcc_box(),
+                identity_clap_box(),
+                plain_box(b"irot", &[0]),
+                plain_box(b"imir", &[1]),
+            ],
+            &[1],
+            &[(1, &[2, 3, 4])],
+        ))
+        .expect("one transform of each type is valid")
+        .transforms;
+
+        assert_eq!(
+            transforms
+                .iter()
+                .map(|transform| match transform {
+                    PrimaryItemTransformProperty::CleanAperture(_) => "clap",
+                    PrimaryItemTransformProperty::Rotation(_) => "irot",
+                    PrimaryItemTransformProperty::Mirror(_) => "imir",
+                })
+                .collect::<Vec<_>>(),
+            ["clap", "irot", "imir"]
         );
     }
 
