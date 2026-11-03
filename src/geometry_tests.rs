@@ -259,9 +259,9 @@ fn grid_fixture() -> isobmff::HeicGridPrimaryItemData {
         tiles: vec![isobmff::HeicGridTileItemData {
             item_id: 1,
             construction_method: 1,
-            hvcc,
+            hvcc: hvcc.into(),
             colr: Default::default(),
-            transforms: vec![],
+            transforms: Default::default(),
             payload: hevc_payload(),
         }],
     }
@@ -458,20 +458,19 @@ fn avif_auxiliary_container_geometry_is_checked_before_backend() {
 #[test]
 fn heic_grid_tile_crop_cannot_hide_oversized_coded_frame() {
     let mut grid = grid_fixture();
-    grid.tiles[0]
-        .transforms
-        .push(isobmff::PrimaryItemTransformProperty::CleanAperture(
-            isobmff::ImageCleanApertureProperty {
-                clean_aperture_width_num: 16,
-                clean_aperture_width_den: 1,
-                clean_aperture_height_num: 16,
-                clean_aperture_height_den: 1,
-                horizontal_offset_num: 0,
-                horizontal_offset_den: 1,
-                vertical_offset_num: 0,
-                vertical_offset_den: 1,
-            },
-        ));
+    grid.tiles[0].transforms = [isobmff::PrimaryItemTransformProperty::CleanAperture(
+        isobmff::ImageCleanApertureProperty {
+            clean_aperture_width_num: 16,
+            clean_aperture_width_den: 1,
+            clean_aperture_height_num: 16,
+            clean_aperture_height_den: 1,
+            horizontal_offset_num: 0,
+            horizontal_offset_den: 1,
+            vertical_offset_num: 0,
+            vertical_offset_den: 1,
+        },
+    )]
+    .into();
     let (result, largest) = tracked(|| decode_primary_heic_grid_to_image(&grid));
     assert!(result.is_err());
     assert!(
@@ -494,7 +493,8 @@ fn heic_grid_checks_later_tiles_before_decoding_first_tile() {
     second.item_id = 3;
     second.hvcc = isobmff::parse_boxes(&config).unwrap()[0]
         .parse_hvcc()
-        .unwrap();
+        .unwrap()
+        .into();
     grid.tile_item_ids.push(3);
     grid.tiles.push(second);
     let (result, largest) = tracked(|| decode_primary_heic_grid_to_image(&grid));
@@ -511,7 +511,8 @@ fn heic_grid_checks_replacement_sps_in_payload() {
     let config = hevc_configuration(small_hevc_sps());
     grid.tiles[0].hvcc = isobmff::parse_boxes(&config).unwrap()[0]
         .parse_hvcc()
-        .unwrap();
+        .unwrap()
+        .into();
     let replacement = large_hevc_sps();
     grid.tiles[0].payload = [
         &(replacement.len() as u32).to_be_bytes()[..],
@@ -825,7 +826,8 @@ fn grid_with_filler(tile_count: u16, filler_bytes: usize) -> isobmff::HeicGridPr
     let config = hevc_configuration(small_hevc_sps());
     grid.tiles[0].hvcc = isobmff::parse_boxes(&config).unwrap()[0]
         .parse_hvcc()
-        .unwrap();
+        .unwrap()
+        .into();
     let mut filler = vec![0xffu8; filler_bytes];
     filler[..2].copy_from_slice(&[0x4c, 0x01]);
     *filler.last_mut().unwrap() = 0x80;
@@ -1139,9 +1141,10 @@ fn grid_tile_streams_with_hidden_parameter_sets_decode_strictly() {
         construction_method: 1,
         hvcc: isobmff::parse_boxes(&config).unwrap()[0]
             .parse_hvcc()
-            .unwrap(),
+            .unwrap()
+            .into(),
         colr: Default::default(),
-        transforms: vec![],
+        transforms: Default::default(),
         payload: hevc_payload(),
     };
     let (decoded, largest) = tracked(|| crate::decode_heic_grid_tile_to_image(&tile).unwrap());
@@ -1356,9 +1359,9 @@ fn tiled_grid(
     let first = isobmff::HeicGridTileItemData {
         item_id: 1,
         construction_method: 1,
-        hvcc,
+        hvcc: hvcc.into(),
         colr: Default::default(),
-        transforms: vec![],
+        transforms: Default::default(),
         payload: hevc_payload(),
     };
     let tile_count = u32::from(columns) * u32::from(rows);

@@ -197,7 +197,7 @@ pub(super) fn preflight_grid(
                             "HEVC tile coded geometry exceeds visible geometry padding",
                         ));
                     }
-                    for transform in &tile.transforms {
+                    for transform in tile.transforms.iter() {
                         if let isobmff::PrimaryItemTransformProperty::Rotation(rotation) = transform
                             && rotation.rotation_ccw_degrees % 180 == 90
                         {
