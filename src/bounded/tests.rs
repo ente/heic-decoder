@@ -1251,3 +1251,19 @@ fn rejects_unprofiled_wide_gamut_grid_before_output() {
     assert_eq!(normal.icc_profile, Some(Vec::new()));
     assert_eq!(bounded.image.pixels, normal.pixels);
 }
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn decodes_unprofiled_bt601_color_like_normal_decode() {
+    let payload = hex("2801af78f70403fe65f7f877430938");
+    for sps in [
+        "4201010408000003009fa800000300001ea0884596eaaf2bc05b828302820000030002000003003210",
+        "4201010408000003009fa800000300001ea0884596eaaf2bc05a830303020000030002000003003210",
+    ] {
+        let bytes = fixture(&[configuration(&hex(sps))], &payload, &[]);
+        let normal = crate::decode_bytes_to_rgb8(&bytes).unwrap();
+        let bounded = decode_bounded(BoundedInput::Bytes(&bytes), Default::default()).unwrap();
+        assert_eq!(normal.icc_profile, None);
+        assert_eq!(bounded.image.pixels, normal.pixels);
+    }
+}
