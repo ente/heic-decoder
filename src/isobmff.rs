@@ -2830,6 +2830,11 @@ pub enum ExtractHeicItemDataError {
         item_id: u32,
         tile_item_id: u32,
     },
+    DuplicateGridTileTransform {
+        item_id: u32,
+        tile_item_id: u32,
+        property_type: FourCc,
+    },
     GridTileAssociationCountTooLarge {
         item_id: u32,
         total: usize,
@@ -2993,6 +2998,14 @@ impl Display for ExtractHeicItemDataError {
             } => write!(
                 f,
                 "primary grid item_ID {item_id} tile item_ID {tile_item_id} has multiple hvcC properties"
+            ),
+            ExtractHeicItemDataError::DuplicateGridTileTransform {
+                item_id,
+                tile_item_id,
+                property_type,
+            } => write!(
+                f,
+                "primary grid item_ID {item_id} tile item_ID {tile_item_id} has multiple {property_type} properties"
             ),
             ExtractHeicItemDataError::GridTileAssociationCountTooLarge { item_id, total } => {
                 write!(
@@ -4669,6 +4682,7 @@ fn resolve_grid_tile_hvcc_colr_and_transforms_indexed(
     let mut hvcc = None;
     let mut last_nclx = None;
     let mut last_icc = None;
+    let mut transform_types = Vec::new();
     let mut transforms = Vec::new();
 
     for association in associations {
@@ -4704,7 +4718,24 @@ fn resolve_grid_tile_hvcc_colr_and_transforms_indexed(
                 ColorInformation::Nclx(_) => last_nclx = Some(property_index),
                 ColorInformation::Icc(_) => last_icc = Some(property_index),
             },
-            CachedGridProperty::Transform(transform) => transforms.push(*transform),
+            CachedGridProperty::Transform(transform) => {
+                let property_type = property.header.box_type;
+                if transform_types.contains(&property_type) {
+                    return Err(ExtractHeicItemDataError::DuplicateGridTileTransform {
+                        item_id,
+                        tile_item_id,
+                        property_type,
+                    });
+                }
+                transform_types.push(property_type);
+                if !matches!(
+                    transform,
+                    PrimaryItemTransformProperty::Rotation(rotation)
+                        if rotation.rotation_ccw_degrees.is_multiple_of(360)
+                ) {
+                    transforms.push(*transform);
+                }
+            }
             CachedGridProperty::Ignored => {}
         }
     }
@@ -7843,13 +7874,14 @@ mod tests {
     };
     use super::{
         ExtractHeicItemDataError, ExtractUncompressedItemDataError, FourCc,
-        HeicGridPrimaryItemData, HeicPrimaryItemDataWithGrid, IccColorProfile, NclxColorProfile,
-        ParseItemLocationBoxError, ParseItemPropertyAssociationBoxError,
-        PrimaryItemColorProperties, extract_primary_heic_item_data_with_grid,
+        HeicGridPrimaryItemData, HeicPrimaryItemDataWithGrid, IROT_BOX_TYPE, IccColorProfile,
+        NclxColorProfile, ParseItemLocationBoxError, ParseItemPropertyAssociationBoxError,
+        PrimaryItemColorProperties, PrimaryItemTransformProperty,
+        extract_primary_heic_item_data_with_grid,
         extract_primary_heic_item_data_with_grid_from_source,
         extract_primary_uncompressed_item_data, extract_primary_uncompressed_item_data_from_source,
-        merge_primary_and_grid_tile_color_properties, parse_iloc_payload, parse_ipma_payload,
-        primary_heic_color_properties,
+        merge_primary_and_grid_tile_color_properties, parse_boxes, parse_iloc_payload,
+        parse_ipma_payload, primary_heic_color_properties,
     };
     use std::sync::Arc;
 
@@ -8248,28 +8280,130 @@ mod tests {
 
     #[test]
     fn grid_tile_transforms_are_shared_across_duplicate_references() {
-        let mut tile_property_indices = vec![1_u8];
-        tile_property_indices.extend([2_u8; 254]);
-        let rotations = [2_u8; 255];
-        let extra_rotations: Vec<(u16, &[u8])> =
-            (0..256).map(|_| (2_u16, &rotations[..])).collect();
-
         let grid = resolved_grid(&minimal_heic_grid_file(
             (16, 16),
             (64, 64),
             &[2_u16; 256],
             &[0x11; 16],
             &[hvcc_box(), plain_box(b"irot", &[1])],
-            &tile_property_indices,
-            &extra_rotations,
+            &[1, 2],
+            &[],
         ));
 
         assert_eq!(grid.tiles.len(), 256);
-        assert_eq!(grid.tiles[0].transforms.len(), 254 + 256 * 255);
+        assert_eq!(grid.tiles[0].transforms.len(), 1);
         assert!(
             grid.tiles
                 .iter()
                 .all(|tile| Arc::ptr_eq(&tile.transforms, &grid.tiles[0].transforms))
+        );
+    }
+
+    fn identity_clap_box() -> Vec<u8> {
+        let fields: [u32; 8] = [16, 1, 16, 1, 0, 1, 0, 1];
+        plain_box(
+            b"clap",
+            &fields
+                .iter()
+                .flat_map(|field| field.to_be_bytes())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn grid_tile_repeated_transform_associations_are_rejected() {
+        let mut tile_property_indices = vec![1_u8];
+        tile_property_indices.extend([2_u8; 254]);
+        let repeats = [2_u8; 255];
+        let extra_repeats: Vec<(u16, &[u8])> = (0..256).map(|_| (2_u16, &repeats[..])).collect();
+
+        for property in [
+            identity_clap_box(),
+            plain_box(b"irot", &[0]),
+            plain_box(b"imir", &[0]),
+        ] {
+            let property_type = FourCc::new(property[4..8].try_into().unwrap());
+            let err = extract_primary_heic_item_data_with_grid(&minimal_heic_grid_file(
+                (16, 16),
+                (256, 256),
+                &[2_u16; 256],
+                &[0x11; 16],
+                &[hvcc_box(), property],
+                &tile_property_indices,
+                &extra_repeats,
+            ))
+            .expect_err("repeated tile transform must be rejected");
+            assert!(
+                matches!(
+                    err,
+                    ExtractHeicItemDataError::DuplicateGridTileTransform {
+                        tile_item_id: 2,
+                        property_type: actual,
+                        ..
+                    } if actual == property_type
+                ),
+                "{property_type}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn grid_tile_distinct_properties_of_one_transform_type_are_rejected() {
+        let err = extract_primary_heic_item_data_with_grid(&minimal_heic_grid_file(
+            (1, 1),
+            (64, 64),
+            &[2],
+            &[0x11; 16],
+            &[
+                hvcc_box(),
+                plain_box(b"irot", &[0]),
+                identity_clap_box(),
+                plain_box(b"irot", &[2]),
+            ],
+            &[1, 2, 3, 4],
+            &[],
+        ))
+        .expect_err("second irot must be rejected");
+        assert!(matches!(
+            err,
+            ExtractHeicItemDataError::DuplicateGridTileTransform {
+                property_type,
+                ..
+            } if property_type.as_bytes() == IROT_BOX_TYPE
+        ));
+    }
+
+    #[test]
+    fn grid_tile_transforms_keep_one_per_type_and_drop_identity_rotations() {
+        let grid = resolved_grid(&minimal_heic_grid_file(
+            (16, 16),
+            (256, 256),
+            &[2_u16; 256],
+            &[0x11; 16],
+            &[
+                hvcc_box(),
+                plain_box(b"irot", &[0]),
+                identity_clap_box(),
+                plain_box(b"imir", &[1]),
+            ],
+            &[1, 2, 3, 4],
+            &[],
+        ));
+
+        assert_eq!(
+            grid.tiles[0].transforms.as_ref(),
+            [
+                PrimaryItemTransformProperty::CleanAperture(
+                    parse_boxes(&identity_clap_box()).unwrap()[0]
+                        .parse_clap()
+                        .unwrap()
+                ),
+                PrimaryItemTransformProperty::Mirror(
+                    parse_boxes(&plain_box(b"imir", &[1])).unwrap()[0]
+                        .parse_imir()
+                        .unwrap()
+                ),
+            ]
         );
     }
 
