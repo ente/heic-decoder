@@ -1,25 +1,4 @@
 #!/usr/bin/env bash
-# Generate the HEVC stress corpus into .heic-test-assets/stress-corpus.
-#
-# These files exercise rare HEVC syntax paths that real camera output does not
-# cover: 10/12-bit, 4:2:2, 4:4:4, lossless (transquant bypass, level 8.5,
-# identity matrix), transform skip, default and custom (asymmetric) scaling
-# lists, cu_qp_delta at small quantization groups, extreme QPs, small CTUs,
-# deep transform trees, WPP on/off (including 1-CTB-wide pictures), NxN intra
-# partitions, disabled loop filters, and odd/tiny picture sizes. Several of
-# these paths carried silent-corruption bugs that the standard corpora never
-# reached.
-#
-# The corpus is generated (not checked in) because this repository tracks no
-# image assets. Exact bytes may differ across x265 versions; that is fine —
-# the verify harness compares decoded pixels against heif-dec at run time, so
-# any conformant encode of these feature combinations is a valid test.
-#
-# Once the directory exists, scripts/heic_tests.sh includes it in the default
-# corpus automatically.
-#
-# Requires the validator build and the ente fixtures corpus, both of which a
-# prior harness run sets up (e.g. `scripts/heic_tests.sh verify --quick`).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -68,8 +47,6 @@ fi
 rm -rf "$OUT_DIR" "$SRC_DIR"
 mkdir -p "$OUT_DIR" "$SRC_DIR"
 
-# --- Source images: one natural photo (from the fixtures corpus) at several
-# odd sizes and bit depths, plus synthetic gradients/noise/edges/flat.
 log "Generating source images"
 "$HEIF_DEC" "$PHOTO_HEIC" "$SRC_DIR/photo_full.png" >/dev/null 2>&1 \
   || fail "heif-dec could not decode $PHOTO_HEIC"
@@ -141,7 +118,6 @@ enc() {
 
 log "Encoding stress corpus into $OUT_DIR"
 
-# Baseline quality sweep on diverse content
 enc q30_photo_odd      photo_odd.png   -q 30
 enc q85_vs_photo_odd   photo_odd.png   -q 85 -p preset=veryslow
 enc q50_noise          noise.png       -q 50
@@ -151,32 +127,27 @@ enc q95_flat           flat.png        -q 95
 enc q50_tiny           tiny.png        -q 50
 enc q10_photo_small    photo_small.png -q 10
 
-# Lossless (transquant bypass, level 8.5, identity matrix RGB)
 enc lossless_photo_small photo_small.png -L
 enc lossless_edges       edges.png       -L
 enc lossless_noise       noise.png       -L
 enc lossless_444_nxn     edges.png       -L -p preset=veryslow
 
-# Chroma formats
 enc c422_photo_small   photo_small.png -q 60 -p chroma=422
 enc c444_photo_small   photo_small.png -q 60 -p chroma=444
 enc c422_edges         edges.png       -q 60 -p chroma=422
 enc c444_noise         noise.png       -q 60 -p chroma=444
 enc c444_nxn           photo_small.png -q 70 -p chroma=444 -p preset=veryslow -p tu-intra-depth=4
 
-# CTU / transform tree geometry
 enc ctu16_photo_small  photo_small.png -q 50 -p x265:ctu=16
 enc ctu32_tu4_edges    edges.png       -q 50 -p x265:ctu=32 -p tu-intra-depth=4
 enc ctu16_tiny         tiny.png        -q 50 -p x265:ctu=16
 
-# WPP variants (including 1-CTB-wide pictures) and extreme QPs
 enc nowpp_photo_small  photo_small.png -q 50 -p x265:wpp=0
 enc wpp_narrow         narrow.png      -q 50
 enc wpp_narrow2        narrow2.png     -q 65
 enc qp51_photo_small   photo_small.png -p x265:qp=51
 enc qp0_edges          edges.png       -p x265:qp=0
 
-# Rare residual / coefficient paths
 enc tskip_edges        edges.png       -q 50 -p x265:tskip=1
 enc tskip_noise        noise.png       -q 40 -p x265:tskip=1
 enc culossless_photo   photo_small.png -q 50 -p x265:cu-lossless=1
@@ -191,7 +162,6 @@ enc nostrong_photo     photo_small.png -q 50 -p x265:strong-intra-smoothing=0
 enc cip_photo_small    photo_small.png -q 50 -p x265:constrained-intra=1
 enc rdoq_psy_noise     noise.png       -q 60 -p x265:rdoq-level=2 -p x265:psy-rdoq=10
 
-# High bit depths (16-bit PNG sources)
 enc bd10_photo16       photo16.png    -q 60 -b 10
 enc bd10_gradient      gradient16.png -q 60 -b 10
 enc bd10_lossless_grad gradient16.png -L -b 10

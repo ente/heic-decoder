@@ -1,8 +1,3 @@
-//! SIMD-accelerated YCbCr→RGB color conversion
-//!
-//! Uses archmage for safe runtime dispatch across x86 (AVX2) with
-//! scalar fallback on other platforms.
-
 use archmage::incant;
 use archmage::prelude::*;
 
@@ -17,10 +12,6 @@ use core::arch::aarch64::{
 #[cfg(target_arch = "aarch64")]
 use safe_unaligned_simd::aarch64::{vld1_u16, vld1q_u16};
 
-/// Parameters for libheif's generic f32 matrix conversion.
-///
-/// Full range uses offsets `(0, midpoint)` and scales `(1, 1)`. Limited
-/// range uses libheif's exact `1.1689f` luma and `1.1429f` chroma scales.
 #[derive(Clone, Copy)]
 pub(crate) struct FloatMatrixParams {
     pub(crate) y_offset: f32,
@@ -33,15 +24,9 @@ pub(crate) struct FloatMatrixParams {
     pub(crate) b_cb: f32,
 }
 
-// Explicit imports for safe SIMD load/store (can't glob-import alongside core::arch)
 #[cfg(target_arch = "x86_64")]
 use safe_unaligned_simd::x86_64::{_mm_loadu_si64, _mm_loadu_si128, _mm256_storeu_si256};
 
-/// Convert full-range 8-bit 4:2:0 planes with libheif's exact fp8 kernel.
-///
-/// `channels` must be 3 or 4. The caller has already validated plane and
-/// output lengths; keeping this kernel focused lets the same path serve both
-/// RGB grid scratch buffers and the image adapter's RGBA buffer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn convert_420_8bit_to_interleaved(
     y_plane: &[u16],
@@ -76,10 +61,6 @@ pub(crate) fn convert_420_8bit_to_interleaved(
     );
 }
 
-/// Convert a rectangular region of full-range 8-bit 4:2:0 planes.
-///
-/// Source coordinates remain in the uncropped planes, so an odd `x_start`
-/// retains the original chroma phase. The result is tightly packed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn convert_420_8bit_region_to_interleaved(
     y_plane: &[u16],
@@ -276,8 +257,6 @@ fn convert_420_8bit_region_to_interleaved_neon(
     let rounding = vdupq_n_s32(128);
     let opaque = vdup_n_u8(u8::MAX);
     let x_end = x_start + width;
-    // Chroma pairs start on even luma coordinates. Peel an odd first sample
-    // so every SIMD group can duplicate four adjacent chroma samples.
     let simd_start = x_start.next_multiple_of(2).min(x_end);
     let simd_end = simd_start + (x_end - simd_start) / 8 * 8;
 
@@ -402,13 +381,6 @@ fn convert_420_8bit_region_to_interleaved_neon(
     }
 }
 
-/// Convert an 8-bit HEIC region through libheif's generic f32 matrix kernel.
-///
-/// This covers limited-range 4:2:0 and full/limited 4:2:2 or 4:4:4, which do
-/// not use libheif's specialized fixed-point 4:2:0 operation. Source
-/// coordinates remain in the uncropped planes so odd crop origins retain
-/// their original chroma phase. `subsample_x`/`subsample_y` must each be one
-/// or two and `channels` must be three or four.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn convert_float_matrix_8bit_region_to_interleaved(
     y_plane: &[u16],
@@ -462,8 +434,6 @@ pub(crate) fn convert_float_matrix_8bit_region_to_interleaved(
     );
 }
 
-/// Convert a complete high-bit-depth HEIC image through libheif's generic
-/// f32 matrix kernel and expand the clipped source samples to RGBA16.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn convert_float_matrix_region_to_rgba16(
     y_plane: &[u16],
@@ -1092,10 +1062,6 @@ fn convert_float_matrix_region_to_rgba16_neon(
     }
 }
 
-/// Get color matrix coefficients for YCbCr→RGB conversion.
-///
-/// Returns (cr_r, cb_g, cr_g, cb_b, y_bias, y_scale, rounding, shift_bits).
-/// Full-range uses ×256 fixed-point, limited-range uses ×8192.
 #[inline]
 fn get_coefficients(
     full_range: bool,
@@ -1103,25 +1069,21 @@ fn get_coefficients(
 ) -> (i32, i32, i32, i32, i32, i32, i32, i32) {
     if full_range {
         let (cr_r, cb_g, cr_g, cb_b) = match matrix_coeffs {
-            1 => (403, -48, -120, 475), // BT.709
-            9 => (377, -42, -146, 482), // BT.2020
-            _ => (359, -88, -183, 454), // BT.601
+            1 => (403, -48, -120, 475),
+            9 => (377, -42, -146, 482),
+            _ => (359, -88, -183, 454),
         };
         (cr_r, cb_g, cr_g, cb_b, 0, 256, 128, 8)
     } else {
         let (cr_r, cb_g, cr_g, cb_b) = match matrix_coeffs {
-            1 => (14744, -1754, -4383, 17373), // BT.709
-            9 => (13806, -1541, -5349, 17615), // BT.2020
-            _ => (13126, -3222, -6686, 16591), // BT.601
+            1 => (14744, -1754, -4383, 17373),
+            9 => (13806, -1541, -5349, 17615),
+            _ => (13126, -3222, -6686, 16591),
         };
         (cr_r, cb_g, cr_g, cb_b, 16, 9576, 4096, 13)
     }
 }
 
-/// Convert 4:2:0 YCbCr planes to interleaved RGB bytes.
-///
-/// Dispatches to AVX2 when available, scalar fallback otherwise.
-/// Writes exactly `(y_end - y_start) * (x_end - x_start) * 3` bytes to `rgb`.
 #[allow(clippy::too_many_arguments)]
 pub fn convert_420_to_rgb(
     y_plane: &[u16],
@@ -1158,7 +1120,6 @@ pub fn convert_420_to_rgb(
     )
 }
 
-/// Scalar YCbCr→RGB conversion (fallback for all platforms)
 #[allow(clippy::too_many_arguments)]
 fn convert_420_to_rgb_scalar(
     _token: ScalarToken,
@@ -1205,7 +1166,6 @@ fn convert_420_to_rgb_scalar(
     }
 }
 
-/// AVX2 YCbCr→RGB conversion — processes 8 pixels per iteration
 #[arcane]
 #[allow(clippy::too_many_arguments)]
 fn convert_420_to_rgb_v3(
@@ -1227,7 +1187,6 @@ fn convert_420_to_rgb_v3(
     let (cr_r, cb_g, cr_g, cb_b, y_bias, y_scale, rnd, shr) =
         get_coefficients(full_range, matrix_coeffs);
 
-    // Coefficient vectors (hoisted out of loop)
     let cr_r_v = _mm256_set1_epi32(cr_r);
     let cb_g_v = _mm256_set1_epi32(cb_g);
     let cr_g_v = _mm256_set1_epi32(cr_g);
@@ -1242,14 +1201,11 @@ fn convert_420_to_rgb_v3(
     let shift_v = _mm_cvtsi32_si128(shift as i32);
     let needs_shift = shift > 0;
 
-    // Shuffle mask: interleave packed [R0..R3, G0..G3, B0..B3, 0000] per lane
-    // into [R0,G0,B0, R1,G1,B1, R2,G2,B2, R3,G3,B3, 0000]
     let shuffle = _mm256_setr_epi8(
         0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11, -1, -1, -1, -1, 0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11,
         -1, -1, -1, -1,
     );
 
-    // Align SIMD start to even x for 4:2:0 chroma alignment
     let x_simd_start = x_start.next_multiple_of(2);
     let row_pixels = x_end.saturating_sub(x_simd_start) as usize;
     let simd_count = (row_pixels / 8) * 8;
@@ -1261,7 +1217,6 @@ fn convert_420_to_rgb_v3(
         let y_row = y as usize * y_stride;
         let c_row = (y as usize / 2) * c_stride;
 
-        // Scalar prefix: handle odd x_start (0 or 1 pixel)
         for x in x_start..x_simd_start.min(x_end) {
             scalar_pixel(
                 y_plane,
@@ -1284,18 +1239,15 @@ fn convert_420_to_rgb_v3(
             );
         }
 
-        // SIMD: 8 pixels per iteration
         let mut x = x_simd_start as usize;
         let x_end_simd = x_simd_end as usize;
         while x < x_end_simd {
             let cx = x / 2;
 
-            // Load 8 Y values (u16) → zero-extend to 8×i32
             let y_arr: &[u16; 8] = (&y_plane[y_row + x..y_row + x + 8]).try_into().unwrap();
             let y_raw = _mm_loadu_si128(y_arr);
             let mut y_i32 = _mm256_cvtepu16_epi32(y_raw);
 
-            // Load 4 Cb/Cr values, duplicate each for 4:2:0 → 8×i32
             let cb_arr: &[u16; 4] = (&cb_plane[c_row + cx..c_row + cx + 4]).try_into().unwrap();
             let cr_arr: &[u16; 4] = (&cr_plane[c_row + cx..c_row + cx + 4]).try_into().unwrap();
             let cb_raw = _mm_loadu_si64(cb_arr);
@@ -1305,14 +1257,12 @@ fn convert_420_to_rgb_v3(
             let mut cb_i32 = _mm256_cvtepu16_epi32(cb_dup);
             let mut cr_i32 = _mm256_cvtepu16_epi32(cr_dup);
 
-            // 10-bit → 8-bit shift
             if needs_shift {
                 y_i32 = _mm256_srl_epi32(y_i32, shift_v);
                 cb_i32 = _mm256_srl_epi32(cb_i32, shift_v);
                 cr_i32 = _mm256_srl_epi32(cr_i32, shift_v);
             }
 
-            // Fixed-point YCbCr → RGB
             let yv = _mm256_mullo_epi32(_mm256_sub_epi32(y_i32, y_bias_v), y_scale_v);
             let cb_adj = _mm256_sub_epi32(cb_i32, bias128_v);
             let cr_adj = _mm256_sub_epi32(cr_i32, bias128_v);
@@ -1342,18 +1292,15 @@ fn convert_420_to_rgb_v3(
                 shr_v,
             );
 
-            // Clamp [0, 255]
             let r = _mm256_min_epi32(_mm256_max_epi32(r, zero), max255);
             let g = _mm256_min_epi32(_mm256_max_epi32(g, zero), max255);
             let b = _mm256_min_epi32(_mm256_max_epi32(b, zero), max255);
 
-            // Pack i32→i16→u8: each lane gets [r0-3, g0-3, b0-3, 0000]
             let rg = _mm256_packs_epi32(r, g);
             let bz = _mm256_packs_epi32(b, zero);
             let packed = _mm256_packus_epi16(rg, bz);
             let interleaved = _mm256_shuffle_epi8(packed, shuffle);
 
-            // Extract 12 bytes from each 128-bit lane → 24 bytes total
             let mut buf = [0u8; 32];
             _mm256_storeu_si256(&mut buf, interleaved);
             rgb[out_idx..out_idx + 12].copy_from_slice(&buf[..12]);
@@ -1363,7 +1310,6 @@ fn convert_420_to_rgb_v3(
             x += 8;
         }
 
-        // Scalar tail: remaining 0–7 pixels
         for x in x_simd_end..x_end {
             scalar_pixel(
                 y_plane,
@@ -1388,10 +1334,9 @@ fn convert_420_to_rgb_v3(
     }
 }
 
-/// Convert a single 4:2:0 pixel (shared between SIMD prefix/tail and scalar path)
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // only used from #[arcane] AVX2 path
+#[allow(dead_code)]
 fn scalar_pixel(
     y_plane: &[u16],
     cb_plane: &[u16],

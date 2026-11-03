@@ -46,9 +46,6 @@ jobs:
 
             - run: cargo test --release --locked --no-default-features --features incremental-experiment --lib
 
-    # Full TESTING.md correctness pass: pixel-for-pixel and ICC-profile
-    # comparison against a pinned heif-dec validator over the libheif corpus,
-    # the ente HEIC fixtures, and the generated HEVC stress corpus.
     verify:
         runs-on: ubuntu-latest
         timeout-minutes: 90
@@ -61,8 +58,6 @@ jobs:
             # profiles in two pinned HEIC fixtures. Newer libpng reports those
             # profile issues without leaving heif-dec's oracle PNG empty.
             LIBPNG_PIN: 3061454d980de7d53608f594194cfac722721d2a
-            # HEIC fixture corpus (media/heic/v1/files); bump to pick up
-            # fixtures added upstream.
             ENTE_FIXTURES_PIN: 13c7cf83717140be20b32e6fbb178d5f15ea09ea
         steps:
             - name: Checkout

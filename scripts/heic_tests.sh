@@ -169,10 +169,6 @@ use std::fs::File;
 use std::io::BufReader;
 use std::process::ExitCode;
 
-/// Extracts the decompressed iCCP colour profile from a PNG.
-///
-/// Exit codes: 0 = profile written to the output path, 3 = the PNG carries
-/// no profile, 1 = the PNG could not be read, 2 = usage error.
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 3 {
@@ -773,11 +769,6 @@ is_ente_fixtures_files_dir() {
   find "$dir" -type f \( -iname '*.heif' -o -iname '*.heic' -o -iname '*.avif' \) -print -quit 2>/dev/null | grep -q .
 }
 
-# The ente test-fixtures HEIC corpus is part of the default corpus. It is
-# fetched on demand into the gitignored asset directory (sparse clone of only
-# the HEIC fixture subtree) and never checked into this repository. Best
-# effort: if it is missing and cannot be fetched, a warning is printed and the
-# default corpus falls back to the libheif dirs only.
 ensure_ente_fixtures() {
   local files_dir
   files_dir="$(ente_fixtures_files_dir)"
@@ -816,8 +807,6 @@ default_corpus_dirs() {
   if ensure_ente_fixtures; then
     ente_fixtures_files_dir
   fi
-  # Locally generated HEVC stress corpus (scripts/gen_stress_corpus.sh or
-  # `scripts/heic_tests.sh gen-stress`); included when present.
   if [[ -d "$ASSET_ROOT/stress-corpus" ]]; then
     printf '%s\n' "$ASSET_ROOT/stress-corpus"
   fi
@@ -1070,7 +1059,6 @@ png_to_rgba() {
 # the Rust PNG must carry byte-identical profile data. A Rust-only profile
 # is allowed and expected: the Rust decoder synthesizes an ICC profile from
 # nclx colour information, which heif-dec does not embed.
-# Prints a failure description and returns 1 on mismatch.
 compare_png_icc() {
   local ref_png="$1" rust_png="$2" prefix="$3"
   local ref_label="${4:-validator}" rust_label="${5:-rust}"

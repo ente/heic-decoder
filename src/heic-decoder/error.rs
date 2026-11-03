@@ -1,38 +1,17 @@
-//! Error types for HEVC decoding.
-
 use alloc::string::String;
 use core::fmt;
 
-/// Errors specific to HEVC decoding.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum HevcError {
     AllocationFailed,
-    /// Invalid NAL unit.
     InvalidNalUnit(&'static str),
-    /// Invalid bitstream.
     InvalidBitstream(&'static str),
-    /// Missing required parameter set.
     MissingParameterSet(&'static str),
-    /// Invalid parameter set.
-    InvalidParameterSet {
-        /// Parameter set type, for example "SPS" or "PPS".
-        kind: &'static str,
-        /// Description of the issue.
-        msg: String,
-    },
-    /// CABAC decoding error.
+    InvalidParameterSet { kind: &'static str, msg: String },
     CabacError(&'static str),
-    /// Unsupported profile/level.
-    UnsupportedProfile {
-        /// HEVC profile IDC.
-        profile: u8,
-        /// HEVC level IDC.
-        level: u8,
-    },
-    /// Unsupported feature.
+    UnsupportedProfile { profile: u8, level: u8 },
     Unsupported(&'static str),
-    /// Decoding error.
     DecodingError(&'static str),
 }
 
