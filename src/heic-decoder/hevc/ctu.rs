@@ -1629,6 +1629,9 @@ impl<'a> SliceContext<'a> {
     }
 
     fn decode_intra_chroma_mode(&mut self, luma_mode: IntraPredMode) -> Result<IntraPredMode> {
+        if self.sps.chroma_array_type() == 0 {
+            return Ok(luma_mode);
+        }
         let ctx_idx = context::INTRA_CHROMA_PRED_MODE;
         let first_bin = self.cabac.decode_bin(&mut self.ctx[ctx_idx]);
         let intra_chroma_mode = if first_bin == 0 {

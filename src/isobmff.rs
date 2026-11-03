@@ -4,6 +4,7 @@ use std::collections::btree_map::Entry;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::mem::size_of;
+use std::sync::Arc;
 
 const BASIC_HEADER_SIZE: usize = 8;
 const LARGE_SIZE_FIELD_SIZE: usize = 8;
@@ -681,9 +682,9 @@ pub struct HeicGridDescriptor {
 pub struct HeicGridTileItemData {
     pub item_id: u32,
     pub construction_method: u8,
-    pub hvcc: HevcDecoderConfigurationBox,
-    pub colr: PrimaryItemColorProperties,
-    pub transforms: Vec<PrimaryItemTransformProperty>,
+    pub hvcc: Arc<HevcDecoderConfigurationBox>,
+    pub colr: Arc<PrimaryItemColorProperties>,
+    pub transforms: Arc<[PrimaryItemTransformProperty]>,
     pub payload: Vec<u8>,
 }
 
@@ -4444,7 +4445,8 @@ fn extract_primary_heic_item_data_with_grid_internal(
     } else {
         None
     };
-    let mut property_cache = BTreeMap::new();
+    let mut property_cache = GridTilePropertyCache::default();
+    let mut tile_properties_by_item = BTreeMap::new();
     let tile_payload_budget = source
         .as_ref()
         .map_or(input.len() as u64, |source| source.len())
@@ -4477,18 +4479,24 @@ fn extract_primary_heic_item_data_with_grid_internal(
             });
         }
 
-        let tile_associations = associations_by_item
-            .get(&tile_item_id)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
         let (tile_hvcc, tile_colr, tile_transforms) =
-            resolve_grid_tile_hvcc_colr_and_transforms_indexed(
-                item_id,
-                tile_item_id,
-                tile_associations,
-                &flattened_properties,
-                &mut property_cache,
-            )?;
+            match tile_properties_by_item.entry(tile_item_id) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let tile_associations = associations_by_item
+                        .get(&tile_item_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    entry.insert(resolve_grid_tile_hvcc_colr_and_transforms_indexed(
+                        item_id,
+                        tile_item_id,
+                        tile_associations,
+                        &flattened_properties,
+                        &mut property_cache,
+                    )?)
+                }
+            }
+            .clone();
 
         let tile_location = &resolved.iloc.items[*iloc_index.get(&tile_item_id).ok_or(
             ExtractHeicItemDataError::MissingGridTileLocation {
@@ -4511,10 +4519,12 @@ fn extract_primary_heic_item_data_with_grid_internal(
                 item_id,
                 length: u64::MAX,
             })?;
-        if total_tile_payload_bytes > tile_payload_budget {
+        let total_tile_data_bytes =
+            total_tile_payload_bytes.saturating_add(property_cache.color_profile_bytes);
+        if total_tile_data_bytes > tile_payload_budget {
             return Err(ExtractHeicItemDataError::PayloadTooLarge {
                 item_id,
-                length: total_tile_payload_bytes,
+                length: total_tile_data_bytes,
             });
         }
         tiles.push(HeicGridTileItemData {
@@ -4537,9 +4547,22 @@ fn extract_primary_heic_item_data_with_grid_internal(
     }))
 }
 
+type GridTileProperties = (
+    Arc<HevcDecoderConfigurationBox>,
+    Arc<PrimaryItemColorProperties>,
+    Arc<[PrimaryItemTransformProperty]>,
+);
+
+#[derive(Default)]
+struct GridTilePropertyCache {
+    properties: BTreeMap<usize, CachedGridProperty>,
+    colors: BTreeMap<(Option<usize>, Option<usize>), Arc<PrimaryItemColorProperties>>,
+    color_profile_bytes: u64,
+}
+
 #[derive(Clone)]
 enum CachedGridProperty {
-    Hvcc(HevcDecoderConfigurationBox),
+    Hvcc(Arc<HevcDecoderConfigurationBox>),
     Colr(ColorInformationProperty),
     Transform(PrimaryItemTransformProperty),
     Ignored,
@@ -4551,13 +4574,15 @@ fn parse_grid_tile_property(
     property: &ParsedBox<'_>,
 ) -> Result<CachedGridProperty, ExtractHeicItemDataError> {
     if property.header.box_type.as_bytes() == HVCC_BOX_TYPE {
-        return Ok(CachedGridProperty::Hvcc(property.parse_hvcc().map_err(
-            |source| ExtractHeicItemDataError::GridTileCodecConfiguration {
-                item_id,
-                tile_item_id,
-                source,
-            },
-        )?));
+        return Ok(CachedGridProperty::Hvcc(Arc::new(
+            property.parse_hvcc().map_err(|source| {
+                ExtractHeicItemDataError::GridTileCodecConfiguration {
+                    item_id,
+                    tile_item_id,
+                    source,
+                }
+            })?,
+        )));
     }
     if property.header.box_type.as_bytes() == COLR_BOX_TYPE {
         return Ok(CachedGridProperty::Colr(property.parse_colr().map_err(
@@ -4609,14 +4634,7 @@ fn resolve_grid_tile_hvcc_colr_and_transforms(
     tile_item_id: u32,
     associations: &[ItemPropertyAssociationBox],
     flattened_properties: &[ParsedBox<'_>],
-) -> Result<
-    (
-        HevcDecoderConfigurationBox,
-        PrimaryItemColorProperties,
-        Vec<PrimaryItemTransformProperty>,
-    ),
-    ExtractHeicItemDataError,
-> {
+) -> Result<GridTileProperties, ExtractHeicItemDataError> {
     let mut tile_associations = Vec::new();
     for association_box in associations {
         for entry in &association_box.entries {
@@ -4631,7 +4649,7 @@ fn resolve_grid_tile_hvcc_colr_and_transforms(
             }
         }
     }
-    let mut property_cache = BTreeMap::new();
+    let mut property_cache = GridTilePropertyCache::default();
     resolve_grid_tile_hvcc_colr_and_transforms_indexed(
         item_id,
         tile_item_id,
@@ -4646,15 +4664,8 @@ fn resolve_grid_tile_hvcc_colr_and_transforms_indexed(
     tile_item_id: u32,
     associations: &[&ItemPropertyAssociation],
     flattened_properties: &[ParsedBox<'_>],
-    property_cache: &mut BTreeMap<usize, CachedGridProperty>,
-) -> Result<
-    (
-        HevcDecoderConfigurationBox,
-        PrimaryItemColorProperties,
-        Vec<PrimaryItemTransformProperty>,
-    ),
-    ExtractHeicItemDataError,
-> {
+    property_cache: &mut GridTilePropertyCache,
+) -> Result<GridTileProperties, ExtractHeicItemDataError> {
     let mut hvcc = None;
     let mut last_nclx = None;
     let mut last_icc = None;
@@ -4683,12 +4694,12 @@ fn resolve_grid_tile_hvcc_colr_and_transforms_indexed(
                 },
             );
         }
-        if let Entry::Vacant(entry) = property_cache.entry(property_index) {
+        if let Entry::Vacant(entry) = property_cache.properties.entry(property_index) {
             let parsed = parse_grid_tile_property(item_id, tile_item_id, property)?;
             entry.insert(parsed);
         }
-        match &property_cache[&property_index] {
-            CachedGridProperty::Hvcc(parsed) => hvcc = Some(parsed.clone()),
+        match &property_cache.properties[&property_index] {
+            CachedGridProperty::Hvcc(parsed) => hvcc = Some(Arc::clone(parsed)),
             CachedGridProperty::Colr(parsed) => match &parsed.information {
                 ColorInformation::Nclx(_) => last_nclx = Some(property_index),
                 ColorInformation::Icc(_) => last_icc = Some(property_index),
@@ -4698,19 +4709,27 @@ fn resolve_grid_tile_hvcc_colr_and_transforms_indexed(
         }
     }
 
-    let mut colr = PrimaryItemColorProperties::default();
-    if let Some(index) = last_nclx
-        && let Some(CachedGridProperty::Colr(parsed)) = property_cache.get(&index)
-        && let ColorInformation::Nclx(profile) = &parsed.information
-    {
-        colr.nclx = Some(profile.clone());
+    let color_key = (last_nclx, last_icc);
+    if !property_cache.colors.contains_key(&color_key) {
+        let mut colr = PrimaryItemColorProperties::default();
+        if let Some(index) = last_nclx
+            && let Some(CachedGridProperty::Colr(parsed)) = property_cache.properties.get(&index)
+            && let ColorInformation::Nclx(profile) = &parsed.information
+        {
+            colr.nclx = Some(profile.clone());
+        }
+        if let Some(index) = last_icc
+            && let Some(CachedGridProperty::Colr(parsed)) = property_cache.properties.get(&index)
+            && let ColorInformation::Icc(profile) = &parsed.information
+        {
+            property_cache.color_profile_bytes = property_cache
+                .color_profile_bytes
+                .saturating_add(profile.profile.len() as u64);
+            colr.icc = Some(profile.clone());
+        }
+        property_cache.colors.insert(color_key, Arc::new(colr));
     }
-    if let Some(index) = last_icc
-        && let Some(CachedGridProperty::Colr(parsed)) = property_cache.get(&index)
-        && let ColorInformation::Icc(profile) = &parsed.information
-    {
-        colr.icc = Some(profile.clone());
-    }
+    let colr = Arc::clone(&property_cache.colors[&color_key]);
 
     let hvcc = hvcc.ok_or(
         ExtractHeicItemDataError::MissingGridTileCodecConfiguration {
@@ -4718,7 +4737,7 @@ fn resolve_grid_tile_hvcc_colr_and_transforms_indexed(
             tile_item_id,
         },
     )?;
-    Ok((hvcc, colr, transforms))
+    Ok((hvcc, colr, transforms.into()))
 }
 
 pub fn primary_heic_color_properties(input: &[u8]) -> Option<PrimaryItemColorProperties> {
@@ -4772,7 +4791,7 @@ pub fn primary_heic_color_properties(input: &[u8]) -> Option<PrimaryItemColorPro
                 &flattened_properties,
             )
             .ok()
-            .map(|(_, tile_colr, _)| tile_colr)
+            .map(|(_, tile_colr, _)| Arc::unwrap_or_clone(tile_colr))
         });
     merge_primary_and_grid_tile_color_properties(primary_colr, tile_colr)
 }
@@ -7824,14 +7843,15 @@ mod tests {
     };
     use super::{
         ExtractHeicItemDataError, ExtractUncompressedItemDataError, FourCc,
-        HeicPrimaryItemDataWithGrid, IccColorProfile, NclxColorProfile, ParseItemLocationBoxError,
-        ParseItemPropertyAssociationBoxError, PrimaryItemColorProperties,
-        extract_primary_heic_item_data_with_grid,
+        HeicGridPrimaryItemData, HeicPrimaryItemDataWithGrid, IccColorProfile, NclxColorProfile,
+        ParseItemLocationBoxError, ParseItemPropertyAssociationBoxError,
+        PrimaryItemColorProperties, extract_primary_heic_item_data_with_grid,
         extract_primary_heic_item_data_with_grid_from_source,
         extract_primary_uncompressed_item_data, extract_primary_uncompressed_item_data_from_source,
         merge_primary_and_grid_tile_color_properties, parse_iloc_payload, parse_ipma_payload,
         primary_heic_color_properties,
     };
+    use std::sync::Arc;
 
     #[test]
     fn resolves_primary_nclx_and_icc_from_container_bytes() {
@@ -8211,6 +8231,129 @@ mod tests {
 
         let err = extract_primary_heic_item_data_with_grid(&file)
             .expect_err("duplicate payloads must be budgeted");
+        assert!(matches!(
+            err,
+            ExtractHeicItemDataError::PayloadTooLarge { .. }
+        ));
+    }
+
+    fn resolved_grid(file: &[u8]) -> HeicGridPrimaryItemData {
+        let HeicPrimaryItemDataWithGrid::Grid(grid) =
+            extract_primary_heic_item_data_with_grid(file).expect("grid should resolve")
+        else {
+            panic!("expected grid");
+        };
+        grid
+    }
+
+    #[test]
+    fn grid_tile_transforms_are_shared_across_duplicate_references() {
+        let mut tile_property_indices = vec![1_u8];
+        tile_property_indices.extend([2_u8; 254]);
+        let rotations = [2_u8; 255];
+        let extra_rotations: Vec<(u16, &[u8])> =
+            (0..256).map(|_| (2_u16, &rotations[..])).collect();
+
+        let grid = resolved_grid(&minimal_heic_grid_file(
+            (16, 16),
+            (64, 64),
+            &[2_u16; 256],
+            &[0x11; 16],
+            &[hvcc_box(), plain_box(b"irot", &[1])],
+            &tile_property_indices,
+            &extra_rotations,
+        ));
+
+        assert_eq!(grid.tiles.len(), 256);
+        assert_eq!(grid.tiles[0].transforms.len(), 254 + 256 * 255);
+        assert!(
+            grid.tiles
+                .iter()
+                .all(|tile| Arc::ptr_eq(&tile.transforms, &grid.tiles[0].transforms))
+        );
+    }
+
+    #[test]
+    fn grid_tile_codec_configurations_are_shared_across_duplicate_references() {
+        let nal_count = 65_535_u16;
+        let mut hvcc = vec![0_u8; 23];
+        hvcc[0] = 1;
+        hvcc[22] = 1;
+        hvcc.push(32);
+        hvcc.extend_from_slice(&nal_count.to_be_bytes());
+        for _ in 0..nal_count {
+            hvcc.extend_from_slice(&1_u16.to_be_bytes());
+            hvcc.push(0x40);
+        }
+
+        let grid = resolved_grid(&minimal_heic_grid_file(
+            (16, 16),
+            (64, 64),
+            &[2_u16; 256],
+            &[0x11; 16],
+            &[plain_box(b"hvcC", &hvcc)],
+            &[1],
+            &[],
+        ));
+
+        assert_eq!(grid.tiles.len(), 256);
+        assert_eq!(
+            grid.tiles[0].hvcc.nal_arrays[0].nal_units.len(),
+            usize::from(nal_count)
+        );
+        assert!(
+            grid.tiles
+                .iter()
+                .all(|tile| Arc::ptr_eq(&tile.hvcc, &grid.tiles[0].hvcc))
+        );
+    }
+
+    #[test]
+    fn grid_tile_color_profiles_are_shared_across_distinct_tiles() {
+        let profile = vec![0x5A_u8; 3 * 1024 * 1024];
+        let tile_ids: Vec<u16> = (2..66).collect();
+
+        let grid = resolved_grid(&minimal_heic_grid_file(
+            (8, 8),
+            (512, 512),
+            &tile_ids,
+            &[0x11; 16],
+            &[hvcc_box(), colr_icc_box(&profile)],
+            &[1, 2],
+            &[],
+        ));
+
+        assert_eq!(grid.tiles.len(), 64);
+        assert_eq!(grid.tiles[0].colr.icc.as_ref().unwrap().profile, profile);
+        assert!(grid.tiles.iter().all(|tile| {
+            Arc::ptr_eq(&tile.colr, &grid.tiles[0].colr)
+                && Arc::ptr_eq(&tile.hvcc, &grid.tiles[0].hvcc)
+        }));
+    }
+
+    #[test]
+    fn grid_tile_color_profile_copies_are_budgeted_across_distinct_compositions() {
+        let profile = vec![0x5A_u8; 3 * 1024 * 1024];
+        let tile_ids: Vec<u16> = (2..66).collect();
+        let mut properties = vec![hvcc_box(), colr_icc_box(&profile)];
+        properties.extend((0..64).map(|_| colr_nclx_box(1, 13, 6, true)));
+        let nclx_indices: Vec<[u8; 1]> = (3..67).map(|index| [index]).collect();
+        let extra_associations: Vec<(u16, &[u8])> = tile_ids
+            .iter()
+            .zip(&nclx_indices)
+            .map(|(&tile_id, index)| (tile_id, &index[..]))
+            .collect();
+
+        let err = extract_primary_heic_item_data_with_grid(&minimal_heic_grid_file(
+            (8, 8),
+            (512, 512),
+            &tile_ids,
+            &[0x11; 16],
+            &properties,
+            &[1, 2],
+            &extra_associations,
+        ))
+        .expect_err("per-composition profile copies must be budgeted");
         assert!(matches!(
             err,
             ExtractHeicItemDataError::PayloadTooLarge { .. }

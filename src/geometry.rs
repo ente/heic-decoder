@@ -32,6 +32,14 @@ fn single_span_tile_extent(output_extent: u32, alignment: u32, stacks_tiles: boo
     }
 }
 
+fn grid_budget_extent(output_extent: u32, spans: u16, other_spans: u16) -> u64 {
+    if spans == 1 && other_spans > 1 {
+        u64::from(output_extent).max(GRID_SINGLE_SPAN_TILE_EXTENT_LIMIT)
+    } else {
+        u64::from(output_extent)
+    }
+}
+
 fn byte_limit(stage: &'static str, actual_bytes: u64, max_decoded_bytes: u64) -> DecodeError {
     DecodeGuardrailError::DecodedByteCountExceeded {
         stage,
@@ -74,20 +82,12 @@ fn check_sps(
         sps.pic_width_in_luma_samples,
         sps.pic_height_in_luma_samples,
     )?;
-    if let Some((width, height)) = expected {
-        if (metadata.width, metadata.height) != (width, height) {
-            return Err(invalid(
-                "auxiliary HEVC geometry does not match primary image",
-            ));
-        }
-        let alignment = sps.ctb_size();
-        if u64::from(sps.pic_width_in_luma_samples) > padded_extent(width, alignment)
-            || u64::from(sps.pic_height_in_luma_samples) > padded_extent(height, alignment)
-        {
-            return Err(invalid(
-                "auxiliary HEVC coded geometry exceeds primary image padding",
-            ));
-        }
+    if let Some(expected) = expected
+        && (metadata.width, metadata.height) != expected
+    {
+        return Err(invalid(
+            "auxiliary HEVC geometry does not match primary image",
+        ));
     }
     Ok(estimate_heic_grid_sps_decode_bytes(sps)?)
 }
@@ -140,11 +140,17 @@ pub(super) fn preflight_grid(
     validate_heic_grid_descriptor_and_tile_count(grid)?;
     let descriptor = &grid.descriptor;
     guardrails.enforce_pixel_count(descriptor.output_width, descriptor.output_height)?;
-    let output_pixels = u64::from(descriptor.output_width) * u64::from(descriptor.output_height);
+    let budget_pixels =
+        grid_budget_extent(descriptor.output_width, descriptor.columns, descriptor.rows)
+            * grid_budget_extent(
+                descriptor.output_height,
+                descriptor.rows,
+                descriptor.columns,
+            );
     let pixel_budget = guardrails
         .max_pixels
-        .unwrap_or(output_pixels)
-        .min(output_pixels);
+        .unwrap_or(budget_pixels)
+        .min(budget_pixels);
     let decoded_budget = decoded_byte_budget(pixel_budget);
     let mut aggregate = 0u64;
     for tile in &grid.tiles {
@@ -197,7 +203,7 @@ pub(super) fn preflight_grid(
                             "HEVC tile coded geometry exceeds visible geometry padding",
                         ));
                     }
-                    for transform in &tile.transforms {
+                    for transform in tile.transforms.iter() {
                         if let isobmff::PrimaryItemTransformProperty::Rotation(rotation) = transform
                             && rotation.rotation_ccw_degrees % 180 == 90
                         {

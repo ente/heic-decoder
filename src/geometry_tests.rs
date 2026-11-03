@@ -259,9 +259,9 @@ fn grid_fixture() -> isobmff::HeicGridPrimaryItemData {
         tiles: vec![isobmff::HeicGridTileItemData {
             item_id: 1,
             construction_method: 1,
-            hvcc,
+            hvcc: hvcc.into(),
             colr: Default::default(),
-            transforms: vec![],
+            transforms: Default::default(),
             payload: hevc_payload(),
         }],
     }
@@ -458,20 +458,19 @@ fn avif_auxiliary_container_geometry_is_checked_before_backend() {
 #[test]
 fn heic_grid_tile_crop_cannot_hide_oversized_coded_frame() {
     let mut grid = grid_fixture();
-    grid.tiles[0]
-        .transforms
-        .push(isobmff::PrimaryItemTransformProperty::CleanAperture(
-            isobmff::ImageCleanApertureProperty {
-                clean_aperture_width_num: 16,
-                clean_aperture_width_den: 1,
-                clean_aperture_height_num: 16,
-                clean_aperture_height_den: 1,
-                horizontal_offset_num: 0,
-                horizontal_offset_den: 1,
-                vertical_offset_num: 0,
-                vertical_offset_den: 1,
-            },
-        ));
+    grid.tiles[0].transforms = [isobmff::PrimaryItemTransformProperty::CleanAperture(
+        isobmff::ImageCleanApertureProperty {
+            clean_aperture_width_num: 16,
+            clean_aperture_width_den: 1,
+            clean_aperture_height_num: 16,
+            clean_aperture_height_den: 1,
+            horizontal_offset_num: 0,
+            horizontal_offset_den: 1,
+            vertical_offset_num: 0,
+            vertical_offset_den: 1,
+        },
+    )]
+    .into();
     let (result, largest) = tracked(|| decode_primary_heic_grid_to_image(&grid));
     assert!(result.is_err());
     assert!(
@@ -494,7 +493,8 @@ fn heic_grid_checks_later_tiles_before_decoding_first_tile() {
     second.item_id = 3;
     second.hvcc = isobmff::parse_boxes(&config).unwrap()[0]
         .parse_hvcc()
-        .unwrap();
+        .unwrap()
+        .into();
     grid.tile_item_ids.push(3);
     grid.tiles.push(second);
     let (result, largest) = tracked(|| decode_primary_heic_grid_to_image(&grid));
@@ -511,7 +511,8 @@ fn heic_grid_checks_replacement_sps_in_payload() {
     let config = hevc_configuration(small_hevc_sps());
     grid.tiles[0].hvcc = isobmff::parse_boxes(&config).unwrap()[0]
         .parse_hvcc()
-        .unwrap();
+        .unwrap()
+        .into();
     let replacement = large_hevc_sps();
     grid.tiles[0].payload = [
         &(replacement.len() as u32).to_be_bytes()[..],
@@ -825,7 +826,8 @@ fn grid_with_filler(tile_count: u16, filler_bytes: usize) -> isobmff::HeicGridPr
     let config = hevc_configuration(small_hevc_sps());
     grid.tiles[0].hvcc = isobmff::parse_boxes(&config).unwrap()[0]
         .parse_hvcc()
-        .unwrap();
+        .unwrap()
+        .into();
     let mut filler = vec![0xffu8; filler_bytes];
     filler[..2].copy_from_slice(&[0x4c, 0x01]);
     *filler.last_mut().unwrap() = 0x80;
@@ -1139,9 +1141,10 @@ fn grid_tile_streams_with_hidden_parameter_sets_decode_strictly() {
         construction_method: 1,
         hvcc: isobmff::parse_boxes(&config).unwrap()[0]
             .parse_hvcc()
-            .unwrap(),
+            .unwrap()
+            .into(),
         colr: Default::default(),
-        transforms: vec![],
+        transforms: Default::default(),
         payload: hevc_payload(),
     };
     let (decoded, largest) = tracked(|| crate::decode_heic_grid_tile_to_image(&tile).unwrap());
@@ -1356,9 +1359,9 @@ fn tiled_grid(
     let first = isobmff::HeicGridTileItemData {
         item_id: 1,
         construction_method: 1,
-        hvcc,
+        hvcc: hvcc.into(),
         colr: Default::default(),
-        transforms: vec![],
+        transforms: Default::default(),
         payload: hevc_payload(),
     };
     let tile_count = u32::from(columns) * u32::from(rows);
@@ -1423,4 +1426,78 @@ fn heic_grid_single_tile_keeps_the_padded_extent_bound() {
     let sps = sps_with_tile_dimensions(512, 512);
     let grid = tiled_grid(1, 1, (300, 8000), sps);
     assert!(geometry::preflight_grid(&grid, &DecodeGuardrails::default()).is_err());
+}
+
+#[test]
+fn heic_grid_budget_counts_the_fixed_tile_span_of_narrow_grids() {
+    let sps = sps_with_tile_dimensions(512, 512);
+    for (columns, rows, output) in [
+        (1u16, 59u16, (40u32, 30000u32)),
+        (59, 1, (30000, 40)),
+        (1, 79, (100, 40000)),
+    ] {
+        let grid = tiled_grid(columns, rows, output, sps.clone());
+        assert!(
+            geometry::preflight_grid(&grid, &DecodeGuardrails::default()).is_ok(),
+            "{}x{} grid with output {}x{}",
+            columns,
+            rows,
+            output.0,
+            output.1
+        );
+    }
+}
+
+#[test]
+fn heic_grid_narrow_budget_stays_capped_by_max_pixels() {
+    let sps = sps_with_tile_dimensions(512, 512);
+    let grid = tiled_grid(1, 59, (40, 30000), sps);
+    let result = geometry::preflight_grid(
+        &grid,
+        &DecodeGuardrails {
+            max_pixels: Some(40 * 30000),
+            ..DecodeGuardrails::default()
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(DecodeError::Guardrail(
+            DecodeGuardrailError::DecodedByteCountExceeded {
+                stage: "HEIC grid",
+                ..
+            }
+        ))
+    ));
+}
+
+fn assert_alpha_ramp(input: &[u8], width: u32, height: u32, x_step: u32) {
+    let decoded = decode_bytes_to_rgba(input).unwrap();
+    assert_eq!((decoded.width, decoded.height), (width, height));
+    let DecodedRgbaPixels::U8(pixels) = decoded.pixels else {
+        panic!("expected 8-bit RGBA output");
+    };
+    for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+        let (x, y) = (index as u32 % width, index as u32 / width);
+        let expected = x_step * x + y;
+        assert!(
+            u32::from(pixel[3]).abs_diff(expected) <= 2,
+            "alpha at ({x}, {y}) is {}, expected {expected}",
+            pixel[3]
+        );
+    }
+}
+
+#[test]
+fn apple_monochrome_alpha_plane_decodes() {
+    assert_alpha_ramp(
+        include_bytes!("testdata/apple-alpha-192x64.heic"),
+        192,
+        64,
+        1,
+    );
+}
+
+#[test]
+fn apple_alpha_coded_at_the_minimum_frame_size_is_kept() {
+    assert_alpha_ramp(include_bytes!("testdata/apple-alpha-40x30.heic"), 40, 30, 5);
 }

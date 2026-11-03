@@ -14062,9 +14062,10 @@ mod tests {
                     nal_units: vec![sps_nal.clone()],
                 }],
                 4,
-            ),
+            )
+            .into(),
             colr: Default::default(),
-            transforms: Vec::new(),
+            transforms: Default::default(),
             payload: Vec::new(),
         };
 
@@ -14114,9 +14115,10 @@ mod tests {
                     nal_units: vec![small_sps.clone()],
                 }],
                 4,
-            ),
+            )
+            .into(),
             colr: Default::default(),
-            transforms: Vec::new(),
+            transforms: Default::default(),
             payload,
         };
 

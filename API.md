@@ -177,14 +177,18 @@ Notes:
 - `max_pixels` checks AV1 and HEVC coded frame area before pixel decoding,
   including auxiliary alpha frames and HEIC grid tiles. Container dimensions
   and post-decode geometry checks still apply.
-- Auxiliary alpha must match the primary geometry. HEVC conformance-window
-  padding is allowed up to the coded block boundary; cropping cannot hide an
-  oversized coded frame.
+- Auxiliary alpha must match the primary's visible geometry. Its coded frame,
+  including any conformance-window padding, counts against `max_pixels` and
+  the decoded-byte allowance below, so cropping cannot hide an oversized coded
+  frame.
 - HEVC preflight estimates decoded planes and normalized bitstream storage.
   The byte allowance is 12 bytes per allowed pixel plus 64 MiB, with the
   primary area limiting auxiliary frames and the composed output area limiting
-  grids. Every grid tile, including the first, and the sum of all tile estimates
-  must fit this allowance. This estimate is not a process RSS limit.
+  grids. A grid dimension covered by a single tile row or column counts as at
+  least 512 pixels when tiles are stacked along the other dimension, matching
+  the fixed tile span encoders use for narrow images. Every grid tile,
+  including the first, and the sum of all tile estimates must fit this
+  allowance. This estimate is not a process RSS limit.
 
 ## Error Handling Contract
 
