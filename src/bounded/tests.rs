@@ -57,13 +57,23 @@ fn fixture_with_exif(
     extra_properties: &[Vec<u8>],
     orientation: Option<u8>,
 ) -> Vec<u8> {
-    fixture_with_exif_info(configs, payload, extra_properties, orientation, b"Exif\0")
+    fixture_with_exif_info(
+        configs,
+        payload,
+        extra_properties,
+        &(0..extra_properties.len()).collect::<Vec<_>>(),
+        &[],
+        orientation,
+        b"Exif\0",
+    )
 }
 
 fn fixture_with_exif_info(
     configs: &[Vec<u8>],
     payload: &[u8],
     extra_properties: &[Vec<u8>],
+    primary_extras: &[usize],
+    tile_extras: &[usize],
     orientation: Option<u8>,
     exif_info: &[u8],
 ) -> Vec<u8> {
@@ -109,13 +119,20 @@ fn fixture_with_exif_info(
         );
         associations.extend_from_slice(&id.to_be_bytes());
         if id == primary {
-            associations.push(1 + extra_properties.len() as u8);
+            associations.push(1 + primary_extras.len() as u8);
             associations.push(0x82);
-            for i in 0..extra_properties.len() {
+            for i in primary_extras {
                 associations.push(0x80 | (3 + configs.len() + i) as u8);
             }
         } else {
-            associations.extend_from_slice(&[2, 0x81, 0x80 | (id + 2) as u8]);
+            associations.extend_from_slice(&[
+                2 + tile_extras.len() as u8,
+                0x81,
+                0x80 | (id + 2) as u8,
+            ]);
+            for i in tile_extras {
+                associations.push(0x80 | (3 + configs.len() + i) as u8);
+            }
         }
     }
     let mut exif = Vec::new();
@@ -755,18 +772,28 @@ fn incremental_rejects_unimplemented_chroma_transform_orders() {
         .into_iter()
         .flat_map(u32::to_be_bytes)
         .collect::<Vec<_>>();
-    for extras in [
-        vec![box_bytes(b"irot", &[1]), box_bytes(b"clap", &crop)],
-        vec![box_bytes(b"clap", &crop), box_bytes(b"clap", &crop)],
-    ] {
-        let bytes = fixture(std::slice::from_ref(&config), &nals[3], &extras);
-        assert!(matches!(
-            incremental::decode(BoundedInput::Bytes(&bytes), Default::default()),
-            Err(BoundedDecodeError::Unsupported(
-                "repeated crop or crop after orientation"
-            ))
-        ));
-    }
+    let bytes = fixture(
+        std::slice::from_ref(&config),
+        &nals[3],
+        &[box_bytes(b"irot", &[1]), box_bytes(b"clap", &crop)],
+    );
+    assert!(matches!(
+        incremental::decode(BoundedInput::Bytes(&bytes), Default::default()),
+        Err(BoundedDecodeError::Unsupported(
+            "repeated crop or crop after orientation"
+        ))
+    ));
+    let bytes = fixture(
+        std::slice::from_ref(&config),
+        &nals[3],
+        &[box_bytes(b"clap", &crop), box_bytes(b"clap", &crop)],
+    );
+    assert!(matches!(
+        incremental::decode(BoundedInput::Bytes(&bytes), Default::default()),
+        Err(BoundedDecodeError::Malformed(
+            "duplicate transform property"
+        ))
+    ));
     let bytes = fixture(
         &[config.clone(), config],
         &nals[3],
@@ -1006,6 +1033,8 @@ fn public_decode_applies_associated_exif_after_identity_rotation() {
                 &[config.clone(), config.clone()],
                 &asymmetric_payload(),
                 &[box_bytes(b"irot", &[0])],
+                &[0],
+                &[],
                 Some(orientation),
                 exif_info,
             );
@@ -1121,6 +1150,64 @@ fn render_rejects_workspace_and_geometry_changes_after_preflight() {
             "codec workspace changed after preflight"
         ))
     ));
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn rejects_repeated_transform_types_like_normal_decode() {
+    let nals = nal_sets();
+    let config = configuration(&nals[1]);
+    let crop: Vec<_> = [13u32, 1, 11, 1, 0, 1, 0, 1]
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect();
+    let mirror = box_bytes(b"imir", &[0]);
+    let rotation = box_bytes(b"irot", &[1]);
+    let identity = box_bytes(b"irot", &[0]);
+    let clean_aperture = box_bytes(b"clap", &crop);
+    for (properties, primary_extras, tile_extras) in [
+        (vec![mirror.clone()], vec![0, 0], vec![]),
+        (vec![mirror.clone(), mirror], vec![0, 1], vec![]),
+        (vec![rotation.clone()], vec![0, 0], vec![]),
+        (vec![identity.clone(), rotation], vec![0, 1], vec![]),
+        (vec![clean_aperture.clone()], vec![0, 0], vec![]),
+        (
+            vec![clean_aperture.clone(), clean_aperture],
+            vec![0, 1],
+            vec![],
+        ),
+        (vec![identity.clone()], vec![], vec![0, 0]),
+        (vec![identity.clone(), identity.clone()], vec![], vec![0, 1]),
+    ] {
+        let bytes = fixture_with_exif_info(
+            std::slice::from_ref(&config),
+            &nals[3],
+            &properties,
+            &primary_extras,
+            &tile_extras,
+            None,
+            b"Exif\0",
+        );
+        assert!(matches!(
+            decode_bounded(BoundedInput::Bytes(&bytes), Default::default()),
+            Err(BoundedDecodeError::Malformed(
+                "duplicate transform property"
+            ))
+        ));
+        assert!(crate::decode_bytes_to_rgb8(&bytes).is_err());
+    }
+    let bytes = fixture_with_exif_info(
+        std::slice::from_ref(&config),
+        &nals[3],
+        &[identity],
+        &[],
+        &[0],
+        None,
+        b"Exif\0",
+    );
+    let normal = crate::decode_bytes_to_rgb8(&bytes).unwrap();
+    let bounded = decode_bounded(BoundedInput::Bytes(&bytes), Default::default()).unwrap();
+    assert_eq!(bounded.image.pixels, normal.pixels);
 }
 
 #[cfg(not(feature = "decoder-tracing"))]

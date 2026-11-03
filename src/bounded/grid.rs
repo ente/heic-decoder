@@ -161,6 +161,11 @@ impl<'a> Properties<'a> {
                 _ => {}
             }
             if let Some(transform) = transform {
+                if result.transforms.iter().flatten().any(|stored| {
+                    std::mem::discriminant(stored) == std::mem::discriminant(&transform)
+                }) {
+                    return Err(Error::Malformed("duplicate transform property"));
+                }
                 if result.transform_count == result.transforms.len() {
                     return Err(Error::LimitExceeded("transform count"));
                 }
