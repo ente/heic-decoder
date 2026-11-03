@@ -1,12 +1,5 @@
-//! Deblocking filter (H.265 Section 8.7.2)
-//!
-//! Applies strong/weak filtering at CU and TU boundaries to reduce blocking artifacts.
-//! For I-slices (HEIC still images), all boundaries have bS=2 since both sides are intra-coded.
-
 use super::picture::{DEBLOCK_FLAG_HORIZ, DEBLOCK_FLAG_VERT, DecodedFrame};
 
-/// Beta prime values for deblocking filter (Table 8-12)
-/// Index 0-51 maps QP to beta prime threshold
 #[rustfmt::skip]
 static BETA_PRIME: [u16; 52] = [
      0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
@@ -15,8 +8,6 @@ static BETA_PRIME: [u16; 52] = [
     58, 60, 62, 64,
 ];
 
-/// tC prime values for deblocking filter (Table 8-23)
-/// Index 0-53 maps to tC prime threshold
 #[rustfmt::skip]
 static TC_PRIME: [u16; 54] = [
      0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
@@ -25,13 +16,11 @@ static TC_PRIME: [u16; 54] = [
     14, 16, 18, 20, 22, 24,
 ];
 
-/// Chroma QP mapping table (Table 8-10) for indices 30-42
 #[rustfmt::skip]
 static CHROMA_QP_TABLE: [i32; 13] = [
     29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37,
 ];
 
-/// Map intermediate chroma QP to actual chroma QP (4:2:0)
 fn chroma_qp_mapping(qp_i: i32) -> i32 {
     if qp_i < 30 {
         qp_i
@@ -42,11 +31,6 @@ fn chroma_qp_mapping(qp_i: i32) -> i32 {
     }
 }
 
-/// Apply the deblocking filter to a decoded frame.
-///
-/// `beta_offset` and `tc_offset` come from slice header (slice_beta_offset_div2 * 2
-/// and slice_tc_offset_div2 * 2).
-/// `cb_qp_offset` and `cr_qp_offset` come from PPS (pps_cb_qp_offset / pps_cr_qp_offset).
 pub fn apply_deblocking_filter(
     frame: &mut DecodedFrame,
     beta_offset: i32,
@@ -77,8 +61,6 @@ pub(crate) fn apply_deblocking_rows(
     let width = frame.width;
     let height = end;
 
-    // Pass 1: Vertical edges
-    // Process at 8-sample intervals in x, 4-sample intervals in y
     let mut x = 8u32;
     while x < width {
         let mut y = start;
@@ -89,7 +71,6 @@ pub(crate) fn apply_deblocking_rows(
             if idx < frame.deblock_flags.len()
                 && (frame.deblock_flags[idx] & DEBLOCK_FLAG_VERT) != 0
             {
-                // Get QP on both sides
                 let qp_q = frame.qp_map[idx] as i32;
                 let qp_p = if bx > 0 {
                     frame.qp_map[(by * frame.deblock_stride + bx - 1) as usize] as i32
@@ -104,8 +85,6 @@ pub(crate) fn apply_deblocking_rows(
         x += 8;
     }
 
-    // Pass 2: Horizontal edges
-    // Process at 4-sample intervals in x, 8-sample intervals in y
     let mut y = start.max(8);
     while y < height {
         let mut x = 0u32;
@@ -130,18 +109,11 @@ pub(crate) fn apply_deblocking_rows(
         y += 8;
     }
 
-    // Chroma deblocking (only for bS=2, which is all edges for I-slices)
     if frame.chroma_format > 0 {
         apply_chroma_deblocking(frame, tc_offset, cb_qp_offset, cr_qp_offset, start, end);
     }
 }
 
-/// Filter a single luma edge (4 samples along the edge)
-///
-/// For vertical edges: x is the boundary position, filtering samples at x-1..x-4 and x..x+3
-/// For horizontal edges: y is the boundary position, filtering samples at y-1..y-4 and y..y+3
-///
-/// Uses direct plane access with stride-based indexing to avoid per-sample bounds checks.
 #[allow(clippy::too_many_arguments)]
 fn filter_edge_luma(
     frame: &mut DecodedFrame,
@@ -156,8 +128,6 @@ fn filter_edge_luma(
     let bit_depth = frame.bit_depth as i32;
     let max_val = (1i32 << bit_depth) - 1;
 
-    // H.265 8.7.2.5.7: samples in cu_transquant_bypass (lossless) CUs are not
-    // modified by deblocking; suppress writes per side.
     let (p_bypass, q_bypass) = if vertical {
         (
             frame.is_block_bypass(x.wrapping_sub(1), y),
@@ -176,7 +146,6 @@ fn filter_edge_luma(
     // For I-slices, bS is always 2 at boundaries
     let bs = 2i32;
 
-    // Compute thresholds
     let qp_l = (qp_q + qp_p + 1) >> 1;
     let q_beta = (qp_l + beta_offset).clamp(0, 51);
     let beta = (BETA_PRIME[q_beta as usize] as i32) << (bit_depth - 8);
@@ -191,23 +160,13 @@ fn filter_edge_luma(
     let y = y - frame.row_origin;
     let plane = &mut frame.y_plane;
 
-    // Compute stride-based addressing:
-    // - step_along: stride between adjacent samples along the edge (k direction)
-    // - step_across: stride between adjacent samples perpendicular to edge (p/q direction)
-    // - base_q: offset of q[0][0] in plane
     let (step_along, step_across, base_q) = if vertical {
-        // Vertical edge: k steps in y (stride), p/q steps in x (1)
         (stride, 1usize, y as usize * stride + x as usize)
     } else {
-        // Horizontal edge: k steps in x (1), p/q steps in y (stride)
         (1usize, stride, y as usize * stride + x as usize)
     };
-    // base_p = one step before the boundary on the p side
     let base_p = base_q - step_across;
 
-    // Bounds check: ensure all 4 samples on both sides are in-bounds
-    // q side extends 3 steps across from base_q, plus 3 steps along
-    // p side extends 3 steps across back from base_p (= base_q - step_across)
     if base_p < 3 * step_across {
         return;
     }
@@ -216,7 +175,6 @@ fn filter_edge_luma(
         return;
     }
 
-    // Read samples for edge decision at k=0 and k=3
     let k3 = 3 * step_along;
     let p0_0 = plane[base_p] as i32;
     let p1_0 = plane[base_p - step_across] as i32;
@@ -236,7 +194,6 @@ fn filter_edge_luma(
     let q2_3 = plane[base_q + k3 + 2 * step_across] as i32;
     let q3_3 = plane[base_q + k3 + 3 * step_across] as i32;
 
-    // Edge decision (H.265 8.7.2.5.3)
     let dp0 = (p2_0 - 2 * p1_0 + p0_0).abs();
     let dp3 = (p2_3 - 2 * p1_3 + p0_3).abs();
     let dq0 = (q2_0 - 2 * q1_0 + q0_0).abs();
@@ -252,7 +209,6 @@ fn filter_edge_luma(
         return;
     }
 
-    // Determine filter strength
     let d_sam0 = 2 * dpq0 < (beta >> 2)
         && (p3_0 - p0_0).abs() + (q0_0 - q3_0).abs() < (beta >> 3)
         && (p0_0 - q0_0).abs() < ((5 * tc + 1) >> 1);
@@ -265,11 +221,9 @@ fn filter_edge_luma(
     let d_ep = dp < ((beta + (beta >> 1)) >> 3);
     let d_eq = dq < ((beta + (beta >> 1)) >> 3);
 
-    // Apply filter for all 4 samples along the edge
     for k in 0..4usize {
         let k_off = k * step_along;
 
-        // Read p[0..3] and q[0..3] for this sample
         let p0 = plane[base_p + k_off] as i32;
         let p1 = plane[base_p + k_off - step_across] as i32;
         let p2 = plane[base_p + k_off - 2 * step_across] as i32;
@@ -282,7 +236,6 @@ fn filter_edge_luma(
             let q3 = plane[base_q + k_off + 3 * step_across] as i32;
             let tc2 = 2 * tc;
 
-            // Strong filter (H.265 8.7.2.5.7)
             let p0_f = ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3)
                 .clamp(p0 - tc2, p0 + tc2)
                 .clamp(0, max_val);
@@ -313,7 +266,6 @@ fn filter_edge_luma(
                 plane[base_q + k_off + 2 * step_across] = q2_f as u16;
             }
         } else {
-            // Weak filter
             let delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
 
             if delta.abs() < 10 * tc {
@@ -342,10 +294,6 @@ fn filter_edge_luma(
     }
 }
 
-/// Apply chroma deblocking filter
-///
-/// For I-slices, all edges have bS=2, so chroma deblocking applies everywhere.
-/// Chroma deblocking only modifies p0 and q0 (one sample on each side).
 fn apply_chroma_deblocking(
     frame: &mut DecodedFrame,
     tc_offset: i32,
@@ -356,10 +304,9 @@ fn apply_chroma_deblocking(
 ) {
     let width = frame.width;
     let height = end;
-    let bit_depth_c = frame.bit_depth as i32; // Same as luma for typical HEIC
+    let bit_depth_c = frame.bit_depth as i32;
     let max_val = (1i32 << bit_depth_c) - 1;
 
-    // Chroma subsampling factors
     let (sub_x, sub_y) = match frame.chroma_format {
         1 => (2u32, 2u32),
         2 => (2, 1),
@@ -371,18 +318,11 @@ fn apply_chroma_deblocking(
     let c_height = (height - frame.row_origin) / sub_y;
     let c_width = width / sub_x;
 
-    // For 4:2:0: chroma edges are at 8-chroma-pixel intervals (16 luma pixels).
-    // Per H.265 8.7.2, chroma deblocking requires both sides to have width/height >= 8
-    // in chroma samples. The edge processing unit is 4 chroma samples along the edge.
-    //
-    // Matching libde265: xIncr = 2*SubWidthC (in 4-luma-pixel deblock grid units),
-    // yIncr = SubHeightC for vertical, yIncr = 2*SubHeightC for horizontal.
-    let x_step_vert = 8 * sub_x; // luma x step for vertical edges (16 for 4:2:0)
-    let y_step_vert = 4 * sub_y; // luma y step for vertical edges (8 for 4:2:0)
-    let x_step_horiz = 4 * sub_x; // luma x step for horizontal edges (8 for 4:2:0)
-    let y_step_horiz = 8 * sub_y; // luma y step for horizontal edges (16 for 4:2:0)
+    let x_step_vert = 8 * sub_x;
+    let y_step_vert = 4 * sub_y;
+    let x_step_horiz = 4 * sub_x;
+    let y_step_horiz = 8 * sub_y;
 
-    // Pass 1: Vertical edges
     let mut x = x_step_vert;
     while x < width {
         let mut y = start;
@@ -403,7 +343,6 @@ fn apply_chroma_deblocking(
                 let cx = x / sub_x;
                 let cy = (y - frame.row_origin) / sub_y;
 
-                // Per-sample transquant-bypass exemption (H.265 8.7.2.5.7)
                 let mut p_bypass = [false; 4];
                 let mut q_bypass = [false; 4];
                 for k in 0..4u32 {
@@ -419,8 +358,6 @@ fn apply_chroma_deblocking(
                         cr_qp_offset
                     };
                     let qp_i = ((qp_q + qp_p + 1) >> 1) + qp_offset;
-                    // Table 8-10 mapping applies to 4:2:0 only (H.265
-                    // 8.7.2.5.5); otherwise QpC = Min(qPi, 51).
                     let qp_c = if frame.chroma_format == 1 {
                         chroma_qp_mapping(qp_i)
                     } else {
@@ -439,7 +376,6 @@ fn apply_chroma_deblocking(
                         &mut frame.cr_plane
                     };
 
-                    // Process 4 chroma samples along the edge
                     let num_samples = 4u32.min(c_height.saturating_sub(cy));
                     for k in 0..num_samples {
                         let row = (cy + k) as usize;
@@ -471,7 +407,6 @@ fn apply_chroma_deblocking(
         x += x_step_vert;
     }
 
-    // Pass 2: Horizontal edges
     let mut y = start.max(y_step_horiz);
     while y < height {
         let mut x = 0u32;
@@ -492,7 +427,6 @@ fn apply_chroma_deblocking(
                 let cx = x / sub_x;
                 let cy = (y - frame.row_origin) / sub_y;
 
-                // Per-sample transquant-bypass exemption (H.265 8.7.2.5.7)
                 let mut p_bypass = [false; 4];
                 let mut q_bypass = [false; 4];
                 for k in 0..4u32 {
@@ -508,8 +442,6 @@ fn apply_chroma_deblocking(
                         cr_qp_offset
                     };
                     let qp_i = ((qp_q + qp_p + 1) >> 1) + qp_offset;
-                    // Table 8-10 mapping applies to 4:2:0 only (H.265
-                    // 8.7.2.5.5); otherwise QpC = Min(qPi, 51).
                     let qp_c = if frame.chroma_format == 1 {
                         chroma_qp_mapping(qp_i)
                     } else {
@@ -528,7 +460,6 @@ fn apply_chroma_deblocking(
                         &mut frame.cr_plane
                     };
 
-                    // Process 4 chroma samples along the edge
                     let num_samples = 4u32.min(c_width.saturating_sub(cx));
                     for k in 0..num_samples {
                         let col = (cx + k) as usize;
