@@ -4422,17 +4422,27 @@ fn extract_primary_heic_item_data_with_grid_internal(
     }))
 }
 
+pub(crate) fn extract_heic_grid_descriptor(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+    meta: &MetaBox<'_>,
+    location: &ItemLocationItem,
+) -> Result<(u8, HeicGridDescriptor), ExtractHeicItemDataError> {
+    let (construction_method, grid_payload) =
+        extract_heic_item_payload_from_location(input, source, meta, location, location.item_id)?;
+    let descriptor = parse_heic_grid_descriptor(location.item_id, &grid_payload)?;
+    Ok((construction_method, descriptor))
+}
+
 pub(crate) fn extract_heic_grid_item_data(
     input: &[u8],
     source: &mut Option<&mut dyn RandomAccessSource>,
     meta: &MetaBox<'_>,
     resolved: &ResolvedPrimaryItemGraph<'_>,
-    location: &ItemLocationItem,
+    item_id: u32,
+    construction_method: u8,
+    descriptor: HeicGridDescriptor,
 ) -> Result<HeicGridPrimaryItemData, ExtractHeicItemDataError> {
-    let item_id = location.item_id;
-    let (construction_method, grid_payload) =
-        extract_heic_item_payload_from_location(input, source, meta, location, item_id)?;
-    let descriptor = parse_heic_grid_descriptor(item_id, &grid_payload)?;
     let tile_item_ids = grid_tile_item_ids(
         item_id,
         resolved

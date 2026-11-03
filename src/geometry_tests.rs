@@ -208,6 +208,22 @@ fn hevc_payload() -> Vec<u8> {
 }
 
 fn grid_alpha_fixture(candidates: &[(u16, bool)], tiles_per_side: u8) -> Vec<u8> {
+    grid_alpha_fixture_with_tile(
+        candidates,
+        tiles_per_side,
+        small_hevc_sps(),
+        16,
+        hevc_payload(),
+    )
+}
+
+fn grid_alpha_fixture_with_tile(
+    candidates: &[(u16, bool)],
+    tiles_per_side: u8,
+    sps: Vec<u8>,
+    tile_extent: u16,
+    tile_payload: Vec<u8>,
+) -> Vec<u8> {
     let candidate_ids: Vec<u16> = (3..).take(candidates.len()).collect();
     let count = 2 + candidate_ids.len() as u16;
     let mut info = count.to_be_bytes().to_vec();
@@ -215,12 +231,12 @@ fn grid_alpha_fixture(candidates: &[(u16, bool)], tiles_per_side: u8) -> Vec<u8>
     let mut associations = u32::from(count).to_be_bytes().to_vec();
     let mut references = Vec::new();
     let mut data = Vec::new();
-    let output = (16 * u16::from(tiles_per_side)).to_be_bytes();
+    let output = (tile_extent * u16::from(tiles_per_side)).to_be_bytes();
     let last_tile = tiles_per_side - 1;
     let descriptor = [&[0, 0, last_tile, last_tile][..], &output, &output].concat();
     let coded = [
         (1, b"hvc1", hevc_payload(), true),
-        (2, b"hvc1", hevc_payload(), true),
+        (2, b"hvc1", tile_payload, true),
     ];
     let grids = candidate_ids
         .iter()
@@ -261,8 +277,8 @@ fn grid_alpha_fixture(candidates: &[(u16, bool)], tiles_per_side: u8) -> Vec<u8>
         ));
     }
     let properties = [
-        hevc_configuration(small_hevc_sps()),
-        ispe(16, 16),
+        hevc_configuration(sps),
+        ispe(u32::from(tile_extent), u32::from(tile_extent)),
         full_box(b"auxC", 0, b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0"),
     ]
     .concat();
@@ -340,11 +356,21 @@ fn grid_alpha_is_held_to_the_callers_guardrails() {
 }
 
 #[test]
-fn grid_alpha_of_another_size_is_dropped_before_decoding() {
-    let (alpha, largest) =
-        tracked(|| decode_grid_alpha_fixture(&[(256, true)], 16, &DecodeGuardrails::default()));
+fn grid_alpha_of_another_size_is_dropped_before_its_tiles_are_copied() {
+    let tile_payload = [hevc_payload(), vec![0; 256 * 1024]].concat();
+    let input = grid_alpha_fixture_with_tile(&[(4, true)], 2, small_hevc_sps(), 16, tile_payload);
+    let (alpha, largest) = tracked(|| {
+        decode_primary_heic_auxiliary_alpha_plane_internal(
+            &input,
+            &mut None,
+            16,
+            16,
+            &DecodeGuardrails::default(),
+        )
+        .unwrap()
+    });
     assert!(alpha.is_none());
-    assert!(largest < 64 * 1024, "allocated a canvas: {largest}");
+    assert!(largest < 256 * 1024, "copied a tile: {largest}");
 }
 
 #[test]

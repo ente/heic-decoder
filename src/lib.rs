@@ -8024,13 +8024,26 @@ fn decode_auxiliary_alpha_grid<'a>(
     expected: (u32, u32),
     guardrails: &DecodeGuardrails,
 ) -> Result<Option<HeicAuxiliaryAlphaPlane>, DecodeHeicError> {
-    let Ok(grid) = isobmff::extract_heic_grid_item_data(input, source, meta, resolved, location)
+    let Ok((construction_method, descriptor)) =
+        isobmff::extract_heic_grid_descriptor(input, source, meta, location)
     else {
         return Ok(None);
     };
-    if (grid.descriptor.output_width, grid.descriptor.output_height) != expected
-        || geometry::preflight_grid(&grid, guardrails).is_err()
-    {
+    if (descriptor.output_width, descriptor.output_height) != expected {
+        return Ok(None);
+    }
+    let Ok(grid) = isobmff::extract_heic_grid_item_data(
+        input,
+        source,
+        meta,
+        resolved,
+        location.item_id,
+        construction_method,
+        descriptor,
+    ) else {
+        return Ok(None);
+    };
+    if geometry::preflight_grid(&grid, guardrails).is_err() {
         return Ok(None);
     }
     let decoded = match decode_primary_heic_grid_to_image(&grid) {
