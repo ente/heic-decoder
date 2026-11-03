@@ -7339,6 +7339,7 @@ const ICEF_SIZE_BITS_TABLE: [u8; 5] = [8, 16, 24, 32, 64];
 const AV01_ITEM_TYPE: [u8; 4] = *b"av01";
 const HVC1_ITEM_TYPE: [u8; 4] = *b"hvc1";
 const HEV1_ITEM_TYPE: [u8; 4] = *b"hev1";
+const GRID_ITEM_TYPE: [u8; 4] = *b"grid";
 const AUXL_REFERENCE_TYPE: [u8; 4] = *b"auxl";
 const CDSC_REFERENCE_TYPE: [u8; 4] = *b"cdsc";
 const EXIF_ITEM_TYPE: [u8; 4] = *b"Exif";
@@ -7913,6 +7914,8 @@ fn decode_primary_heic_auxiliary_alpha_plane_internal(
         return Ok(None);
     };
     let primary_item_id = resolved.primary_item.item_id;
+    let expected = (expected_width, expected_height);
+    let mut grid_alpha_tried = false;
 
     for reference in &iref.references {
         if reference.reference_type.as_bytes() != AUXL_REFERENCE_TYPE {
@@ -7922,16 +7925,24 @@ fn decode_primary_heic_auxiliary_alpha_plane_internal(
             continue;
         }
 
-        let Some(alpha_plane) = decode_auxiliary_alpha_item_candidate(
-            input,
-            source,
-            &meta,
-            &resolved,
-            reference.from_item_id,
-            (expected_width, expected_height),
-            guardrails,
-        )?
-        else {
+        let item_id = reference.from_item_id;
+        let candidate = if item_is_grid(&resolved, item_id) {
+            if grid_alpha_tried {
+                continue;
+            }
+            let Some(location) = auxiliary_alpha_grid_location(&resolved, item_id) else {
+                continue;
+            };
+            grid_alpha_tried = true;
+            decode_auxiliary_alpha_grid(
+                input, source, &meta, &resolved, location, expected, guardrails,
+            )?
+        } else {
+            decode_auxiliary_alpha_item_candidate(
+                input, source, &meta, &resolved, item_id, expected, guardrails,
+            )?
+        };
+        let Some(alpha_plane) = candidate else {
             continue;
         };
 
@@ -7970,6 +7981,63 @@ fn decode_auxiliary_alpha_item_candidate<'a>(
     if decoded.y_plane.samples.len() != expected_samples {
         return Ok(None);
     }
+    Ok(Some(HeicAuxiliaryAlphaPlane {
+        width: decoded.width,
+        height: decoded.height,
+        bit_depth: decoded.bit_depth_luma,
+        samples: decoded.y_plane.samples,
+    }))
+}
+
+fn item_is_grid(resolved: &isobmff::ResolvedPrimaryItemGraph<'_>, item_id: u32) -> bool {
+    resolved
+        .iinf
+        .entries
+        .iter()
+        .find(|entry| entry.item_id == item_id)
+        .and_then(|entry| entry.item_type)
+        .is_some_and(|item_type| item_type.as_bytes() == GRID_ITEM_TYPE)
+}
+
+fn auxiliary_alpha_grid_location<'r>(
+    resolved: &'r isobmff::ResolvedPrimaryItemGraph<'_>,
+    item_id: u32,
+) -> Option<&'r isobmff::ItemLocationItem> {
+    let location = resolved
+        .iloc
+        .items
+        .iter()
+        .find(|item| item.item_id == item_id)?;
+    let properties = resolved_item_properties_for_item(resolved, item_id)?;
+    properties
+        .iter()
+        .any(property_is_alpha_auxiliary_type_property)
+        .then_some(location)
+}
+
+fn decode_auxiliary_alpha_grid<'a>(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+    meta: &isobmff::MetaBox<'a>,
+    resolved: &isobmff::ResolvedPrimaryItemGraph<'a>,
+    location: &isobmff::ItemLocationItem,
+    expected: (u32, u32),
+    guardrails: &DecodeGuardrails,
+) -> Result<Option<HeicAuxiliaryAlphaPlane>, DecodeHeicError> {
+    let Ok(grid) = isobmff::extract_heic_grid_item_data(input, source, meta, resolved, location)
+    else {
+        return Ok(None);
+    };
+    if (grid.descriptor.output_width, grid.descriptor.output_height) != expected
+        || geometry::preflight_grid(&grid, guardrails).is_err()
+    {
+        return Ok(None);
+    }
+    let decoded = match decode_primary_heic_grid_to_image(&grid) {
+        Ok(decoded) => decoded,
+        Err(error @ DecodeHeicError::AllocationFailed { .. }) => return Err(error),
+        Err(_) => return Ok(None),
+    };
     Ok(Some(HeicAuxiliaryAlphaPlane {
         width: decoded.width,
         height: decoded.height,

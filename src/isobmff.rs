@@ -4367,17 +4367,89 @@ fn extract_primary_heic_item_data_with_grid_internal(
         }
     }
 
-    let tile_item_ids: Vec<u32> = resolved
-        .primary_item
-        .references
-        .iter()
+    let tile_item_ids = grid_tile_item_ids(item_id, &resolved.primary_item.references)?;
+    let tiles = extract_heic_grid_tiles(
+        input,
+        source,
+        &meta,
+        &resolved,
+        item_id,
+        &descriptor,
+        &tile_item_ids,
+    )?;
+
+    Ok(HeicPrimaryItemDataWithGrid::Grid(HeicGridPrimaryItemData {
+        item_id,
+        construction_method,
+        descriptor,
+        colr,
+        tile_item_ids,
+        tiles,
+    }))
+}
+
+pub(crate) fn extract_heic_grid_item_data(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+    meta: &MetaBox<'_>,
+    resolved: &ResolvedPrimaryItemGraph<'_>,
+    location: &ItemLocationItem,
+) -> Result<HeicGridPrimaryItemData, ExtractHeicItemDataError> {
+    let item_id = location.item_id;
+    let (construction_method, grid_payload) =
+        extract_heic_item_payload_from_location(input, source, meta, location, item_id)?;
+    let descriptor = parse_heic_grid_descriptor(item_id, &grid_payload)?;
+    let tile_item_ids = grid_tile_item_ids(
+        item_id,
+        resolved
+            .iref
+            .iter()
+            .flat_map(|iref| &iref.references)
+            .filter(|reference| reference.from_item_id == item_id),
+    )?;
+    let tiles = extract_heic_grid_tiles(
+        input,
+        source,
+        meta,
+        resolved,
+        item_id,
+        &descriptor,
+        &tile_item_ids,
+    )?;
+    Ok(HeicGridPrimaryItemData {
+        item_id,
+        construction_method,
+        descriptor,
+        colr: PrimaryItemColorProperties::default(),
+        tile_item_ids,
+        tiles,
+    })
+}
+
+fn grid_tile_item_ids<'a>(
+    item_id: u32,
+    references: impl IntoIterator<Item = &'a ItemReferenceEntry>,
+) -> Result<Vec<u32>, ExtractHeicItemDataError> {
+    let tile_item_ids: Vec<u32> = references
+        .into_iter()
         .filter(|reference| reference.reference_type.as_bytes() == DIMG_REFERENCE_TYPE)
         .flat_map(|reference| reference.to_item_ids.iter().copied())
         .collect();
     if tile_item_ids.is_empty() {
         return Err(ExtractHeicItemDataError::MissingGridTileReferences { item_id });
     }
+    Ok(tile_item_ids)
+}
 
+fn extract_heic_grid_tiles(
+    input: &[u8],
+    source: &mut Option<&mut dyn RandomAccessSource>,
+    meta: &MetaBox<'_>,
+    resolved: &ResolvedPrimaryItemGraph<'_>,
+    item_id: u32,
+    descriptor: &HeicGridDescriptor,
+    tile_item_ids: &[u32],
+) -> Result<Vec<HeicGridTileItemData>, ExtractHeicItemDataError> {
     let expected_tiles_u64 = u64::from(descriptor.rows) * u64::from(descriptor.columns);
     let expected_tiles = usize::try_from(expected_tiles_u64).map_err(|_| {
         ExtractHeicItemDataError::PayloadTooLarge {
@@ -4408,7 +4480,7 @@ fn extract_primary_heic_item_data_with_grid_internal(
     for (index, item) in resolved.iloc.items.iter().enumerate() {
         iloc_index.entry(item.item_id).or_insert(index);
     }
-    let mut distinct_tile_ids: Vec<u32> = tile_item_ids.clone();
+    let mut distinct_tile_ids = tile_item_ids.to_vec();
     distinct_tile_ids.sort_unstable();
     distinct_tile_ids.dedup();
     let mut associations_by_item: BTreeMap<u32, Vec<&ItemPropertyAssociation>> = BTreeMap::new();
@@ -4455,7 +4527,7 @@ fn extract_primary_heic_item_data_with_grid_internal(
     let mut total_tile_payload_bytes = 0_u64;
 
     let mut tiles = Vec::with_capacity(tile_item_ids.len());
-    for &tile_item_id in &tile_item_ids {
+    for &tile_item_id in tile_item_ids {
         let tile_item_info = &resolved.iinf.entries[*iinf_index.get(&tile_item_id).ok_or(
             ExtractHeicItemDataError::MissingGridTileItemInfo {
                 item_id,
@@ -4508,7 +4580,7 @@ fn extract_primary_heic_item_data_with_grid_internal(
             extract_heic_item_payload_from_location_with_idat(
                 input,
                 source,
-                &meta,
+                meta,
                 tile_location,
                 tile_item_id,
                 shared_idat_payload,
@@ -4537,14 +4609,7 @@ fn extract_primary_heic_item_data_with_grid_internal(
         });
     }
 
-    Ok(HeicPrimaryItemDataWithGrid::Grid(HeicGridPrimaryItemData {
-        item_id,
-        construction_method,
-        descriptor,
-        colr,
-        tile_item_ids,
-        tiles,
-    }))
+    Ok(tiles)
 }
 
 type GridTileProperties = (
