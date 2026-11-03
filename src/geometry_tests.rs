@@ -374,6 +374,44 @@ fn grid_alpha_of_another_size_is_dropped_before_its_tiles_are_copied() {
 }
 
 #[test]
+fn grid_alpha_that_fails_to_decode_is_dropped() {
+    let input = grid_alpha_fixture_with_tile(
+        &[(1, true)],
+        1,
+        small_hevc_sps(),
+        16,
+        hevc_payload_with_nal_header([0x28, 0x09]),
+    );
+    let alpha = decode_primary_heic_auxiliary_alpha_plane_internal(
+        &input,
+        &mut None,
+        16,
+        16,
+        &DecodeGuardrails::default(),
+    );
+    assert!(matches!(alpha, Ok(None)));
+}
+
+#[test]
+fn grid_alpha_allocation_failure_is_propagated() {
+    let input =
+        grid_alpha_fixture_with_tile(&[(1, true)], 1, large_hevc_sps(), 126, hevc_payload());
+    let result = with_allocations_failing_at(128 * 128 * 2, || {
+        decode_primary_heic_auxiliary_alpha_plane_internal(
+            &input,
+            &mut None,
+            126,
+            126,
+            &DecodeGuardrails::default(),
+        )
+    });
+    assert!(matches!(
+        result,
+        Err(DecodeHeicError::AllocationFailed { .. })
+    ));
+}
+
+#[test]
 fn heic_alpha_rejects_coded_geometry_before_plane_allocation() {
     let input = image_fixture(
         b"hvc1",
