@@ -4564,12 +4564,13 @@ fn extract_heic_grid_tiles(
     let mut property_cache = GridTilePropertyCache::default();
     let mut tile_properties_by_item = BTreeMap::new();
     let mut tile_payloads_by_item = BTreeMap::new();
-    let tile_payload_budget = source
+    let tile_copy_budget = source
         .as_ref()
         .map_or(input.len() as u64, |source| source.len())
-        .saturating_mul(4)
-        .max(MAX_GRID_TILE_PAYLOAD_BYTES);
+        .saturating_mul(4);
+    let tile_payload_budget = tile_copy_budget.max(MAX_GRID_TILE_PAYLOAD_BYTES);
     let mut total_tile_payload_bytes = 0_u64;
+    let mut copied_tile_payload_bytes = 0_u64;
 
     let mut tiles = Vec::with_capacity(tile_item_ids.len());
     for &tile_item_id in tile_item_ids {
@@ -4633,6 +4634,8 @@ fn extract_heic_grid_tiles(
                         tile_item_id,
                         shared_idat_payload,
                     )?;
+                copied_tile_payload_bytes =
+                    copied_tile_payload_bytes.saturating_add(payload.len() as u64);
                 entry.insert((construction_method, Arc::new(payload)))
             }
         }
@@ -4649,6 +4652,14 @@ fn extract_heic_grid_tiles(
             return Err(ExtractHeicItemDataError::PayloadTooLarge {
                 item_id,
                 length: total_tile_data_bytes,
+            });
+        }
+        let copied_tile_data_bytes =
+            copied_tile_payload_bytes.saturating_add(property_cache.color_profile_bytes);
+        if copied_tile_data_bytes > tile_copy_budget {
+            return Err(ExtractHeicItemDataError::PayloadTooLarge {
+                item_id,
+                length: copied_tile_data_bytes,
             });
         }
         tiles.push(HeicGridTileItemData {
@@ -8706,6 +8717,55 @@ mod tests {
             &extra_associations,
         ))
         .expect_err("per-composition profile copies must be budgeted");
+        assert!(matches!(
+            err,
+            ExtractHeicItemDataError::PayloadTooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn grid_tile_payload_copies_are_budgeted_against_the_file_size() {
+        let tile_ids: Vec<u16> = (2..10).collect();
+
+        let err = extract_primary_heic_item_data_with_grid(&minimal_heic_grid_file(
+            (1, 8),
+            (512, 64),
+            &tile_ids,
+            &[0xAB; 64 * 1024],
+            &[hvcc_box()],
+            &[1],
+            &[],
+        ))
+        .expect_err("distinct tiles sharing one extent must not be copied past the budget");
+        assert!(matches!(
+            err,
+            ExtractHeicItemDataError::PayloadTooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn grid_tile_color_profile_copies_are_budgeted_against_the_file_size() {
+        let profile = vec![0x5A_u8; 64 * 1024];
+        let tile_ids: Vec<u16> = (2..10).collect();
+        let mut properties = vec![hvcc_box(), colr_icc_box(&profile)];
+        properties.extend((0..8).map(|_| colr_nclx_box(1, 13, 6, true)));
+        let nclx_indices: Vec<[u8; 1]> = (3..11).map(|index| [index]).collect();
+        let extra_associations: Vec<(u16, &[u8])> = tile_ids
+            .iter()
+            .zip(&nclx_indices)
+            .map(|(&tile_id, index)| (tile_id, &index[..]))
+            .collect();
+
+        let err = extract_primary_heic_item_data_with_grid(&minimal_heic_grid_file(
+            (1, 8),
+            (512, 64),
+            &tile_ids,
+            &[0x11; 16],
+            &properties,
+            &[1, 2],
+            &extra_associations,
+        ))
+        .expect_err("profile copies must not exceed the budget");
         assert!(matches!(
             err,
             ExtractHeicItemDataError::PayloadTooLarge { .. }
