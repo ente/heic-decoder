@@ -14134,7 +14134,7 @@ mod tests {
             .into(),
             colr: Default::default(),
             transforms: Default::default(),
-            payload: Vec::new(),
+            payload: Default::default(),
         };
 
         let sps = super::hevc_sps_from_nal(&sps_nal, 0).expect("SPS should parse");
@@ -14187,7 +14187,7 @@ mod tests {
             .into(),
             colr: Default::default(),
             transforms: Default::default(),
-            payload,
+            payload: payload.into(),
         };
 
         let small = super::hevc_sps_from_nal(&small_sps, 0).expect("small SPS should parse");

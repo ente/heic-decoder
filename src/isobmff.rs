@@ -685,7 +685,7 @@ pub struct HeicGridTileItemData {
     pub hvcc: Arc<HevcDecoderConfigurationBox>,
     pub colr: Arc<PrimaryItemColorProperties>,
     pub transforms: Arc<[PrimaryItemTransformProperty]>,
-    pub payload: Vec<u8>,
+    pub payload: Arc<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4553,6 +4553,7 @@ fn extract_heic_grid_tiles(
     };
     let mut property_cache = GridTilePropertyCache::default();
     let mut tile_properties_by_item = BTreeMap::new();
+    let mut tile_payloads_by_item = BTreeMap::new();
     let tile_payload_budget = source
         .as_ref()
         .map_or(input.len() as u64, |source| source.len())
@@ -4604,21 +4605,28 @@ fn extract_heic_grid_tiles(
             }
             .clone();
 
-        let tile_location = &resolved.iloc.items[*iloc_index.get(&tile_item_id).ok_or(
-            ExtractHeicItemDataError::MissingGridTileLocation {
-                item_id,
-                tile_item_id,
-            },
-        )?];
-        let (tile_construction_method, payload) =
-            extract_heic_item_payload_from_location_with_idat(
-                input,
-                source,
-                meta,
-                tile_location,
-                tile_item_id,
-                shared_idat_payload,
-            )?;
+        let (tile_construction_method, payload) = match tile_payloads_by_item.entry(tile_item_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let tile_location = &resolved.iloc.items[*iloc_index.get(&tile_item_id).ok_or(
+                    ExtractHeicItemDataError::MissingGridTileLocation {
+                        item_id,
+                        tile_item_id,
+                    },
+                )?];
+                let (construction_method, payload) =
+                    extract_heic_item_payload_from_location_with_idat(
+                        input,
+                        source,
+                        meta,
+                        tile_location,
+                        tile_item_id,
+                        shared_idat_payload,
+                    )?;
+                entry.insert((construction_method, Arc::new(payload)))
+            }
+        }
+        .clone();
         total_tile_payload_bytes = total_tile_payload_bytes
             .checked_add(payload.len() as u64)
             .ok_or(ExtractHeicItemDataError::PayloadTooLarge {
@@ -8363,6 +8371,27 @@ mod tests {
             panic!("expected grid");
         };
         grid
+    }
+
+    #[test]
+    fn grid_tile_payloads_are_shared_across_duplicate_references() {
+        let grid = resolved_grid(&minimal_heic_grid_file(
+            (16, 16),
+            (64, 64),
+            &[2_u16; 256],
+            &[0x11; 16],
+            &[hvcc_box()],
+            &[1],
+            &[],
+        ));
+
+        assert_eq!(grid.tiles.len(), 256);
+        assert_eq!(grid.tiles[0].payload.as_slice(), [0x11; 16]);
+        assert!(
+            grid.tiles
+                .iter()
+                .all(|tile| Arc::ptr_eq(&tile.payload, &grid.tiles[0].payload))
+        );
     }
 
     #[test]

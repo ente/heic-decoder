@@ -402,7 +402,7 @@ fn grid_fixture() -> isobmff::HeicGridPrimaryItemData {
             hvcc: hvcc.into(),
             colr: Default::default(),
             transforms: Default::default(),
-            payload: hevc_payload(),
+            payload: hevc_payload().into(),
         }],
     }
 }
@@ -659,7 +659,8 @@ fn heic_grid_checks_replacement_sps_in_payload() {
         &replacement,
         &hevc_payload(),
     ]
-    .concat();
+    .concat()
+    .into();
     let (result, largest) = tracked(|| decode_primary_heic_grid_to_image(&grid));
     assert!(result.is_err());
     assert!(largest < 128 * 128 * 2);
@@ -976,7 +977,8 @@ fn grid_with_filler(tile_count: u16, filler_bytes: usize) -> isobmff::HeicGridPr
         &filler,
         &hevc_payload(),
     ]
-    .concat();
+    .concat()
+    .into();
     grid.descriptor.columns = tile_count;
     grid.descriptor.output_width = 16 * u32::from(tile_count);
     for index in 1..tile_count {
@@ -1285,7 +1287,7 @@ fn grid_tile_streams_with_hidden_parameter_sets_decode_strictly() {
             .into(),
         colr: Default::default(),
         transforms: Default::default(),
-        payload: hevc_payload(),
+        payload: hevc_payload().into(),
     };
     let (decoded, largest) = tracked(|| crate::decode_heic_grid_tile_to_image(&tile).unwrap());
     assert_eq!((decoded.width, decoded.height), (16, 16));
@@ -1502,7 +1504,7 @@ fn tiled_grid(
         hvcc: hvcc.into(),
         colr: Default::default(),
         transforms: Default::default(),
-        payload: hevc_payload(),
+        payload: hevc_payload().into(),
     };
     let tile_count = u32::from(columns) * u32::from(rows);
     isobmff::HeicGridPrimaryItemData {
