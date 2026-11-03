@@ -5,6 +5,7 @@ This document is the practical API reference for integrating `heic_decoder` in a
 ## Scope
 
 - Decode HEIF/HEIC/AVIF to RGBA (`u8` or `u16` storage).
+- Decode HEVC-coded HEIC/HEIF straight to RGB8 when alpha is not needed.
 - Decode from bytes, `Read`, `BufRead`, and file paths.
 - Optional `image` crate integration through hook registration.
 - Keep default decode output aligned with primary item transforms (`clap`/`irot`/`imir`) and expose explicit EXIF orientation helpers.
@@ -41,6 +42,11 @@ image = { version = "0.25", default-features = false, features = ["png"] }
   - `source_bit_depth`
   - `pixels: DecodedRgbaPixels` (`U8(Vec<u8>)` or `U16(Vec<u16>)`)
   - `icc_profile: Option<Vec<u8>>`
+- `DecodedRgbImage`
+  - `width`, `height`
+  - `source_bit_depth`
+  - `pixels: Vec<u8>` (RGB8 interleaved)
+  - `icc_profile: Option<Vec<u8>>`
 - `ExifOrientationHint`
   - `exif_orientation: Option<u8>`
   - `primary_item_has_orientation_transform: bool`
@@ -64,6 +70,37 @@ Result<DecodedRgbaImage, DecodeError>
 - `decode_path_to_rgba_with_guardrails(path, guardrails)`
 
 Non-guardrailed convenience variants also exist (`decode_*_to_rgba`) and use `DecodeGuardrails::default()`.
+
+### RGB8 output
+
+For callers that only need RGB, such as pipelines that would otherwise call
+`DynamicImage::into_rgb8` on the RGBA result:
+
+- `decode_bytes_to_rgb8_with_guardrails(input, guardrails)`
+- `decode_path_to_rgb8_with_guardrails(path, guardrails)`
+
+Both return `Result<DecodedRgbImage, DecodeError>`. `decode_bytes_to_rgb8` and
+`decode_path_to_rgb8` use `DecodeGuardrails::default()`. There are no
+`Read`/`BufRead` variants.
+
+Contract:
+
+- Only HEVC-coded primary items (`hvc1`/`hev1`, or a `grid` of them) are
+  supported. AVIF and uncompressed (`unci`) HEIF return an error; use the RGBA
+  entry points for those.
+- Calling RGB8 is an explicit request to drop alpha. Auxiliary alpha is not
+  decoded and no RGBA buffer is allocated. On large images this roughly halves
+  peak memory compared with decoding RGBA and then calling `into_rgb8`.
+- `pixels` holds `width * height * 3` bytes, row-major with no padding.
+  Primary item transforms (`clap`/`irot`/`imir`) are applied and EXIF
+  orientation is not, as with RGBA. `DecodedRgbImage` has no orientation
+  helper.
+- Output is always 8-bit; `source_bit_depth` reports the coded bit depth.
+- When the RGBA decode of the same input succeeds, `pixels` is byte-for-byte
+  equal to that RGBA output converted with `DynamicImage::into_rgb8`. For
+  high-bit-depth input this means each RGBA16 sample `v` becomes
+  `(v + 128) / 257`.
+- `icc_profile` matches the RGBA output's.
 
 ### PNG output
 
