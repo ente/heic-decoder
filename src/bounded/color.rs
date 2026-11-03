@@ -31,9 +31,9 @@ impl ColorTransform {
             return Err(Error::Unsupported("HDR transfer function"));
         }
         let nclx = color.nclx.as_ref().filter(|n| !n.is_undefined());
-        let srgb_or_unspecified = |primaries, transfer| {
-            matches!(primaries, 1 | 2) && matches!(transfer, 1 | 2 | 6 | 13..=15)
-        };
+        let srgb_transfer = |transfer: u16| matches!(transfer, 1 | 2 | 6 | 13..=15);
+        let srgb_or_unspecified =
+            |primaries, transfer| matches!(primaries, 1 | 2) && srgb_transfer(transfer);
         if color.icc == Some(&[])
             && nclx.is_some_and(|n| {
                 !srgb_or_unspecified(n.colour_primaries, n.transfer_characteristics)
@@ -43,10 +43,8 @@ impl ColorTransform {
         }
         if color.icc.is_none()
             && nclx.is_none()
-            && !srgb_or_unspecified(
-                u16::from(bitstream_primaries),
-                u16::from(bitstream_transfer),
-            )
+            && !(matches!(bitstream_primaries, 1 | 2 | 5 | 6)
+                && srgb_transfer(u16::from(bitstream_transfer)))
         {
             return Err(Error::Unsupported("unprofiled HEVC color"));
         }
@@ -303,7 +301,7 @@ mod tests {
         for icc in [None, Some(&[][..])] {
             for nclx in [None, Some(undefined.clone())] {
                 let color = Color { icc, nclx };
-                for (primaries, transfer) in [(9, 13), (12, 1), (1, 8), (2, 17)] {
+                for (primaries, transfer) in [(9, 13), (12, 1), (1, 8), (2, 17), (5, 8), (7, 6)] {
                     let result = ColorTransform::new(&color, primaries, transfer, &budget);
                     if icc.is_some() {
                         assert!(result.unwrap().is_identity());
@@ -314,7 +312,7 @@ mod tests {
                         ));
                     }
                 }
-                for primaries in [1, 2] {
+                for primaries in [1, 2, 5, 6] {
                     for transfer in [1, 2, 6, 13, 14, 15] {
                         assert!(
                             ColorTransform::new(&color, primaries, transfer, &budget)
