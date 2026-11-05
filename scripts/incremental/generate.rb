@@ -50,13 +50,17 @@ cases = [
   ['odd-width-grid', 'edge', 1, 1, { 'GRID' => '1', 'CANVAS' => '255x256', 'CROP' => '253x254' }],
   ['odd-height-grid', 'vertical', 1, 1, { 'GRID' => '1', 'CANVAS' => '256x255', 'CROP' => '254x253' }],
   ['undefined-grid-nclx', 'direct', 2, 2, { 'TILE_NCLX' => '1/13/1/0', 'PRIMARY_NCLX' => '2/2/2/1' }],
-  ['invalid-grid-references', 'direct', 2, 2, { 'REFERENCE_COUNT' => '65535' }]
+  ['invalid-grid-references', 'direct', 2, 2, { 'REFERENCE_COUNT' => '65535' }],
+  ['tile-crop/odd-tile-crop', 'edge', 1, 1, { 'GRID' => '1', 'CANVAS' => '253x254', 'TILE_CROP' => '253x254' }],
+  ['tile-crop/odd-tile-vertical', 'vertical', 1, 1, { 'GRID' => '1', 'CANVAS' => '254x253', 'TILE_CROP' => '254x253' }],
+  ['tile-crop/odd-tile-photo', 'direct', 1, 1, { 'GRID' => '1', 'CANVAS' => '254x254', 'TILE_CROP' => '254x254' }]
 ]
 cases.each do |name, encoded, columns, rows, options|
   _, width, height = encodes.find { |entry| entry[0] == encoded }
   extension = name == 'invalid-grid-references' ? 'bin' : 'heic'
   path = File.join(output, "#{name}.#{extension}")
-  environment = %w[GRID CANVAS CROP ROTATION MIRROR TILE_NCLX PRIMARY_NCLX REFERENCE_COUNT].to_h { |key| [key, nil] }.merge(options)
+  FileUtils.mkdir_p(File.dirname(path))
+  environment = %w[GRID CANVAS CROP TILE_CROP ROTATION MIRROR TILE_NCLX PRIMARY_NCLX REFERENCE_COUNT].to_h { |key| [key, nil] }.merge(options)
   execute(environment, RbConfig.ruby, File.join(__dir__, 'wrap.rb'), File.join(output, "#{encoded}.hevc"),
           path, width.to_s, height.to_s, columns.to_s, rows.to_s)
   oracle_png(oracle, path, path.sub(/\.heic$/, '.png')) if extension == 'heic'
@@ -68,7 +72,7 @@ manifest = {
   ffmpeg: execute('ffmpeg', '-version').lines.first.strip,
   inputs: cases.to_h do |name, *_|
     path = File.join(output, "#{name}.#{name == 'invalid-grid-references' ? 'bin' : 'heic'}")
-    [File.basename(path), Digest::SHA256.file(path).hexdigest]
+    [path.delete_prefix("#{output}/"), Digest::SHA256.file(path).hexdigest]
   end
 }
 File.write(File.join(output, 'manifest.json'), JSON.pretty_generate(manifest))

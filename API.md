@@ -252,6 +252,19 @@ Default decode behavior:
 - Decode does not implicitly apply EXIF orientation.
 - This keeps output stable for libheif parity and avoids hidden double-rotation behavior.
 
+Clean-aperture crops follow libheif when they would split chroma samples. If a
+leading `clap` on a 4:2:0 image has an odd left or top edge, or one on a 4:2:2
+image has an odd left edge, the HEVC decode paths first convert the image to
+4:4:4 with bilinear chroma. If the coded colour is limited range, they then
+convert it through RGB to full-range 4:4:4, as libheif does, and crop
+afterwards. The coded stream's colour drives that conversion; a `colr` nclx
+property replaces it only after the crop. The same applies to primary items,
+to grids as a whole, and to individual grid tiles. Image edges use clamped
+interpolation, matching libheif after its 2026-10 border fix. The pinned
+libheif 1.21.2 validator differs on output rows or columns that keep an image
+edge. A `clap` after `irot`/`imir` keeps the earlier behaviour: the crop is
+taken from RGBA converted with nearest-neighbour chroma.
+
 Orientation APIs:
 
 - `exif_orientation_hint(input_bytes)` -> `ExifOrientationHint`

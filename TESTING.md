@@ -9,7 +9,7 @@ The harness mirrors the correctness and performance checks used in `libheic-rs`.
 It uses libheif only as an external validator and optional corpus source. The
 crate does not use libheif source code or link to libheif.
 
-The default corpus has three parts:
+The default corpus has four parts:
 
 1. the libheif checkout's sample/test/fuzz images,
 2. the HEIC fixture corpus from
@@ -20,18 +20,23 @@ The default corpus has three parts:
    corpora reaches: 10/12-bit, 4:2:2, 4:4:4, lossless, transform skip,
    custom scaling lists, extreme QPs, small CTUs, 1-CTB-wide WPP, NxN intra
    partitions, and odd/tiny picture sizes. Several of these paths carried
-   silent-corruption bugs before this corpus existed.
+   silent-corruption bugs before this corpus existed, and
+4. the locally generated incremental corpus (once generated, see
+   [Incremental bounded decoder](#incremental-bounded-decoder)) — synthetic
+   crops, orientations, grids, and colour metadata, including clean apertures
+   with odd origins.
 
 Changes to the HEIC decoder should be regression-tested with a default-corpus
-`verify` run, which covers all three. None of the corpora are ever checked
+`verify` run, which covers all four. None of the corpora are ever checked
 into this repository.
 
 CI runs this on every pull request (`.github/workflows/tests.yml`): a `lint`
 job (`cargo fmt --check`, clippy, `cargo test`) and a `verify` job that
-performs the full default-corpus correctness pass, including stress-corpus
-generation. The workflow pins the Rust toolchain plus the libpng, libheif, and
-ente test-fixtures commits it fetches; bump those pins in the workflow to move
-the CI toolchain, validator, or corpus forward deliberately.
+performs the full default-corpus correctness pass, including stress- and
+incremental-corpus generation. The workflow pins the Rust toolchain plus the
+libpng, libheif, and ente test-fixtures commits it fetches; bump those pins in
+the workflow to move the CI toolchain, validator, or corpus forward
+deliberately.
 
 - pixel-for-pixel PNG comparison against an external `heif-dec` validator
 - pixel-for-pixel comparison of the `image` crate integration hook output
@@ -236,6 +241,14 @@ and height-growth cases missing from that corpus in the ignored
 `.heic-test-assets/incremental-corpus` directory. All reference PNGs come from
 live strict libheif decoding. Its manifest records source, oracle, FFmpeg,
 and input identities; encoded bytes can differ across libx265 versions.
+Grid tiles are hidden items, so `heif-dec` writes only the primary image.
+Once the corpus exists, default `verify` runs also compare each of its `.heic`
+files exactly against `heif-dec`. Regenerate a corpus made before tiles were
+hidden: `heif-dec` writes visible tiles first, and `verify` would compare the
+primary decode against a tile. Cases whose grid tiles carry their own odd
+clean aperture are written to the `tile-crop` subdirectory. The incremental
+and bounded decoders refuse tile crops, so the incremental runner below only
+receives the top-level files, and default `verify` covers the subdirectory.
 
 ```bash
 cmake -S scripts/incremental -B .heic-test-runs/incremental-oracle \
@@ -279,21 +292,34 @@ must retain exact sample checks against an independent decoder. ICC
 normalization currently shares moxcms with the implementation; separate qcms
 unit tests cover that boundary.
 
-The pinned libheif has a bilinear chroma-border indexing defect. Odd-grid
-regressions retain an interior aperture so they still exercise the final
-chroma neighbor without depending on its erroneous outer-border conversion.
-Every supplied input uses the unmodified live strict oracle; there are no
-stored corrected PNGs or input-specific comparison exceptions. This leaves
-the affected outer-border RGB conversion outside independent libheif coverage.
-Do not raise the global tolerance or silently classify discrepancies as
-oracle defects.
+For a clean aperture that splits chroma samples, libheif converts the image
+to 4:4:4 with bilinear chroma before cropping. If the coded colour is limited
+range, it also converts the image through RGB to full-range 4:4:4, because
+that conversion targets a default full-range profile. The regular decoders
+reproduce both steps for primary items, grids, and grid tiles. Default
+`verify` compares them exactly against `heif-dec` on `odd-short`, `oriented`,
+`odd-tall`, `odd-pipeline`, `odd-width-grid`, `odd-height-grid`, and the
+three `tile-crop` cases.
+
+The pinned libheif has a bilinear chroma-border indexing defect, fixed
+upstream by strukturag/libheif commit 215cbdad. The decoders implement the
+fixed border. Odd-grid regressions retain an interior aperture so they still
+exercise the final chroma neighbor without depending on its erroneous
+outer-border conversion. Every supplied input uses the unmodified live strict
+oracle; there are no stored corrected PNGs or input-specific comparison
+exceptions. This leaves the affected outer-border RGB conversion outside
+independent libheif coverage. Do not raise the global tolerance or silently
+classify discrepancies as oracle defects.
 
 A separate high-frequency odd-crop probe remains outside the passing corpus:
 at side 6000, one green sample is 72 versus the strict oracle's 70, despite
 exact native YUV agreement with FFmpeg. The sample lies inside a band, and
-the display-conversion cause remains unresolved. The one-value RGB gate is
-unchanged; this probe is not counted as a passing input. Preserve it for
-the decoder compatibility follow-up.
+the display-conversion cause remains unresolved. The incremental path
+converts its bilinear chroma straight to RGB and omits libheif's
+limited-range round trip through full-range 4:4:4; that difference has not
+yet been confirmed as the cause. The one-value RGB gate is unchanged; this
+probe is not counted as a passing input. Preserve it for the decoder
+compatibility follow-up.
 
 For a supplied large supported image, measure allocator requests separately
 from uninstrumented decode timing:
@@ -328,6 +354,7 @@ packages a supplied one-IDR Annex-B 8-bit 4:2:0 stream into a direct HEIC or
 repeated-tile grid; its dimensions must match the stream. `CROP`, `ROTATION`
 and `MIRROR` environment variables add fixture transforms without re-encoding.
 `GRID=1` creates a single-tile grid, `CANVAS` clips its visible dimensions,
+`TILE_CROP` adds a centred clean aperture to every grid tile,
 `TILE_NCLX` and `PRIMARY_NCLX` set color metadata, and `REFERENCE_COUNT`
 constructs malformed reference-count regression inputs.
 The 200 MP photographic fixture used during development was externally

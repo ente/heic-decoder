@@ -19,8 +19,8 @@ def box(kind, data)
   [data.bytesize + 8].pack('N') + kind + data
 end
 
-def full(kind, version, data)
-  box(kind, [version << 24].pack('N') + data)
+def full(kind, version, data, flags = 0)
+  box(kind, [(version << 24) | flags].pack('N') + data)
 end
 
 count = columns * rows
@@ -40,6 +40,13 @@ primary_color = nil
   properties << box('colr', 'nclx' + [primaries, transfer, matrix, range << 7].pack('nnnC'))
   target == :tile ? tile_color = properties.length : primary_color = properties.length
 end
+tile_crop = nil
+if ENV['TILE_CROP']
+  raise 'TILE_CROP requires a grid' unless grid
+  w, h = ENV.fetch('TILE_CROP').split('x').map { |n| Integer(n) }
+  properties << box('clap', [w, 1, h, 1, 0, 1, 0, 1].pack('N*'))
+  tile_crop = properties.length
+end
 extra = []
 if ENV['CROP']
   w, h = ENV.fetch('CROP').split('x').map { |n| Integer(n) }
@@ -56,11 +63,12 @@ if ENV['MIRROR']
 end
 items = (1..total).map do |id|
   kind = id == primary && grid ? 'grid' : 'hvc1'
-  full('infe', 2, [id, 0].pack('nn') + kind + "\0")
+  full('infe', 2, [id, 0].pack('nn') + kind + "\0", grid && id != primary ? 1 : 0)
 end.join
 ipma = [total].pack('N') + (1..total).map do |id|
   associations = id == primary && grid ? [0x84] : [0x81, 2, 3]
   associations << tile_color if tile_color && !(id == primary && grid)
+  associations << (tile_crop | 0x80) if tile_crop && id != primary
   associations << primary_color if primary_color && id == primary
   associations += extra.map { |n| n | 0x80 } if id == primary
   [id, associations.length].pack('nC') + associations.pack('C*')

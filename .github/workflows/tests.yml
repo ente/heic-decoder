@@ -116,10 +116,7 @@ jobs:
             - name: Generate HEVC stress corpus
               run: scripts/heic_tests.sh gen-stress
 
-            - name: Full correctness pass
-              run: scripts/heic_tests.sh verify --full --require-exts heic,avif
-
-            - name: Incremental decoder oracle comparisons
+            - name: Generate incremental oracle corpus
               run: |
                   prefix="$PWD/.heic-test-assets/libpng-install"
                   cmake -S scripts/incremental -B .heic-test-runs/incremental-oracle \
@@ -131,6 +128,12 @@ jobs:
                   ruby scripts/incremental/generate.rb \
                       .heic-test-runs/incremental-oracle/primary-oracle \
                       .heic-test-assets/libheif/fuzzing/data/corpus/colors-no-alpha.heic
+
+            - name: Full correctness pass
+              run: scripts/heic_tests.sh verify --full --require-exts heic,avif
+
+            - name: Incremental decoder oracle comparisons
+              run: |
                   cargo test --release --locked --features incremental-experiment --test incremental-memory
                   cargo test --release --locked --no-default-features --features incremental-experiment --test incremental-memory
                   cargo build --release --locked --features incremental-experiment --bins

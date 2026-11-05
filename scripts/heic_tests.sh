@@ -810,6 +810,9 @@ default_corpus_dirs() {
   if [[ -d "$ASSET_ROOT/stress-corpus" ]]; then
     printf '%s\n' "$ASSET_ROOT/stress-corpus"
   fi
+  if [[ -d "$ASSET_ROOT/incremental-corpus" ]]; then
+    printf '%s\n' "$ASSET_ROOT/incremental-corpus"
+  fi
 }
 
 gather_files() {
