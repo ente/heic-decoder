@@ -133,7 +133,7 @@ impl<R: Read> Read for Rbsp<R> {
 
 fn plan<'a>(index: &Index<'a>, source: &mut Source<'_>, budget: &Budget) -> Result<Grid<'a>> {
     let primary = index.primary;
-    let properties = Properties::read_incremental(index, primary, false)?;
+    let properties = Properties::read(index, primary, false)?;
     let (width, height) = properties
         .dimensions
         .ok_or(Error::Malformed("primary dimensions"))?;
@@ -203,7 +203,7 @@ fn plan<'a>(index: &Index<'a>, source: &mut Source<'_>, budget: &Budget) -> Resu
         if !matches!(&index.items[item].kind, b"hvc1" | b"hev1") {
             return Err(Error::Unsupported("direct HEVC item required"));
         }
-        let props = Properties::read_incremental(index, item, is_grid)?;
+        let props = Properties::read(index, item, is_grid)?;
         let config = props.config.ok_or(Error::Malformed("missing hvcC"))?;
         let _headers = budget.reserve(2 * 1024 * 1024, "header parsing")?;
         let slice = slice(index, source, item, config)?;
@@ -261,7 +261,7 @@ pub fn decode(
     let _runtime = budget.reserve(65536, "runtime")?;
     let mut source = Source::new(input)?;
     let metadata = source.metadata(&budget)?;
-    let index = Index::parse_primary(&metadata, source.len(), &budget, true)?;
+    let index = Index::parse(&metadata, source.len(), &budget)?;
     let grid = plan(&index, &mut source, &budget)?;
     let layout = Layout::new(&grid, options.max_side)?;
     for (i, transform) in grid.properties.transforms.iter().flatten().enumerate() {

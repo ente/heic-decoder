@@ -204,6 +204,117 @@ fn fixture_with_exif_info(
     .concat()
 }
 
+#[derive(Clone, Copy)]
+enum Primary {
+    Single,
+    Grid,
+}
+
+fn coded_fixture(
+    primary: Primary,
+    config: &[u8],
+    dimensions: (u32, u32),
+    nals: &[&[u8]],
+    extra_properties: &[Vec<u8>],
+    orientation: Option<u8>,
+) -> Vec<u8> {
+    let ftyp = box_bytes(b"ftyp", b"heic\0\0\0\0mif1heic");
+    let payload: Vec<u8> = nals
+        .iter()
+        .flat_map(|nal| [&(nal.len() as u32).to_be_bytes()[..], nal].concat())
+        .collect();
+    let descriptor = [
+        vec![0, 0, 0, 0],
+        (dimensions.0 as u16).to_be_bytes().to_vec(),
+        (dimensions.1 as u16).to_be_bytes().to_vec(),
+    ]
+    .concat();
+    let exif = orientation.map(|orientation| {
+        let mut exif = hex("0000000049492a0008000000010012010300010000000100000000000000");
+        exif[22] = orientation;
+        exif
+    });
+    let grid = matches!(primary, Primary::Grid);
+    let mut items = vec![(b"hvc1\0".as_slice(), payload.as_slice())];
+    if grid {
+        items.push((b"grid\0", &descriptor));
+    }
+    let primary_id = items.len() as u16;
+    if let Some(exif) = &exif {
+        items.push((b"Exif\0", exif));
+    }
+    let item_count = items.len() as u16;
+    let mut data = Vec::new();
+    let mut info = item_count.to_be_bytes().to_vec();
+    let mut locations = vec![0x44, 0];
+    locations.extend_from_slice(&item_count.to_be_bytes());
+    for (id, (kind, bytes)) in (1u16..).zip(&items) {
+        info.extend(full_box(
+            b"infe",
+            2,
+            &[&id.to_be_bytes()[..], &[0, 0], kind].concat(),
+        ));
+        locations.extend_from_slice(&id.to_be_bytes());
+        locations.extend_from_slice(&[0, 0, 0, 0, 0, 1]);
+        locations.extend_from_slice(&((ftyp.len() + 8 + data.len()) as u32).to_be_bytes());
+        locations.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        data.extend_from_slice(bytes);
+    }
+    let mut properties = full_box(
+        b"ispe",
+        0,
+        &[dimensions.0.to_be_bytes(), dimensions.1.to_be_bytes()].concat(),
+    );
+    properties.extend(box_bytes(b"hvcC", config));
+    let mut extras = Vec::new();
+    for (i, property) in extra_properties.iter().enumerate() {
+        properties.extend(property);
+        extras.push(0x80 | (3 + i) as u8);
+    }
+    let mut associations = u32::from(primary_id).to_be_bytes().to_vec();
+    let coded = [&[0x81, 0x82][..], if grid { &[] } else { &extras }].concat();
+    associations.extend_from_slice(&1u16.to_be_bytes());
+    associations.push(coded.len() as u8);
+    associations.extend(coded);
+    if grid {
+        associations.extend_from_slice(&primary_id.to_be_bytes());
+        associations.push(1 + extras.len() as u8);
+        associations.push(0x81);
+        associations.extend(&extras);
+    }
+    let mut references = Vec::new();
+    if grid {
+        references.extend(box_bytes(
+            b"dimg",
+            &[primary_id, 1, 1].map(u16::to_be_bytes).concat(),
+        ));
+    }
+    if exif.is_some() {
+        references.extend(box_bytes(
+            b"cdsc",
+            &[item_count, 1, primary_id].map(u16::to_be_bytes).concat(),
+        ));
+    }
+    let mut meta = [
+        full_box(b"pitm", 0, &primary_id.to_be_bytes()),
+        full_box(b"iinf", 0, &info),
+        full_box(b"iloc", 1, &locations),
+        box_bytes(
+            b"iprp",
+            &[
+                box_bytes(b"ipco", &properties),
+                full_box(b"ipma", 0, &associations),
+            ]
+            .concat(),
+        ),
+    ]
+    .concat();
+    if !references.is_empty() {
+        meta.extend(full_box(b"iref", 0, &references));
+    }
+    [ftyp, box_bytes(b"mdat", &data), full_box(b"meta", 0, &meta)].concat()
+}
+
 fn read_ue(bits: &[bool], position: &mut usize) -> u32 {
     let mut zeros = 0;
     while !bits[*position] {
@@ -229,6 +340,10 @@ fn write_ue(bits: &mut Vec<bool>, value: u32) {
 }
 
 fn huge_cropped_sps() -> Vec<u8> {
+    sps_with_size(16384, 16384, Some([0, 8184, 0, 8184]))
+}
+
+fn sps_with_size(width: u32, height: u32, crop: Option<[u32; 4]>) -> Vec<u8> {
     let nals = nal_sets();
     let sps = crate::heic_decoder::hevc::bitstream::parse_single_nal(&nals[1]).unwrap();
     let mut bits: Vec<bool> = sps
@@ -245,11 +360,11 @@ fn huge_cropped_sps() -> Vec<u8> {
     assert!(!bits[cursor]);
     cursor += 1;
     let mut replacement = Vec::new();
-    write_ue(&mut replacement, 16384);
-    write_ue(&mut replacement, 16384);
-    replacement.push(true);
-    for crop in [0, 8184, 0, 8184] {
-        write_ue(&mut replacement, crop);
+    write_ue(&mut replacement, width);
+    write_ue(&mut replacement, height);
+    replacement.push(crop.is_some());
+    for offset in crop.into_iter().flatten() {
+        write_ue(&mut replacement, offset);
     }
     bits.splice(start..cursor, replacement);
     nal_from_bits(&nals[1][..2], bits)
@@ -740,10 +855,11 @@ fn display_mapping_matches_existing_transform_plan() {
     }
 }
 
-#[cfg(all(feature = "incremental-experiment", not(feature = "decoder-tracing")))]
+#[cfg(not(feature = "decoder-tracing"))]
 #[test]
-fn incremental_accepts_legacy_pixi_without_relaxing_bit_depth_checks() {
+fn one_channel_pixi_is_accepted_without_relaxing_bit_depth_checks() {
     let nals = nal_sets();
+    let config = configuration(&nals[1]);
     for (channels, expected) in [
         (vec![1, 8], true),
         (vec![3, 8, 8, 8], true),
@@ -753,13 +869,31 @@ fn incremental_accepts_legacy_pixi_without_relaxing_bit_depth_checks() {
         (vec![0], false),
         (vec![1, 8, 8], false),
     ] {
-        let bytes = fixture(
-            &[configuration(&nals[1])],
-            &nals[3],
-            &[full_box(b"pixi", 0, &channels)],
-        );
-        let result = incremental::decode(BoundedInput::Bytes(&bytes), Default::default());
-        assert_eq!(result.is_ok(), expected, "{channels:?}: {result:?}");
+        let pixi = [full_box(b"pixi", 0, &channels)];
+        let configs = std::slice::from_ref(&config);
+        for (shape, bytes) in [
+            (
+                "single",
+                coded_fixture(Primary::Single, &config, (16, 16), &[&nals[3]], &pixi, None),
+            ),
+            (
+                "grid tile",
+                fixture_with_exif_info(configs, &nals[3], &pixi, &[], &[0], None, b"Exif\0"),
+            ),
+            ("grid", fixture(configs, &nals[3], &pixi)),
+        ] {
+            let result = decode_bounded(BoundedInput::Bytes(&bytes), Default::default());
+            assert_eq!(result.is_ok(), expected, "{shape} {channels:?}: {result:?}");
+            #[cfg(feature = "incremental-experiment")]
+            {
+                let result = incremental::decode(BoundedInput::Bytes(&bytes), Default::default());
+                assert_eq!(
+                    result.is_ok(),
+                    expected,
+                    "incremental {shape} {channels:?}: {result:?}"
+                );
+            }
+        }
     }
 }
 
@@ -833,8 +967,7 @@ fn shared_reference_validation_preserves_auxiliary_and_exif_rules() {
         let budget = memory::Budget::new(128 * 1024 * 1024);
         let mut source = container::Source::new(BoundedInput::Bytes(&bytes)).unwrap();
         let metadata = source.metadata(&budget).unwrap();
-        let index =
-            container::Index::parse_primary(&metadata, source.len(), &budget, true).unwrap();
+        let index = container::Index::parse(&metadata, source.len(), &budget).unwrap();
         let result = grid::validate_references(&index, &mut source, &[], &budget);
         match expected {
             None => assert!(result.is_ok()),
@@ -849,8 +982,7 @@ fn shared_reference_validation_preserves_auxiliary_and_exif_rules() {
         let budget = memory::Budget::new(128 * 1024 * 1024);
         let mut source = container::Source::new(BoundedInput::Bytes(&bytes)).unwrap();
         let metadata = source.metadata(&budget).unwrap();
-        let index =
-            container::Index::parse_primary(&metadata, source.len(), &budget, true).unwrap();
+        let index = container::Index::parse(&metadata, source.len(), &budget).unwrap();
         assert_eq!(
             grid::validate_references(&index, &mut source, &[], &budget).unwrap(),
             Some(orientation)
@@ -1266,4 +1398,226 @@ fn decodes_unprofiled_bt601_color_like_normal_decode() {
         assert_eq!(normal.icc_profile, None);
         assert_eq!(bounded.image.pixels, normal.pixels);
     }
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn single_image_primaries_decode_like_one_tile_grids() {
+    let config = configuration(&nal_sets()[1]);
+    let payload = asymmetric_payload();
+    let crop: Vec<_> = [12u32, 1, 12, 1, 0, 1, 0, 1]
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect();
+    let mut property_sets = vec![
+        vec![],
+        vec![box_bytes(b"clap", &crop)],
+        vec![box_bytes(b"clap", &crop), box_bytes(b"irot", &[1])],
+    ];
+    for rotation in 0..4 {
+        for mirror in 0..2 {
+            property_sets.push(vec![
+                box_bytes(b"irot", &[rotation]),
+                box_bytes(b"imir", &[mirror]),
+            ]);
+        }
+    }
+    for properties in &property_sets {
+        for orientation in std::iter::once(None).chain((1..=8).map(Some)) {
+            let fixture = |primary| {
+                coded_fixture(
+                    primary,
+                    &config,
+                    (16, 16),
+                    &[&payload],
+                    properties,
+                    orientation,
+                )
+            };
+            let single = fixture(Primary::Single);
+            let grid = fixture(Primary::Grid);
+            for max_side in [6000, 7] {
+                let options = BoundedDecodeOptions {
+                    max_side,
+                    ..Default::default()
+                };
+                let actual = decode_bounded(BoundedInput::Bytes(&single), options).unwrap();
+                let expected = decode_bounded(BoundedInput::Bytes(&grid), options).unwrap();
+                assert_eq!(actual.original_dimensions, expected.original_dimensions);
+                assert_eq!(
+                    (actual.image.width, actual.image.height),
+                    (expected.image.width, expected.image.height)
+                );
+                assert_eq!(actual.image.pixels, expected.image.pixels);
+            }
+            let bounded = decode_bounded(BoundedInput::Bytes(&single), Default::default()).unwrap();
+            #[cfg(feature = "incremental-experiment")]
+            {
+                let (incremental, _) =
+                    incremental::decode(BoundedInput::Bytes(&single), Default::default()).unwrap();
+                assert_eq!(incremental.original_dimensions, bounded.original_dimensions);
+                assert_eq!(incremental.image.pixels, bounded.image.pixels);
+            }
+            let normal = crate::decode_bytes_to_rgb8(&single).unwrap();
+            let transforms = crate::exif_orientation_hint(&single)
+                .orientation_to_apply()
+                .and_then(|n| crate::exif_orientation_to_primary_item_transforms(u16::from(n)))
+                .unwrap_or_default();
+            let plan = crate::RgbaTransformPlan::from_primary_transforms(
+                normal.width,
+                normal.height,
+                &transforms,
+            )
+            .unwrap();
+            assert_eq!(
+                bounded.original_dimensions,
+                (plan.destination_width, plan.destination_height)
+            );
+            for y in 0..bounded.image.height as usize {
+                for x in 0..bounded.image.width as usize {
+                    let (sx, sy) = plan.map_destination_pixel(x, y).unwrap();
+                    let src = (sy * normal.width as usize + sx) * 3;
+                    let dst = (y * bounded.image.width as usize + x) * 3;
+                    assert_eq!(
+                        &bounded.image.pixels[dst..dst + 3],
+                        &normal.pixels[src..src + 3]
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn single_image_primaries_handle_color_like_one_tile_grids() {
+    let payload = hex("2801af78f70403fe65f7f877430938");
+    let decode = |sps: &[u8], properties: &[Vec<u8>]| {
+        let fixture = |primary| {
+            coded_fixture(
+                primary,
+                &configuration(sps),
+                (16, 16),
+                &[&payload],
+                properties,
+                None,
+            )
+        };
+        let single = fixture(Primary::Single);
+        let actual = decode_bounded(BoundedInput::Bytes(&single), Default::default());
+        let expected = decode_bounded(
+            BoundedInput::Bytes(&fixture(Primary::Grid)),
+            Default::default(),
+        );
+        match (actual, expected) {
+            (Ok(actual), Ok(expected)) => {
+                assert_eq!(actual.image.pixels, expected.image.pixels);
+                assert_eq!(
+                    actual.image.pixels,
+                    crate::decode_bytes_to_rgb8(&single).unwrap().pixels
+                );
+                Ok(actual.image.pixels)
+            }
+            (
+                Err(BoundedDecodeError::Unsupported(actual)),
+                Err(BoundedDecodeError::Unsupported(expected)),
+            ) if actual == expected => Err(actual),
+            (actual, expected) => panic!("{actual:?} != {expected:?}"),
+        }
+    };
+    let wide_gamut =
+        hex("4201010408000003009fa800000300001ea0884596eaaf2bc05a848684820000030002000003003210");
+    assert_eq!(decode(&wide_gamut, &[]), Err("unprofiled HEVC color"));
+    decode(&wide_gamut, &[box_bytes(b"colr", b"prof")]).unwrap();
+    for sps in [
+        "4201010408000003009fa800000300001ea0884596eaaf2bc05b828302820000030002000003003210",
+        "4201010408000003009fa800000300001ea0884596eaaf2bc05a830303020000030002000003003210",
+    ] {
+        decode(&hex(sps), &[]).unwrap();
+    }
+    let nclx = box_bytes(
+        b"colr",
+        &[b"nclx".as_slice(), &[0, 1, 0, 13, 0, 6, 0x80]].concat(),
+    );
+    let sps = &nal_sets()[1];
+    assert_ne!(decode(sps, &[]).unwrap(), decode(sps, &[nclx]).unwrap());
+}
+
+#[test]
+fn single_images_exceeding_the_budget_are_refused_during_preflight_like_grids() {
+    let nals = nal_sets();
+    for primary in [Primary::Single, Primary::Grid] {
+        for (sps, dimensions) in [
+            (sps_with_size(8192, 8192, None), (8192, 8192)),
+            (huge_cropped_sps(), (16, 16)),
+        ] {
+            let bytes = coded_fixture(
+                primary,
+                &configuration(&sps),
+                dimensions,
+                &[&nals[3]],
+                &[],
+                None,
+            );
+            let budget = memory::Budget::new(128 * 1024 * 1024);
+            let mut source = container::Source::new(BoundedInput::Bytes(&bytes)).unwrap();
+            let metadata = source.metadata(&budget).unwrap();
+            let index = container::Index::parse(&metadata, source.len(), &budget).unwrap();
+            assert!(matches!(
+                grid::Grid::preflight(&index, &mut source, &budget),
+                Err(BoundedDecodeError::MemoryBudgetExceeded {
+                    stage: "tile reconstruction",
+                    ..
+                })
+            ));
+            #[cfg(not(feature = "decoder-tracing"))]
+            assert!(matches!(
+                decode_bounded(BoundedInput::Bytes(&bytes), Default::default()),
+                Err(BoundedDecodeError::MemoryBudgetExceeded {
+                    stage: "tile reconstruction",
+                    ..
+                })
+            ));
+        }
+    }
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn single_image_payloads_are_bounded_by_the_budget_instead_of_the_tile_cap() {
+    let nals = nal_sets();
+    let config = configuration(&nals[1]);
+    let mut filler = vec![0xff; container::MAX_ITEM_BYTES];
+    filler[..2].copy_from_slice(&[0x4c, 0x01]);
+    *filler.last_mut().unwrap() = 0x80;
+    let fixture =
+        |primary, nals: &[&[u8]]| coded_fixture(primary, &config, (16, 16), nals, &[], None);
+    let options = |megabytes: usize| BoundedDecodeOptions {
+        max_memory_bytes: megabytes * 1024 * 1024,
+        ..Default::default()
+    };
+    assert!(matches!(
+        decode_bounded(
+            BoundedInput::Bytes(&fixture(Primary::Grid, &[&filler, &nals[3]])),
+            options(256)
+        ),
+        Err(BoundedDecodeError::LimitExceeded(
+            "coded item payload bytes"
+        ))
+    ));
+    let single = fixture(Primary::Single, &[&filler, &nals[3]]);
+    let expected = decode_bounded(
+        BoundedInput::Bytes(&fixture(Primary::Single, &[&nals[3]])),
+        Default::default(),
+    )
+    .unwrap();
+    let actual = decode_bounded(BoundedInput::Bytes(&single), options(256)).unwrap();
+    assert_eq!(actual.image.pixels, expected.image.pixels);
+    assert!(matches!(
+        decode_bounded(BoundedInput::Bytes(&single), options(64)),
+        Err(BoundedDecodeError::MemoryBudgetExceeded {
+            stage: "HEVC header parsing",
+            ..
+        })
+    ));
 }

@@ -6,6 +6,7 @@ This document is the practical API reference for integrating `heic_decoder` in a
 
 - Decode HEIF/HEIC/AVIF to RGBA (`u8` or `u16` storage).
 - Decode HEVC-coded HEIC/HEIF straight to RGB8 when alpha is not needed.
+- Decode HEVC-coded HEIC within a memory budget to a size-capped, display-oriented sRGB RGB8 image (`decode_bounded`).
 - Decode from bytes, `Read`, `BufRead`, and file paths.
 - Optional `image` crate integration through hook registration.
 - Keep default decode output aligned with primary item transforms (`clap`/`irot`/`imir`) and expose explicit EXIF orientation helpers.
@@ -416,6 +417,38 @@ fn decode(path: &Path) -> Result<(), heic_decoder::DecodeError> {
     Ok(())
 }
 ```
+
+## Bounded decoding
+
+`decode_bounded(BoundedInput, BoundedDecodeOptions)` decodes a HEIC still image
+to display-oriented sRGB RGB8 within a memory budget. It returns
+`Result<BoundedRgbImage, BoundedDecodeError>`. The output is reduced with area
+averaging so that neither side exceeds `max_side` (1 through 6000, default
+6000), and `original_dimensions` is the display size before reduction.
+`max_memory_bytes` (at least 64 KiB, default 128 MiB) caps the decoder-owned
+memory that depends on the input. `decoder-tracing` disables bounded decoding.
+
+The primary item may be a grid of uniform HEVC tiles or a single HEVC image
+(`hvc1`/`hev1`). Every coded item must be opaque 8-bit 4:2:0 HEVC with one IDR
+slice; WPP is supported. A single image is decoded as a grid with one tile.
+`clap`/`irot`/`imir` are applied, and Exif orientation applies when no
+effective container orientation is present. RGB matrix/TRC ICC profiles and
+SDR nclx colour with BT.709, BT.2020 or Display P3 primaries are converted to
+sRGB. HDR transfer functions, grayscale or
+lookup-table ICC profiles, unprofiled wide-gamut HEVC colour, alpha, and
+unknown required auxiliaries return errors. Known depth, semantic matte, and
+gain-map auxiliaries are ignored.
+
+Before any pixel decoding, preflight reads every coded item's headers and
+reserves its reconstruction workspace, and admission then reserves the output
+together with the largest tile workspace. Inputs that do not fit return
+`MemoryBudgetExceeded` or `LimitExceeded` without decoding pixels. Grid tiles
+decode one at a time, or concurrently with `parallel-grid` when the budget
+allows. A single image's full-resolution reconstruction must fit the budget at
+once, so a large non-grid image needs a larger budget than a grid of the same
+size. Grid tile payloads are limited to 16 MiB; a single image's payload is
+bounded by the budget and the 512 MiB input limit. Admission is conservative,
+and allocator overhead and process RSS are not included.
 
 ## Experimental incremental bounded decoding
 
