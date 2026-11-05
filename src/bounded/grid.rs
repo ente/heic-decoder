@@ -24,20 +24,6 @@ pub(super) struct Properties<'a> {
 
 impl<'a> Properties<'a> {
     pub(super) fn read(index: &Index<'a>, item: usize, tile: bool) -> Result<Self> {
-        Self::read_with_compatibility(index, item, tile, false)
-    }
-
-    #[cfg(feature = "incremental-experiment")]
-    pub(super) fn read_incremental(index: &Index<'a>, item: usize, tile: bool) -> Result<Self> {
-        Self::read_with_compatibility(index, item, tile, true)
-    }
-
-    fn read_with_compatibility(
-        index: &Index<'a>,
-        item: usize,
-        tile: bool,
-        legacy_pixi: bool,
-    ) -> Result<Self> {
         let mut result = Self {
             config: None,
             dimensions: None,
@@ -92,10 +78,8 @@ impl<'a> Properties<'a> {
                         return Err(Error::Unsupported("pixi version or flags"));
                     }
                     let count = r.uint(1)? as usize;
-                    if (count != 3 && !(legacy_pixi && count == 1))
-                        || r.take(count)?.iter().any(|&n| n != 8)
-                    {
-                        return Err(Error::Unsupported("8-bit RGB channels required"));
+                    if !matches!(count, 1 | 3) || r.take(count)?.iter().any(|&n| n != 8) {
+                        return Err(Error::Unsupported("8-bit channels required"));
                     }
                     r.finish()?;
                 }
@@ -195,12 +179,87 @@ pub(super) struct Grid<'a> {
     pub(super) exif: Option<u8>,
 }
 
+impl<'a> Tile<'a> {
+    fn preflight(
+        index: &Index<'a>,
+        source: &mut Source<'_>,
+        budget: &Budget,
+        item: usize,
+        properties: &Properties<'a>,
+        max_payload: usize,
+    ) -> Result<Self> {
+        let config = properties.config.ok_or(Error::Malformed("missing hvcC"))?;
+        let payload_len = index.items[item]
+            .location
+            .ok_or(Error::Malformed("missing coded item location"))?
+            .length;
+        if payload_len == 0 || payload_len > max_payload {
+            return Err(Error::LimitExceeded("coded item payload bytes"));
+        }
+        let mut payload = budget.zeroed(payload_len, "preflight payload")?;
+        index.read_item(item, source, &mut payload)?;
+        let (geometry, reconstruction_bytes) = {
+            let _headers = budget.reserve(
+                payload_len.saturating_mul(5).saturating_add(1024 * 1024),
+                "HEVC header parsing",
+            )?;
+            let prepared = codec::prepare(config, &payload)?;
+            (prepared.geometry, prepared.reconstruction_bytes())
+        };
+        if properties.dimensions != Some((geometry.width, geometry.height)) {
+            return Err(Error::Malformed("ispe differs from SPS"));
+        }
+        let workspace_bytes = (reconstruction_bytes + payload_len as u64 * 3 + 1024 * 1024)
+            .try_into()
+            .map_err(|_| Error::LimitExceeded("codec workspace"))?;
+        let _admission = budget.reserve(workspace_bytes, "tile reconstruction")?;
+        Ok(Self {
+            item,
+            config,
+            geometry,
+            color: properties.color.clone(),
+            payload_len,
+            workspace_bytes,
+        })
+    }
+}
+
 impl<'a> Grid<'a> {
     pub(super) fn preflight(
         index: &Index<'a>,
         source: &mut Source<'_>,
         budget: &Budget,
     ) -> Result<Self> {
+        if index.items[index.primary].kind == *b"grid" {
+            Self::tiled(index, source, budget)
+        } else {
+            Self::single(index, source, budget)
+        }
+    }
+
+    fn single(index: &Index<'a>, source: &mut Source<'_>, budget: &Budget) -> Result<Self> {
+        let properties = Properties::read(index, index.primary, false)?;
+        let mut tiles = budget.buffer::<Tile<'a>>(1, "tile index")?;
+        tiles.push(Tile::preflight(
+            index,
+            source,
+            budget,
+            index.primary,
+            &properties,
+            usize::MAX,
+        )?)?;
+        let exif = validate_references(index, source, &tiles, budget)?;
+        Ok(Self {
+            width: tiles[0].geometry.width,
+            height: tiles[0].geometry.height,
+            columns: 1,
+            tiles,
+            properties,
+            exif,
+        })
+    }
+
+    fn tiled(index: &Index<'a>, source: &mut Source<'_>, budget: &Budget) -> Result<Self> {
         let primary = index.primary;
         let primary_id = index.items[primary].id;
         let location = index.items[primary]
@@ -255,33 +314,15 @@ impl<'a> Grid<'a> {
                 return Err(Error::Unsupported("grid requires direct HEVC tiles"));
             }
             let props = Properties::read(index, item, true)?;
-            let config = props.config.ok_or(Error::Malformed("missing tile hvcC"))?;
-            let payload_len = index.items[item]
-                .location
-                .ok_or(Error::Malformed("missing tile location"))?
-                .length;
-            if payload_len == 0 || payload_len > MAX_ITEM_BYTES {
-                return Err(Error::LimitExceeded("tile payload bytes"));
-            }
-            let mut payload = budget.zeroed(payload_len, "preflight payload")?;
-            index.read_item(item, source, &mut payload)?;
-            let (geometry, reconstruction_bytes) = {
-                let _headers =
-                    budget.reserve(payload_len * 5 + 1024 * 1024, "HEVC header parsing")?;
-                let prepared = codec::prepare(config, &payload)?;
-                (prepared.geometry, prepared.reconstruction_bytes())
-            };
-            if props.dimensions != Some((geometry.width, geometry.height)) {
-                return Err(Error::Malformed("tile ispe differs from SPS"));
-            }
+            let tile = Tile::preflight(index, source, budget, item, &props, MAX_ITEM_BYTES)?;
             if tiles.first().is_some_and(|first| {
                 (
-                    geometry.width,
-                    geometry.height,
-                    geometry.full_range,
-                    geometry.matrix,
-                    geometry.primaries,
-                    geometry.transfer,
+                    tile.geometry.width,
+                    tile.geometry.height,
+                    tile.geometry.full_range,
+                    tile.geometry.matrix,
+                    tile.geometry.primaries,
+                    tile.geometry.transfer,
                 ) != (
                     first.geometry.width,
                     first.geometry.height,
@@ -289,22 +330,11 @@ impl<'a> Grid<'a> {
                     first.geometry.matrix,
                     first.geometry.primaries,
                     first.geometry.transfer,
-                ) || props.color != first.color
+                ) || tile.color != first.color
             }) {
                 return Err(Error::Unsupported("nonuniform grid tiles"));
             }
-            let workspace_bytes = (reconstruction_bytes + payload_len as u64 * 3 + 1024 * 1024)
-                .try_into()
-                .map_err(|_| Error::LimitExceeded("codec workspace"))?;
-            let _admission = budget.reserve(workspace_bytes, "tile reconstruction")?;
-            tiles.push(Tile {
-                item,
-                config,
-                geometry,
-                color: props.color,
-                payload_len,
-                workspace_bytes,
-            })?;
+            tiles.push(tile)?;
         }
         let tile = &tiles[0];
         if u64::from(tile.geometry.width) * u64::from(columns) < u64::from(width)

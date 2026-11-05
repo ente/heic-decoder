@@ -183,7 +183,8 @@ pub fn decode_bounded(
     let (pool, _pool_reservation) = {
         let threads = std::thread::available_parallelism()
             .map_or(1, usize::from)
-            .min(8);
+            .min(8)
+            .min(grid.tiles.len());
         let mut workers = threads;
         while workers > 1
             && max_job
@@ -285,13 +286,14 @@ pub fn decode_bounded(
 }
 
 fn job_bytes(tile: &grid::Tile<'_>, region: resample::Region, layout: resample::Layout) -> usize {
+    let contributions = if layout.is_unscaled() {
+        0
+    } else {
+        resample::Contribution::workspace_bytes(region)
+    };
     tile.workspace_bytes
-        + tile.payload_len
-        + if layout.is_unscaled() {
-            0
-        } else {
-            resample::Contribution::workspace_bytes(region)
-        }
+        .saturating_add(tile.payload_len)
+        .saturating_add(contributions)
 }
 
 fn render_tile(

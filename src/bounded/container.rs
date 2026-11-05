@@ -273,15 +273,6 @@ fn unique<'a>(slot: &mut Option<&'a [u8]>, data: &'a [u8]) -> Result<()> {
 
 impl<'a> Index<'a> {
     pub(super) fn parse(metadata: &'a [u8], source_len: u64, budget: &Budget) -> Result<Self> {
-        Self::parse_primary(metadata, source_len, budget, false)
-    }
-
-    pub(super) fn parse_primary(
-        metadata: &'a [u8],
-        source_len: u64,
-        budget: &Budget,
-        direct: bool,
-    ) -> Result<Self> {
         let mut reader = Reader::new(metadata);
 
         if reader.full_box()? != (0, 0) {
@@ -361,10 +352,10 @@ impl<'a> Index<'a> {
         let primary = items
             .binary_search_by_key(&primary_id, |item| item.id)
             .map_err(|_| Error::Malformed("primary item missing"))?;
-        if items[primary].kind != *b"grid"
-            && !(direct && matches!(&items[primary].kind, b"hvc1" | b"hev1"))
-        {
-            return Err(Error::Unsupported("primary item must be a HEIC grid"));
+        if !matches!(&items[primary].kind, b"grid" | b"hvc1" | b"hev1") {
+            return Err(Error::Unsupported(
+                "primary item must be a HEIC grid or HEVC image",
+            ));
         }
         let idat = idat.unwrap_or_default();
         Self::locations(
