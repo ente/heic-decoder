@@ -77,14 +77,36 @@ fn fixture_with_exif_info(
     orientation: Option<u8>,
     exif_info: &[u8],
 ) -> Vec<u8> {
+    fixture_with_canvas(
+        configs,
+        payload,
+        extra_properties,
+        primary_extras,
+        tile_extras,
+        orientation,
+        exif_info,
+        (configs.len() as u32 * 16 - 1, 15),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fixture_with_canvas(
+    configs: &[Vec<u8>],
+    payload: &[u8],
+    extra_properties: &[Vec<u8>],
+    primary_extras: &[usize],
+    tile_extras: &[usize],
+    orientation: Option<u8>,
+    exif_info: &[u8],
+    (width, height): (u32, u32),
+) -> Vec<u8> {
     let count = configs.len() as u16;
     let primary = count + 1;
     let item_count = primary + u16::from(orientation.is_some());
-    let width = u32::from(count) * 16 - 1;
     let descriptor = [
         vec![0, 0, 0, count as u8 - 1],
         (width as u16).to_be_bytes().to_vec(),
-        15u16.to_be_bytes().to_vec(),
+        (height as u16).to_be_bytes().to_vec(),
     ]
     .concat();
     let payload = [&(payload.len() as u32).to_be_bytes()[..], payload].concat();
@@ -157,7 +179,7 @@ fn fixture_with_exif_info(
     properties.extend(full_box(
         b"ispe",
         0,
-        &[width.to_be_bytes(), 15u32.to_be_bytes()].concat(),
+        &[width.to_be_bytes(), height.to_be_bytes()].concat(),
     ));
     for config in configs {
         properties.extend(box_bytes(b"hvcC", config));
@@ -1118,13 +1140,27 @@ fn mirrored_asymmetric_pixels_match_normal_decode() {
     let config = configuration(&nal_sets()[1]);
     for rotation in 0..4 {
         for mirror in 0..2 {
-            let bytes = fixture(
-                &[config.clone(), config.clone()],
+            let configs = [config.clone(), config.clone()];
+            let transforms = [
+                box_bytes(b"irot", &[rotation]),
+                box_bytes(b"imir", &[mirror]),
+            ];
+            let odd = fixture(&configs, &asymmetric_payload(), &transforms);
+            assert!(matches!(
+                decode_bounded(BoundedInput::Bytes(&odd), Default::default()),
+                Err(BoundedDecodeError::Unsupported(
+                    "transform that needs 4:4:4 chroma"
+                ))
+            ));
+            let bytes = fixture_with_canvas(
+                &configs,
                 &asymmetric_payload(),
-                &[
-                    box_bytes(b"irot", &[rotation]),
-                    box_bytes(b"imir", &[mirror]),
-                ],
+                &transforms,
+                &[0, 1],
+                &[],
+                None,
+                b"Exif\0",
+                (30, 14),
             );
             let normal = crate::decode_bytes_to_rgb8(&bytes).unwrap();
             assert!(
@@ -1620,4 +1656,102 @@ fn single_image_payloads_are_bounded_by_the_budget_instead_of_the_tile_cap() {
             ..
         })
     ));
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn transforms_that_need_full_chroma_are_refused() {
+    let config = configuration(&nal_sets()[1]);
+    let payload = asymmetric_payload();
+    let clap = |width: i32, height: i32, horizontal_offset: [i32; 2], vertical_offset: [i32; 2]| {
+        let crop: Vec<_> = [
+            width,
+            1,
+            height,
+            1,
+            horizontal_offset[0],
+            horizontal_offset[1],
+            vertical_offset[0],
+            vertical_offset[1],
+        ]
+        .into_iter()
+        .flat_map(i32::to_be_bytes)
+        .collect();
+        box_bytes(b"clap", &crop)
+    };
+    let centred = [0, 1];
+    let back_half = [-1, 2];
+    let mirror = |axis| box_bytes(b"imir", &[axis]);
+    let quarter_turn = box_bytes(b"irot", &[1]);
+    let half_turn = box_bytes(b"irot", &[2]);
+    let three_quarter_turn = box_bytes(b"irot", &[3]);
+    let odd_width = clap(11, 12, back_half, centred);
+    let odd_height = clap(12, 11, centred, back_half);
+    for (properties, refused) in [
+        (vec![clap(12, 12, centred, centred)], false),
+        (
+            vec![clap(12, 12, centred, centred), quarter_turn.clone()],
+            false,
+        ),
+        (
+            vec![half_turn.clone(), clap(12, 12, centred, centred)],
+            false,
+        ),
+        (vec![odd_width.clone()], false),
+        (vec![odd_width.clone(), three_quarter_turn.clone()], false),
+        (vec![odd_height.clone()], false),
+        (vec![odd_height.clone(), quarter_turn.clone()], false),
+        (vec![clap(12, 10, centred, centred)], true),
+        (vec![clap(10, 12, centred, centred)], true),
+        (
+            vec![quarter_turn.clone(), clap(12, 10, centred, centred)],
+            true,
+        ),
+        (vec![half_turn.clone(), clap(11, 12, [1, 2], centred)], true),
+        (vec![half_turn.clone(), odd_width.clone()], true),
+        (vec![odd_width.clone(), quarter_turn.clone()], true),
+        (vec![odd_width.clone(), half_turn.clone()], true),
+        (vec![odd_width.clone(), mirror(0)], true),
+        (vec![odd_width, mirror(1)], true),
+        (vec![odd_height.clone(), half_turn], true),
+        (vec![odd_height.clone(), three_quarter_turn], true),
+        (vec![odd_height.clone(), mirror(0)], true),
+        (vec![odd_height, mirror(1)], true),
+    ] {
+        for primary in [Primary::Single, Primary::Grid] {
+            let bytes = coded_fixture(primary, &config, (16, 16), &[&payload], &properties, None);
+            let result = decode_bounded(BoundedInput::Bytes(&bytes), Default::default());
+            if refused {
+                assert!(
+                    matches!(
+                        result,
+                        Err(BoundedDecodeError::Unsupported(
+                            "transform that needs 4:4:4 chroma"
+                        ))
+                    ),
+                    "{result:?}"
+                );
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+            }
+        }
+    }
+    let rotated_then_cropped = fixture_with_canvas(
+        &[config.clone(), config],
+        &payload,
+        &[quarter_turn, clap(10, 12, centred, centred)],
+        &[0, 1],
+        &[],
+        None,
+        b"Exif\0",
+        (28, 14),
+    );
+    let bounded = decode_bounded(
+        BoundedInput::Bytes(&rotated_then_cropped),
+        Default::default(),
+    )
+    .unwrap();
+    let normal = crate::decode_bytes_to_rgb8(&rotated_then_cropped).unwrap();
+    assert_eq!((bounded.image.width, bounded.image.height), (10, 12));
+    assert_eq!(bounded.image.pixels, normal.pixels);
 }

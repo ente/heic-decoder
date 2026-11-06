@@ -162,6 +162,60 @@ libheif corpus and the ente fixtures.
 Generated reports and PNG artifacts are under `.heic-test-runs/`. Use
 `--keep-artifacts` with `verify` when debugging a pixel mismatch.
 
+## Bounded decoder
+
+CI also compares `decode_bounded` with the strict libheif primary-image oracle
+described in the next section. Build the oracle and generate the incremental
+corpus as shown there, then run:
+
+```bash
+cargo build --release --locked --features incremental-experiment --bins
+ruby scripts/incremental/generate-bounded.rb .heic-test-assets/incremental-corpus
+ruby scripts/incremental/verify-bounded.rb \
+  --require-pass .heic-test-assets/bounded-corpus/pass-odd-width-crop.heic \
+  .heic-test-runs/incremental-oracle/primary-oracle \
+  target/release/incremental-allocation target/release/incremental-compare \
+  .heic-test-assets/libheif/examples \
+  .heic-test-assets/libheif/tests/data \
+  .heic-test-assets/libheif/fuzzing/data/corpus \
+  .heic-test-assets/ente-test-fixtures/media/heic/v1/files \
+  .heic-test-assets/stress-corpus \
+  .heic-test-assets/incremental-corpus \
+  .heic-test-assets/bounded-corpus
+```
+
+`generate-bounded.rb` wraps the incremental corpus's 256×256 encode into the
+ignored `.heic-test-assets/bounded-corpus`, or into an optional output folder.
+These files are kept out of `incremental-corpus` because `verify.rb` requires
+every file there to decode with the incremental experiment. The script refuses
+an output folder that overlaps the incremental corpus, or that is not empty
+and lacks the `.generate-bounded` marker it writes, and it only replaces the
+`pass-*` and `refuse-*` files in its own folder. `refuse-*` files use rotations, mirrors or
+grid canvases for which libheif converts to 4:4:4, so `decode_bounded` must
+refuse them; if one decodes, the pixel comparison fails. `pass-*` files are
+the matching controls and the Display P3 and BT.2020 nclx cases. CI passes
+every `pass-*` file, `IMG_0983.HEIC` and `1718_rotate_90_cw.HEIC` with
+`--require-pass`, which fails the run unless that file passes at both sizes.
+
+Every HEIC, HEIF and AVIF file under the given paths is decoded at max side
+6000 and 97 with a 512 MiB budget (`BOUNDED_BUDGET_MIB` overrides it). The
+runner denies any allocation that would take the live heap past the budget.
+Each successful decode is compared with the oracle's image after the
+comparator applies the Exif orientation reported by
+`exif_orientation_hint_from_path`, converts an embedded ICC profile or the
+item's BT.2020 or Display P3 nclx primaries to sRGB, and area-averages to the
+output size. The `rgb8-rounding` gate described below applies. The Exif value
+comes from the decoder's own parser and the colour conversion from moxcms;
+the comparator's orientation mapping and area average are independent.
+
+Refusals with `Unsupported`, `LimitExceeded` or `MemoryBudgetExceeded` are
+counted but do not fail the run. The run fails on a crash, a timeout, an
+oracle timeout or crash, `AllocationFailed` for any file, any other error on a
+file the oracle decodes, a successful decode of a file the strict oracle
+rejects, a dimension or pixel mismatch, or a required file that does not pass.
+Results and a summary are written under `.heic-test-runs/bounded`;
+`BOUNDED_TEST_ROOT` overrides the folder.
+
 ## Incremental bounded decoder
 
 The opt-in `incremental-experiment` feature is tested separately because
