@@ -45,9 +45,19 @@ int main(int argc, char **argv) {
     int warnings = heif_image_get_decoding_warnings(image.get(), 0, nullptr, 0);
     int width = heif_image_get_width(image.get(), heif_channel_interleaved);
     int height = heif_image_get_height(image.get(), heif_channel_interleaved);
+    std::string nclx_json = "null";
+    heif_color_profile_nclx *nclx = nullptr;
+    if (heif_image_handle_get_nclx_color_profile(handle.get(), &nclx).code == heif_error_Ok && nclx) {
+      nclx_json = "{\"primaries\":" + std::to_string(static_cast<int>(nclx->color_primaries)) +
+                  ",\"transfer\":" + std::to_string(static_cast<int>(nclx->transfer_characteristics)) +
+                  ",\"matrix\":" + std::to_string(static_cast<int>(nclx->matrix_coefficients)) +
+                  ",\"full_range\":" + (nclx->full_range_flag ? "true" : "false") + "}";
+      heif_nclx_color_profile_free(nclx);
+    }
     std::cout << "{\"primary_id\":" << primary << ",\"width\":" << width
               << ",\"height\":" << height << ",\"warnings\":" << warnings
-              << ",\"strict\":" << (options->strict_decoding ? "true" : "false") << "}\n";
+              << ",\"strict\":" << (options->strict_decoding ? "true" : "false")
+              << ",\"nclx\":" << nclx_json << "}\n";
     if (argc >= 3 && std::string(argv[2]) != "-") {
       std::vector<uint8_t> icc(heif_image_get_raw_color_profile_size(image.get()));
       if (!icc.empty()) {

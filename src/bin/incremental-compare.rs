@@ -9,7 +9,7 @@ struct Reference {
     transformed: bool,
 }
 
-fn read_reference(path: &str) -> Result<Reference, Box<dyn Error>> {
+fn read_reference(path: &str, nclx_primaries: u8) -> Result<Reference, Box<dyn Error>> {
     let mut decoder = png::Decoder::new(BufReader::new(File::open(path)?));
     decoder.set_transformations(png::Transformations::EXPAND);
     let mut reader = decoder.read_info()?;
@@ -33,9 +33,20 @@ fn read_reference(path: &str) -> Result<Reference, Box<dyn Error>> {
         }
         _ => return Err("Expected RGB reference".into()),
     };
-    let transformed = icc.is_some();
-    let pixels = if let Some(icc) = icc {
-        let profile = moxcms::ColorProfile::new_from_slice(&icc)?;
+    let profile = match icc {
+        Some(icc) => Some(moxcms::ColorProfile::new_from_slice(&icc)?),
+        None if matches!(nclx_primaries, 9 | 12) => {
+            Some(moxcms::ColorProfile::new_from_cicp(moxcms::CicpProfile {
+                color_primaries: moxcms::CicpColorPrimaries::try_from(nclx_primaries)?,
+                transfer_characteristics: moxcms::TransferCharacteristics::Srgb,
+                matrix_coefficients: moxcms::MatrixCoefficients::Identity,
+                full_range: true,
+            }))
+        }
+        None => None,
+    };
+    let transformed = profile.is_some();
+    let pixels = if let Some(profile) = profile {
         let transform = profile.create_transform_8bit(
             moxcms::Layout::Rgb,
             &moxcms::ColorProfile::new_srgb(),
@@ -54,6 +65,33 @@ fn read_reference(path: &str) -> Result<Reference, Box<dyn Error>> {
         pixels,
         transformed,
     })
+}
+
+fn orient(source: &[u8], width: usize, height: usize, orientation: u8) -> (Vec<u8>, usize, usize) {
+    let (ow, oh) = if orientation >= 5 {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let mut output = vec![0; source.len()];
+    for y in 0..oh {
+        for x in 0..ow {
+            let (sx, sy) = match orientation {
+                2 => (width - 1 - x, y),
+                3 => (width - 1 - x, height - 1 - y),
+                4 => (x, height - 1 - y),
+                5 => (y, x),
+                6 => (y, height - 1 - x),
+                7 => (width - 1 - y, height - 1 - x),
+                8 => (width - 1 - y, x),
+                _ => (x, y),
+            };
+            let from = (sy * width + sx) * 3;
+            let to = (y * ow + x) * 3;
+            output[to..to + 3].copy_from_slice(&source[from..from + 3]);
+        }
+    }
+    (output, ow, oh)
 }
 
 fn area_reference(source: &[u8], sw: usize, sh: usize, w: usize, h: usize) -> Vec<u8> {
@@ -200,7 +238,7 @@ impl Profile {
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 7 {
-        return Err("Usage: comparator raw EXPECTED ACTUAL WIDTH CHANNELS PROFILE | png REFERENCE ACTUAL WIDTH HEIGHT SIDE PROFILE".into());
+        return Err("Usage: comparator raw EXPECTED ACTUAL WIDTH CHANNELS PROFILE | png REFERENCE ACTUAL WIDTH HEIGHT SIDE PROFILE [ORIENTATION NCLX_PRIMARIES]".into());
     }
     if args[1] == "raw" {
         let expected = std::fs::read(&args[2])?;
@@ -220,14 +258,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         if !profile.accepts(&expected, &actual, channels) {
             return Err("Pixel comparison failed".into());
         }
-    } else if args[1] == "png" && args.len() == 8 {
+    } else if args[1] == "png" && matches!(args.len(), 8 | 10) {
         let profile = Profile::parse(&args[7])?;
+        let (orientation, nclx_primaries) = if args.len() == 10 {
+            (args[8].parse::<u8>()?, args[9].parse::<u8>()?)
+        } else {
+            (1, 0)
+        };
+        if !(1..=8).contains(&orientation) {
+            return Err("Orientation must be 1 through 8".into());
+        }
         let Reference {
-            width: sw,
-            height: sh,
-            pixels: source,
+            width: reference_width,
+            height: reference_height,
+            pixels,
             transformed,
-        } = read_reference(&args[2])?;
+        } = read_reference(&args[2], nclx_primaries)?;
+        let (source, sw, sh) = orient(&pixels, reference_width, reference_height, orientation);
         let actual = std::fs::read(&args[3])?;
         let width: usize = args[4].parse()?;
         let height: usize = args[5].parse()?;
@@ -246,7 +293,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             .into());
         }
         let expected = area_reference(&source, sw, sh, width, height);
-        eprintln!("reference={sw}x{sh} output={width}x{height} icc_transformed={transformed}");
+        eprintln!(
+            "reference={sw}x{sh} output={width}x{height} orientation={orientation} color_transformed={transformed}"
+        );
         println!("{}", metrics(&expected, &actual, width, 3));
         if !profile.accepts(&expected, &actual, 3) {
             return Err("Pixel comparison failed".into());
@@ -272,6 +321,26 @@ mod tests {
         assert!(stats.contains("\"max_error\":255,"));
         assert!(stats.contains("\"above_one\":1,"));
         assert!(metrics(&[0, 0, 0, 255], &[0, 0, 0, 254], 1, 4).contains("\"alpha_errors\":1,"));
+    }
+
+    #[test]
+    fn exif_orientations_map_to_display_layout() {
+        let source: Vec<u8> = (0..6u8).flat_map(|v| [v; 3]).collect();
+        for (orientation, dimensions, expected) in [
+            (1, (3, 2), [0, 1, 2, 3, 4, 5]),
+            (2, (3, 2), [2, 1, 0, 5, 4, 3]),
+            (3, (3, 2), [5, 4, 3, 2, 1, 0]),
+            (4, (3, 2), [3, 4, 5, 0, 1, 2]),
+            (5, (2, 3), [0, 3, 1, 4, 2, 5]),
+            (6, (2, 3), [3, 0, 4, 1, 5, 2]),
+            (7, (2, 3), [5, 2, 4, 1, 3, 0]),
+            (8, (2, 3), [2, 5, 1, 4, 0, 3]),
+        ] {
+            let (pixels, width, height) = orient(&source, 3, 2, orientation);
+            assert_eq!((width, height), dimensions);
+            let values: Vec<u8> = pixels.chunks_exact(3).map(|p| p[0]).collect();
+            assert_eq!(values, expected, "orientation {orientation}");
+        }
     }
 
     #[test]

@@ -151,6 +151,26 @@ jobs:
                       REFERENCE_YUV="$prefix.yuv" target/release/incremental-check ".heic-test-assets/incremental-corpus/$name.heic"
                   done
 
+            - name: Bounded decoder oracle comparisons
+              run: |
+                  ruby scripts/incremental/generate-bounded.rb .heic-test-assets/incremental-corpus
+                  required=()
+                  for path in .heic-test-assets/bounded-corpus/pass-*.heic \
+                      .heic-test-assets/ente-test-fixtures/media/heic/v1/files/IMG_0983.HEIC \
+                      .heic-test-assets/ente-test-fixtures/media/heic/v1/files/1718_rotate_90_cw.HEIC; do
+                      required+=(--require-pass "$path")
+                  done
+                  ruby scripts/incremental/verify-bounded.rb "${required[@]}" \
+                      .heic-test-runs/incremental-oracle/primary-oracle \
+                      target/release/incremental-allocation target/release/incremental-compare \
+                      .heic-test-assets/libheif/examples \
+                      .heic-test-assets/libheif/tests/data \
+                      .heic-test-assets/libheif/fuzzing/data/corpus \
+                      .heic-test-assets/ente-test-fixtures/media/heic/v1/files \
+                      .heic-test-assets/stress-corpus \
+                      .heic-test-assets/incremental-corpus \
+                      .heic-test-assets/bounded-corpus
+
             - name: Upload verify report
               if: failure()
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -159,5 +179,8 @@ jobs:
                   path: |
                       .heic-test-runs/verify/run/report.txt
                       .heic-test-runs/incremental/*.json*
+                      .heic-test-runs/bounded/*.json*
+                      .heic-test-runs/bounded/summary.txt
+                      .heic-test-assets/bounded-corpus/
                       .heic-test-assets/incremental-corpus/
                   if-no-files-found: ignore

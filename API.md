@@ -432,7 +432,14 @@ The primary item may be a grid of uniform HEVC tiles or a single HEVC image
 (`hvc1`/`hev1`). Every coded item must be opaque 8-bit 4:2:0 HEVC with one IDR
 slice; WPP is supported. A single image is decoded as a grid with one tile.
 `clap`/`irot`/`imir` are applied, and Exif orientation applies when no
-effective container orientation is present. RGB matrix/TRC ICC profiles and
+effective container orientation is present. Container transforms for which
+libheif first converts 4:2:0 chroma to 4:4:4 return `Unsupported`. Each is
+judged at the size the image has when it applies: a `clap` with an odd left or
+top edge, an anticlockwise 90° rotation (`irot` 1) of an odd width, a 180°
+rotation with either side odd, an anticlockwise 270° rotation (`irot` 3) of an
+odd height, or a mirror with either side odd. A display area that starts on an
+odd source row or column is also refused, which is stricter than libheif when
+a rotation or mirror comes before the crop. RGB matrix/TRC ICC profiles and
 SDR nclx colour with BT.709, BT.2020 or Display P3 primaries are converted to
 sRGB. HDR transfer functions, grayscale or
 lookup-table ICC profiles, unprofiled wide-gamut HEVC colour, alpha, and

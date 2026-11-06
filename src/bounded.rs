@@ -131,6 +131,11 @@ pub fn decode_bounded(
     let index = container::Index::parse(&metadata, source.len(), &budget)?;
     let grid = grid::Grid::preflight(&index, &mut source, &budget)?;
     let layout = resample::Layout::new(&grid, options.max_side)?;
+    if layout.left % 2 != 0 || layout.top % 2 != 0 || !grid.transforms_keep_subsampled_chroma()? {
+        return Err(BoundedDecodeError::Unsupported(
+            "transform that needs 4:4:4 chroma",
+        ));
+    }
     let first = &grid.tiles[0];
     let mut color = first.color.clone();
     if grid
