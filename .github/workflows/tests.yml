@@ -72,8 +72,8 @@ jobs:
               run: |
                   sudo apt-get update
                   sudo apt-get install -y cmake pkg-config ffmpeg ruby \
-                      libde265-dev libx265-dev libaom-dev aom-tools libdav1d-dev \
-                      libopenjp2-7-dev libjpeg-dev libbrotli-dev zlib1g-dev
+                      libde265-dev libx265-dev libaom-dev aom-tools libyuv-dev libwebm-dev \
+                      libdav1d-dev libopenjp2-7-dev libjpeg-dev libbrotli-dev zlib1g-dev
 
             - name: Build pinned libpng for validator output
               run: |
