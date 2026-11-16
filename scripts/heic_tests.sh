@@ -751,7 +751,7 @@ build_libheif_decoder() {
 
   log validator "Building validator at $LIBHEIF_BUILD_DIR ($rebuild_reason)"
   cmake -S "$LIBHEIF_SOURCE_DIR" -B "$LIBHEIF_BUILD_DIR" "${cmake_args[@]}" >/dev/null
-  cmake --build "$LIBHEIF_BUILD_DIR" --target heif-dec heif-info --parallel >/dev/null
+  cmake --build "$LIBHEIF_BUILD_DIR" --target heif-dec heif-info --parallel "$(getconf _NPROCESSORS_ONLN)" >/dev/null
 
   [[ -x "$LIBHEIF_DEC_BIN" ]] || fail "Could not build heif-dec at $LIBHEIF_DEC_BIN"
   if [[ "$LIBHEIF_REQUIRE_ORACLE_DECODERS" == "1" ]] && ! libheif_oracle_ready; then
