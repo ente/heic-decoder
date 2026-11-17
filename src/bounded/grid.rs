@@ -225,6 +225,41 @@ impl<'a> Tile<'a> {
 }
 
 impl<'a> Grid<'a> {
+    pub(super) fn transforms_keep_subsampled_chroma(&self) -> Result<bool> {
+        let (mut width, mut height) = (self.width, self.height);
+        for transform in self.properties.transforms.iter().flatten() {
+            let (odd_width, odd_height) = (width % 2 != 0, height % 2 != 0);
+            match transform {
+                Transform::CleanAperture(aperture) => {
+                    let crop = crate::clean_aperture_crop_bounds(width, height, *aperture)
+                        .map_err(|_| Error::Malformed("display crop"))?;
+                    if crop.left % 2 != 0 || crop.top % 2 != 0 {
+                        return Ok(false);
+                    }
+                    (width, height) = (crop.width, crop.height);
+                }
+                Transform::Rotation(rotation) => {
+                    let degrees = rotation.rotation_ccw_degrees % 360;
+                    if (degrees == 90 && odd_width)
+                        || (degrees == 180 && (odd_width || odd_height))
+                        || (degrees == 270 && odd_height)
+                    {
+                        return Ok(false);
+                    }
+                    if degrees % 180 == 90 {
+                        (width, height) = (height, width);
+                    }
+                }
+                Transform::Mirror(_) => {
+                    if odd_width || odd_height {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     pub(super) fn preflight(
         index: &Index<'a>,
         source: &mut Source<'_>,
