@@ -72,8 +72,8 @@ jobs:
               run: |
                   sudo apt-get update
                   sudo apt-get install -y cmake pkg-config ffmpeg ruby \
-                      libde265-dev libx265-dev libaom-dev libdav1d-dev \
-                      libopenjp2-7-dev libjpeg-dev libbrotli-dev zlib1g-dev
+                      libde265-dev libx265-dev libaom-dev aom-tools libyuv-dev libwebm-dev \
+                      libdav1d-dev libopenjp2-7-dev libjpeg-dev libbrotli-dev zlib1g-dev
 
             - name: Build pinned libpng for validator output
               run: |
@@ -93,7 +93,7 @@ jobs:
                   cmake --build .heic-test-assets/libpng-build --parallel
                   cmake --install .heic-test-assets/libpng-build
 
-                  echo "LIBHEIF_CMAKE_ARGS=-DPNG_PNG_INCLUDE_DIR=$prefix/include -DPNG_LIBRARY=$prefix/lib/libpng16.a" >> "$GITHUB_ENV"
+                  echo "LIBHEIF_CMAKE_ARGS=-DPNG_PNG_INCLUDE_DIR=$prefix/include -DPNG_LIBRARY=$prefix/lib/libpng16.a -DCMAKE_CXX_FLAGS=-ffp-contract=off" >> "$GITHUB_ENV"
 
             - name: Fetch pinned libheif (validator source and corpus)
               run: |
