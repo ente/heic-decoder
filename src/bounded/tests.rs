@@ -1755,3 +1755,31 @@ fn transforms_that_need_full_chroma_are_refused() {
     assert_eq!((bounded.image.width, bounded.image.height), (10, 12));
     assert_eq!(bounded.image.pixels, normal.pixels);
 }
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn grid_dimensions_are_limited_to_500_megapixels() {
+    let nals = nal_sets();
+    let config = configuration(&nals[1]);
+    let decode = |dimensions| {
+        decode_bounded(
+            BoundedInput::Bytes(&coded_fixture(
+                Primary::Grid,
+                &config,
+                dimensions,
+                &[&nals[3]],
+                &[],
+                None,
+            )),
+            Default::default(),
+        )
+    };
+    assert!(matches!(
+        decode((22_361, 22_361)),
+        Err(BoundedDecodeError::LimitExceeded("grid dimensions"))
+    ));
+    assert!(matches!(
+        decode((22_360, 22_360)),
+        Err(BoundedDecodeError::Malformed("ispe differs from SPS"))
+    ));
+}

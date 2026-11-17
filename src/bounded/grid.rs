@@ -318,7 +318,7 @@ impl<'a> Grid<'a> {
         let width = r.uint(if flags == 0 { 2 } else { 4 })? as u32;
         let height = r.uint(if flags == 0 { 2 } else { 4 })? as u32;
         r.finish()?;
-        if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 256_000_000 {
+        if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 500_000_000 {
             return Err(Error::LimitExceeded("grid dimensions"));
         }
         let count = (rows * columns) as usize;
