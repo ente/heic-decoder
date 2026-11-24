@@ -32,26 +32,84 @@ pub(crate) fn bilinear_chroma_sample(
         >> 4) as u16
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeicRegion {
+    pub(crate) left: u32,
+    pub(crate) top: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
 pub(crate) fn upsample_heic_to_yuv444(
-    decoded: DecodedHeicImage,
+    decoded: &DecodedHeicImage,
+) -> Result<DecodedHeicImage, DecodeHeicError> {
+    upsample_heic_region_to_yuv444(
+        decoded,
+        HeicRegion {
+            left: 0,
+            top: 0,
+            width: decoded.width,
+            height: decoded.height,
+        },
+    )
+}
+
+pub(crate) fn upsample_heic_region_to_yuv444(
+    decoded: &DecodedHeicImage,
+    region: HeicRegion,
 ) -> Result<DecodedHeicImage, DecodeHeicError> {
     let (subsample_x, subsample_y) = crate::heic_chroma_subsampling(decoded.layout);
     if subsample_x == 1 && subsample_y == 1 {
-        return Ok(decoded);
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "bilinear chroma upsampling requires subsampled chroma, got {:?}",
+                decoded.layout
+            ),
+        });
+    }
+    if region
+        .left
+        .checked_add(region.width)
+        .is_none_or(|right| right > decoded.width)
+        || region
+            .top
+            .checked_add(region.height)
+            .is_none_or(|bottom| bottom > decoded.height)
+    {
+        return Err(DecodeHeicError::InvalidDecodedFrame {
+            detail: format!(
+                "{}x{} upsampling region at ({}, {}) exceeds {}x{} image",
+                region.width, region.height, region.left, region.top, decoded.width, decoded.height
+            ),
+        });
     }
     crate::validate_heic_plane_dimensions(&decoded.y_plane, decoded.width, decoded.height, "Y")?;
     let (u_plane, v_plane, chroma_width, chroma_height) =
-        crate::require_heic_chroma_planes(&decoded)?;
+        crate::require_heic_chroma_planes(decoded)?;
     crate::validate_heic_plane_dimensions(u_plane, chroma_width, chroma_height, "U")?;
     crate::validate_heic_plane_dimensions(v_plane, chroma_width, chroma_height, "V")?;
-    let upsampled_u = upsample_plane(u_plane, decoded.width, decoded.height, subsample_y, "U")?;
-    let upsampled_v = upsample_plane(v_plane, decoded.width, decoded.height, subsample_y, "V")?;
+    let y_plane = crate::extract_cropped_heic_plane(
+        &decoded.y_plane.samples,
+        decoded.y_plane.width as usize,
+        region.left,
+        region.top,
+        region.width,
+        region.height,
+        "Y",
+    )?;
+    let upsampled_u = upsample_plane(u_plane, region, subsample_y, "U")?;
+    let upsampled_v = upsample_plane(v_plane, region, subsample_y, "V")?;
     let mut upsampled = DecodedHeicImage {
+        width: region.width,
+        height: region.height,
+        bit_depth_luma: decoded.bit_depth_luma,
+        bit_depth_chroma: decoded.bit_depth_chroma,
         layout: HeicPixelLayout::Yuv444,
+        ycbcr_range: decoded.ycbcr_range,
         ycbcr_matrix: with_libheif_srgb_defaults(decoded.ycbcr_matrix),
+        y_plane,
         u_plane: Some(upsampled_u),
         v_plane: Some(upsampled_v),
-        ..decoded
     };
     if upsampled.ycbcr_range == YCbCrRange::Limited {
         requantize_yuv444_to_full_range(&mut upsampled)?;
@@ -61,8 +119,7 @@ pub(crate) fn upsample_heic_to_yuv444(
 
 fn upsample_plane(
     plane: &HeicPlane,
-    width: u32,
-    height: u32,
+    region: HeicRegion,
     subsample_y: u32,
     label: &'static str,
 ) -> Result<HeicPlane, DecodeHeicError> {
@@ -76,14 +133,15 @@ fn upsample_plane(
             ),
         });
     }
-    let sample_count = crate::heic_sample_count(width, height, label)?;
+    let sample_count = crate::heic_sample_count(region.width, region.height, label)?;
     let mut samples = Vec::new();
     samples
         .try_reserve_exact(sample_count)
         .map_err(|_| DecodeHeicError::AllocationFailed {
             stage: "bilinear chroma upsampling",
         })?;
-    for y in 0..height as usize {
+    let (left, top) = (region.left as usize, region.top as usize);
+    for y in top..top + region.height as usize {
         let (row, neighbour_row) = if subsample_y == 2 {
             (y / 2, bilinear_chroma_neighbour(y, 0, chroma_height - 1))
         } else {
@@ -92,7 +150,7 @@ fn upsample_plane(
         let current = &plane.samples[row * chroma_width..(row + 1) * chroma_width];
         let neighbour =
             &plane.samples[neighbour_row * chroma_width..(neighbour_row + 1) * chroma_width];
-        for x in 0..width as usize {
+        for x in left..left + region.width as usize {
             let column = x / 2;
             let neighbour_column = bilinear_chroma_neighbour(x, 0, chroma_width - 1);
             samples.push(bilinear_chroma_sample(
@@ -104,8 +162,8 @@ fn upsample_plane(
         }
     }
     Ok(HeicPlane {
-        width,
-        height,
+        width: region.width,
+        height: region.height,
         samples,
     })
 }
@@ -309,7 +367,7 @@ mod tests {
                     |x, y| (x * 37 + y * 91) as u16 % 240,
                     YCbCrRange::Full,
                 );
-                let upsampled = upsample_heic_to_yuv444(source.clone()).unwrap();
+                let upsampled = upsample_heic_to_yuv444(&source).unwrap();
                 assert_eq!(upsampled.layout, HeicPixelLayout::Yuv444);
                 assert_eq!(upsampled.y_plane, source.y_plane);
                 for (original, converted) in [
@@ -391,7 +449,7 @@ mod tests {
                 YCbCrRange::Full,
             );
             let original = source.u_plane.clone().unwrap();
-            let upsampled = upsample_heic_to_yuv444(source).unwrap();
+            let upsampled = upsample_heic_to_yuv444(&source).unwrap();
             assert_eq!(
                 upsampled.u_plane.unwrap().samples,
                 libheif_420_kernel(&original.samples, width as usize, height as usize),
@@ -409,7 +467,7 @@ mod tests {
             |x, y| (x * 50 + y * 20) as u16,
             YCbCrRange::Full,
         );
-        let upsampled = upsample_heic_to_yuv444(source.clone()).unwrap();
+        let upsampled = upsample_heic_to_yuv444(&source).unwrap();
         assert_eq!(upsampled.ycbcr_range, YCbCrRange::Full);
         assert_eq!(
             upsampled.ycbcr_matrix,
@@ -430,7 +488,7 @@ mod tests {
             |x, _| [16, 128, 240, 200][x as usize % 4],
             YCbCrRange::Limited,
         );
-        let mut expected = upsample_heic_to_yuv444(DecodedHeicImage {
+        let mut expected = upsample_heic_to_yuv444(&DecodedHeicImage {
             ycbcr_range: YCbCrRange::Full,
             ..source.clone()
         })
@@ -450,9 +508,70 @@ mod tests {
             expected.v_plane.as_mut().unwrap().samples[index] = v;
         }
 
-        let upsampled = upsample_heic_to_yuv444(source.clone()).unwrap();
+        let upsampled = upsample_heic_to_yuv444(&source).unwrap();
         assert_eq!(upsampled, expected);
         assert_ne!(upsampled.y_plane, source.y_plane);
+    }
+
+    #[test]
+    fn region_upsampling_matches_cropping_the_whole_upsampled_image() {
+        for layout in [HeicPixelLayout::Yuv420, HeicPixelLayout::Yuv422] {
+            for range in [YCbCrRange::Full, YCbCrRange::Limited] {
+                let source = image(layout, 9, 7, |x, y| ((x * 41 + y * 23) % 220) as u16, range);
+                let whole = upsample_heic_to_yuv444(&source).unwrap();
+                for (left, top, width, height) in [
+                    (0, 0, 9, 7),
+                    (1, 1, 7, 5),
+                    (3, 2, 1, 1),
+                    (8, 6, 1, 1),
+                    (0, 3, 9, 2),
+                ] {
+                    let region = HeicRegion {
+                        left,
+                        top,
+                        width,
+                        height,
+                    };
+                    let crop = |plane: &HeicPlane| HeicPlane {
+                        width,
+                        height,
+                        samples: (top..top + height)
+                            .flat_map(|y| {
+                                (left..left + width)
+                                    .map(move |x| plane.samples[(y * plane.width + x) as usize])
+                            })
+                            .collect(),
+                    };
+                    let expected = DecodedHeicImage {
+                        width,
+                        height,
+                        y_plane: crop(&whole.y_plane),
+                        u_plane: whole.u_plane.as_ref().map(crop),
+                        v_plane: whole.v_plane.as_ref().map(crop),
+                        ..whole.clone()
+                    };
+                    assert_eq!(
+                        upsample_heic_region_to_yuv444(&source, region).unwrap(),
+                        expected,
+                        "{layout:?} {range:?} {region:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn region_upsampling_rejects_regions_outside_the_image() {
+        let source = image(HeicPixelLayout::Yuv420, 4, 4, |_, _| 128, YCbCrRange::Full);
+        for (left, top, width, height) in [(1, 0, 4, 4), (0, 1, 4, 4), (u32::MAX, 0, 2, 1)] {
+            let region = HeicRegion {
+                left,
+                top,
+                width,
+                height,
+            };
+            assert!(upsample_heic_region_to_yuv444(&source, region).is_err());
+        }
     }
 
     #[test]

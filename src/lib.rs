@@ -6522,7 +6522,7 @@ fn apply_heic_grid_tile_transforms(
                     decoded.height,
                     *clean_aperture,
                 ) {
-                    decoded = chroma_upsampling::upsample_heic_to_yuv444(decoded)?;
+                    decoded = chroma_upsampling::upsample_heic_to_yuv444(&decoded)?;
                 }
                 decoded = crop_heic_by_clean_aperture(decoded, *clean_aperture)?;
             }
@@ -6565,16 +6565,16 @@ fn first_chroma_unaligned_leading_clean_aperture(
     mut width: u32,
     mut height: u32,
     transforms: &[isobmff::PrimaryItemTransformProperty],
-) -> Option<usize> {
+) -> Option<(usize, isobmff::ImageCleanApertureProperty)> {
     for (index, transform) in transforms.iter().enumerate() {
         let isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture) = transform else {
             return None;
         };
+        let crop = clean_aperture_crop_bounds(width, height, *clean_aperture).ok()?;
         if !heic_clean_aperture_crop_preserves_chroma_phase(layout, width, height, *clean_aperture)
         {
-            return Some(index);
+            return Some((index, *clean_aperture));
         }
-        let crop = clean_aperture_crop_bounds(width, height, *clean_aperture).ok()?;
         (width, height) = (crop.width, crop.height);
     }
     None
@@ -6615,86 +6615,203 @@ impl HeicColrOverride {
     }
 }
 
+const HEIC_YUV444_BAND_PIXELS: u32 = 1 << 18;
+
+struct HeicYuv444Region {
+    source: DecodedHeicImage,
+    region: chroma_upsampling::HeicRegion,
+    colr: HeicColrOverride,
+}
+
+impl HeicYuv444Region {
+    fn for_each_band<E: From<DecodeHeicError>>(
+        &self,
+        mut visit: impl FnMut(usize, &DecodedHeicImage) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let band_height = (HEIC_YUV444_BAND_PIXELS / self.region.width.max(1)).max(1);
+        for top in (0..self.region.height).step_by(band_height as usize) {
+            let mut band = chroma_upsampling::upsample_heic_region_to_yuv444(
+                &self.source,
+                chroma_upsampling::HeicRegion {
+                    top: self.region.top + top,
+                    height: band_height.min(self.region.height - top),
+                    ..self.region
+                },
+            )?;
+            self.colr.apply(&mut band);
+            visit(top as usize, &band)?;
+        }
+        Ok(())
+    }
+}
+
+enum HeicColorSource {
+    Planes(DecodedHeicImage),
+    Yuv444Region(HeicYuv444Region),
+}
+
+impl HeicColorSource {
+    fn dimensions(&self) -> (u32, u32) {
+        match self {
+            Self::Planes(decoded) => (decoded.width, decoded.height),
+            Self::Yuv444Region(yuv444) => (yuv444.region.width, yuv444.region.height),
+        }
+    }
+
+    fn bit_depth(&self) -> Result<u8, DecodeHeicError> {
+        heic_bit_depth_for_png_conversion(match self {
+            Self::Planes(decoded) => decoded,
+            Self::Yuv444Region(yuv444) => &yuv444.source,
+        })
+    }
+
+    fn crop_by_leading_chroma_aligned_clean_apertures(
+        self,
+        transforms: &[isobmff::PrimaryItemTransformProperty],
+    ) -> Result<(Self, &[isobmff::PrimaryItemTransformProperty]), DecodeError> {
+        match self {
+            Self::Planes(decoded) => {
+                let (decoded, transforms) =
+                    crop_heic_by_leading_chroma_aligned_clean_apertures(decoded, transforms)?;
+                Ok((Self::Planes(decoded), transforms))
+            }
+            source => Ok((source, transforms)),
+        }
+    }
+
+    fn convert<T: Copy>(
+        self,
+        channels: usize,
+        convert: fn(&DecodedHeicImage) -> Result<Vec<T>, DecodeHeicError>,
+    ) -> Result<Vec<T>, DecodeHeicError> {
+        let yuv444 = match self {
+            Self::Planes(decoded) => return convert(&decoded),
+            Self::Yuv444Region(yuv444) => yuv444,
+        };
+        let sample_count =
+            heic_sample_count(yuv444.region.width, yuv444.region.height, "4:4:4 region")?
+                .checked_mul(channels)
+                .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                    detail: format!(
+                        "{}x{} 4:4:4 region output sample count overflows",
+                        yuv444.region.width, yuv444.region.height
+                    ),
+                })?;
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(sample_count)
+            .map_err(|_| DecodeHeicError::AllocationFailed {
+                stage: "4:4:4 region conversion",
+            })?;
+        yuv444.for_each_band(|_, band| {
+            pixels.extend_from_slice(&convert(band)?);
+            Ok::<_, DecodeHeicError>(())
+        })?;
+        Ok(pixels)
+    }
+}
+
 type HeicPrimaryTransformInput<'t, 'a> = (
-    DecodedHeicImage,
+    HeicColorSource,
     &'t [isobmff::PrimaryItemTransformProperty],
     Option<Cow<'a, HeicAuxiliaryAlphaPlane>>,
 );
 
-fn crop_heic_through_chroma_unaligned_clean_aperture<'t, 'a>(
+fn prepare_heic_color_source<'t, 'a>(
     mut decoded: DecodedHeicImage,
     colr: HeicColrOverride,
     transforms: &'t [isobmff::PrimaryItemTransformProperty],
     auxiliary_alpha: Option<&'a HeicAuxiliaryAlphaPlane>,
 ) -> Result<HeicPrimaryTransformInput<'t, 'a>, DecodeError> {
     let mut auxiliary_alpha = auxiliary_alpha.map(Cow::Borrowed);
-    let mut remaining_transforms = transforms;
-    if let Some(index) = first_chroma_unaligned_leading_clean_aperture(
+    let Some((index, clean_aperture)) = first_chroma_unaligned_leading_clean_aperture(
         decoded.layout,
         decoded.width,
         decoded.height,
         transforms,
-    ) {
-        for transform in &transforms[..=index] {
-            let isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture) = transform
-            else {
-                continue;
-            };
-            if !heic_clean_aperture_crop_preserves_chroma_phase(
-                decoded.layout,
+    ) else {
+        colr.apply(&mut decoded);
+        return Ok((
+            HeicColorSource::Planes(decoded),
+            transforms,
+            auxiliary_alpha,
+        ));
+    };
+    for transform in &transforms[..index] {
+        if let isobmff::PrimaryItemTransformProperty::CleanAperture(leading) = transform {
+            auxiliary_alpha = crop_heic_auxiliary_alpha_plane(
+                auxiliary_alpha,
                 decoded.width,
                 decoded.height,
-                *clean_aperture,
-            ) {
-                decoded = chroma_upsampling::upsample_heic_to_yuv444(decoded)?;
-            }
-            if let Some(alpha) = auxiliary_alpha.take() {
-                validate_auxiliary_alpha_plane(&alpha, decoded.width, decoded.height)?;
-                auxiliary_alpha = Some(Cow::Owned(crop_heic_auxiliary_alpha_plane(
-                    &alpha,
-                    *clean_aperture,
-                )?));
-            }
-            decoded = crop_heic_by_clean_aperture(decoded, *clean_aperture)?;
+                *leading,
+            )?;
+            decoded = crop_heic_by_clean_aperture(decoded, *leading)?;
         }
-        remaining_transforms = &transforms[index + 1..];
     }
-    colr.apply(&mut decoded);
-    Ok((decoded, remaining_transforms, auxiliary_alpha))
+    auxiliary_alpha = crop_heic_auxiliary_alpha_plane(
+        auxiliary_alpha,
+        decoded.width,
+        decoded.height,
+        clean_aperture,
+    )?;
+    let region = heic_region_from_clean_aperture(decoded.width, decoded.height, clean_aperture)?;
+    Ok((
+        HeicColorSource::Yuv444Region(HeicYuv444Region {
+            source: decoded,
+            region,
+            colr,
+        }),
+        &transforms[index + 1..],
+        auxiliary_alpha,
+    ))
 }
 
-fn crop_heic_auxiliary_alpha_plane(
-    alpha: &HeicAuxiliaryAlphaPlane,
+fn heic_region_from_clean_aperture(
+    width: u32,
+    height: u32,
     clean_aperture: isobmff::ImageCleanApertureProperty,
-) -> Result<HeicAuxiliaryAlphaPlane, DecodeError> {
-    let crop = clean_aperture_crop_bounds(alpha.width, alpha.height, clean_aperture)?;
+) -> Result<chroma_upsampling::HeicRegion, DecodeError> {
+    let crop = clean_aperture_crop_bounds(width, height, clean_aperture)?;
     let left = u32::try_from(crop.left).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-        detail: format!(
-            "alpha clean-aperture left bound is out of range: {}",
-            crop.left
-        ),
+        detail: format!("clean-aperture left bound is out of range: {}", crop.left),
     })?;
     let top = u32::try_from(crop.top).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-        detail: format!(
-            "alpha clean-aperture top bound is out of range: {}",
-            crop.top
-        ),
+        detail: format!("clean-aperture top bound is out of range: {}", crop.top),
     })?;
+    Ok(chroma_upsampling::HeicRegion {
+        left,
+        top,
+        width: crop.width,
+        height: crop.height,
+    })
+}
+
+fn crop_heic_auxiliary_alpha_plane<'a>(
+    alpha: Option<Cow<'a, HeicAuxiliaryAlphaPlane>>,
+    width: u32,
+    height: u32,
+    clean_aperture: isobmff::ImageCleanApertureProperty,
+) -> Result<Option<Cow<'a, HeicAuxiliaryAlphaPlane>>, DecodeError> {
+    let Some(alpha) = alpha else {
+        return Ok(None);
+    };
+    validate_auxiliary_alpha_plane(&alpha, width, height)?;
+    let region = heic_region_from_clean_aperture(width, height, clean_aperture)?;
     let plane = extract_cropped_heic_plane(
         &alpha.samples,
         alpha.width as usize,
-        left,
-        top,
-        crop.width,
-        crop.height,
+        region.left,
+        region.top,
+        region.width,
+        region.height,
         "auxiliary alpha",
     )?;
-    Ok(HeicAuxiliaryAlphaPlane {
+    Ok(Some(Cow::Owned(HeicAuxiliaryAlphaPlane {
         width: plane.width,
         height: plane.height,
         bit_depth: alpha.bit_depth,
         samples: plane.samples,
-    })
+    })))
 }
 
 fn crop_heic_by_leading_chroma_aligned_clean_apertures(
@@ -9023,22 +9140,33 @@ fn decode_primary_heic_grid_to_rgba_output<T: Copy + Default, O: RgbaSampleOutpu
         )));
     }
     if heic_grid_needs_canvas_for_transforms(grid_data, &first_tile, transforms) {
-        let (canvas, transforms, auxiliary_alpha) =
-            crop_heic_through_chroma_unaligned_clean_aperture(
-                assemble_decoded_heic_grid(grid_data, first_tile)?,
-                HeicColrOverride::for_grid(grid_data),
+        let (canvas, transforms, auxiliary_alpha) = prepare_heic_color_source(
+            assemble_decoded_heic_grid(grid_data, first_tile)?,
+            HeicColrOverride::for_grid(grid_data),
+            transforms,
+            auxiliary_alpha,
+        )?;
+        let auxiliary_alpha = auxiliary_alpha.as_deref();
+        return match canvas {
+            HeicColorSource::Planes(canvas) => decoded_heic_to_rgba_output(
+                canvas,
                 transforms,
                 auxiliary_alpha,
-            )?;
-        return decoded_heic_to_rgba_output(
-            canvas,
-            transforms,
-            auxiliary_alpha.as_deref(),
-            out,
-            storage_bit_depth,
-            scale_alpha,
-            scale_alpha(u16::MAX, 16),
-        );
+                out,
+                storage_bit_depth,
+                scale_alpha,
+                scale_alpha(u16::MAX, 16),
+            ),
+            HeicColorSource::Yuv444Region(yuv444) => heic_yuv444_region_to_rgba_output(
+                &yuv444,
+                transforms,
+                auxiliary_alpha,
+                out,
+                storage_bit_depth,
+                convert_tile,
+                scale_alpha,
+            ),
+        };
     }
 
     let transform_plan = RgbaTransformPlan::from_primary_transforms(
@@ -9369,6 +9497,77 @@ fn paste_direct_grid_rgba_tile_to_output<T: Copy, O: RgbaSampleOutput<T>>(
 }
 
 #[cfg(feature = "image-integration")]
+fn heic_yuv444_region_to_rgba_output<T: Copy, O: RgbaSampleOutput<T>>(
+    yuv444: &HeicYuv444Region,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+    auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
+    out: &mut O,
+    storage_bit_depth: u8,
+    convert_band: fn(&DecodedHeicImage, &mut Vec<T>) -> Result<(), DecodeHeicError>,
+    scale_alpha: fn(u16, u8) -> T,
+) -> Result<(), DecodeError> {
+    let source_storage_bit_depth =
+        heic_storage_bit_depth(heic_bit_depth_for_png_conversion(&yuv444.source)?);
+    if source_storage_bit_depth != storage_bit_depth {
+        return Err(DecodeError::Unsupported(format!(
+            "HEIC storage is RGBA{source_storage_bit_depth}, not RGBA{storage_bit_depth}"
+        )));
+    }
+    let (width, height) = (yuv444.region.width, yuv444.region.height);
+    let transform_plan = RgbaTransformPlan::from_primary_transforms(width, height, transforms)?;
+    let expected = checked_rgba_sample_count(
+        transform_plan.destination_width,
+        transform_plan.destination_height,
+    )?;
+    if out.sample_len() != expected {
+        return Err(DecodeError::TransformGuard(
+            TransformGuardError::RgbaSampleCountMismatch {
+                stage: "HEIC direct transformed image adapter output",
+                actual: out.sample_len(),
+                expected,
+                width: transform_plan.destination_width,
+                height: transform_plan.destination_height,
+            },
+        ));
+    }
+    if let Some(alpha) = auxiliary_alpha {
+        validate_auxiliary_alpha_plane(alpha, width, height)?;
+    }
+    let source_width = transform_dimension_to_usize("HEIC 4:4:4 region", "source width", width)?;
+    let destination_width = transform_dimension_to_usize(
+        "HEIC 4:4:4 region",
+        "destination width",
+        transform_plan.destination_width,
+    )?;
+    let mut band_pixels = Vec::new();
+    yuv444.for_each_band(|top, band| {
+        convert_band(band, &mut band_pixels)?;
+        for (row, row_pixels) in band_pixels.chunks_exact(source_width * 4).enumerate() {
+            let source_y = top + row;
+            for (source_x, pixel) in row_pixels.chunks_exact(4).enumerate() {
+                let Some((destination_x, destination_y)) =
+                    transform_plan.map_source_pixel(source_x, source_y)?
+                else {
+                    continue;
+                };
+                let destination_sample = (destination_y * destination_width + destination_x) * 4;
+                out.write_samples(destination_sample, &pixel[..3]);
+                out.write_sample(
+                    destination_sample + 3,
+                    auxiliary_alpha.map_or(pixel[3], |alpha| {
+                        scale_alpha(
+                            alpha.samples[source_y * source_width + source_x],
+                            alpha.bit_depth,
+                        )
+                    }),
+                );
+            }
+        }
+        Ok::<_, DecodeError>(())
+    })
+}
+
+#[cfg(feature = "image-integration")]
 fn decoded_heic_to_rgba8_slice(
     decoded: DecodedHeicImage,
     colr: HeicColrOverride,
@@ -9376,13 +9575,23 @@ fn decoded_heic_to_rgba8_slice(
     auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
-    let (decoded, transforms, auxiliary_alpha) = crop_heic_through_chroma_unaligned_clean_aperture(
-        decoded,
-        colr,
-        transforms,
-        auxiliary_alpha,
-    )?;
+    let (source, transforms, auxiliary_alpha) =
+        prepare_heic_color_source(decoded, colr, transforms, auxiliary_alpha)?;
     let auxiliary_alpha = auxiliary_alpha.as_deref();
+    let decoded = match source {
+        HeicColorSource::Planes(decoded) => decoded,
+        HeicColorSource::Yuv444Region(yuv444) => {
+            return heic_yuv444_region_to_rgba_output(
+                &yuv444,
+                transforms,
+                auxiliary_alpha,
+                &mut SliceRgbaOutput(out),
+                8,
+                convert_heic_to_rgba8_into,
+                scale_sample_to_u8,
+            );
+        }
+    };
     if auxiliary_alpha.is_none() || transforms.is_empty() {
         let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
         if heic_storage_bit_depth(source_bit_depth) != 8 {
@@ -9465,13 +9674,23 @@ fn decoded_heic_to_rgba16_native_endian_bytes(
     auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
-    let (decoded, transforms, auxiliary_alpha) = crop_heic_through_chroma_unaligned_clean_aperture(
-        decoded,
-        colr,
-        transforms,
-        auxiliary_alpha,
-    )?;
+    let (source, transforms, auxiliary_alpha) =
+        prepare_heic_color_source(decoded, colr, transforms, auxiliary_alpha)?;
     let auxiliary_alpha = auxiliary_alpha.as_deref();
+    let decoded = match source {
+        HeicColorSource::Planes(decoded) => decoded,
+        HeicColorSource::Yuv444Region(yuv444) => {
+            return heic_yuv444_region_to_rgba_output(
+                &yuv444,
+                transforms,
+                auxiliary_alpha,
+                &mut NativeEndianRgba16Output(out),
+                16,
+                convert_heic_to_rgba16_into,
+                scale_sample_to_u16,
+            );
+        }
+    };
     // `image` allocates the identity decode buffer through the global
     // allocator, which is naturally aligned on the mobile targets. Reuse the
     // contiguous RGBA16 converter in that common case so its high-bit-depth
@@ -11208,31 +11427,23 @@ fn decoded_heic_to_rgba_image(
     auxiliary_alpha: Option<&HeicAuxiliaryAlphaPlane>,
     icc_profile: Option<Vec<u8>>,
 ) -> Result<DecodedRgbaImage, DecodeError> {
-    let (mut decoded, mut remaining_transforms, auxiliary_alpha) =
-        crop_heic_through_chroma_unaligned_clean_aperture(
-            decoded,
-            colr,
-            transforms,
-            auxiliary_alpha,
-        )?;
+    let (mut source, mut remaining_transforms, auxiliary_alpha) =
+        prepare_heic_color_source(decoded, colr, transforms, auxiliary_alpha)?;
     let auxiliary_alpha = auxiliary_alpha.as_deref();
     if auxiliary_alpha.is_none() {
-        (decoded, remaining_transforms) =
-            crop_heic_by_leading_chroma_aligned_clean_apertures(decoded, remaining_transforms)?;
+        (source, remaining_transforms) =
+            source.crop_by_leading_chroma_aligned_clean_apertures(remaining_transforms)?;
     }
 
-    let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
+    let (width, height) = source.dimensions();
+    let source_bit_depth = source.bit_depth()?;
     if source_bit_depth <= 8 {
-        let mut pixels = convert_heic_to_rgba8(&decoded)?;
+        let mut pixels = source.convert(4, convert_heic_to_rgba8)?;
         if let Some(alpha) = auxiliary_alpha {
-            apply_auxiliary_alpha_to_rgba8(&mut pixels, decoded.width, decoded.height, alpha)?;
+            apply_auxiliary_alpha_to_rgba8(&mut pixels, width, height, alpha)?;
         }
-        let (width, height, transformed) = apply_primary_item_transforms_rgba(
-            decoded.width,
-            decoded.height,
-            pixels,
-            remaining_transforms,
-        )?;
+        let (width, height, transformed) =
+            apply_primary_item_transforms_rgba(width, height, pixels, remaining_transforms)?;
         return Ok(DecodedRgbaImage {
             width,
             height,
@@ -11242,16 +11453,12 @@ fn decoded_heic_to_rgba_image(
         });
     }
 
-    let mut pixels = convert_heic_to_rgba16(&decoded)?;
+    let mut pixels = source.convert(4, convert_heic_to_rgba16)?;
     if let Some(alpha) = auxiliary_alpha {
-        apply_auxiliary_alpha_to_rgba16(&mut pixels, decoded.width, decoded.height, alpha)?;
+        apply_auxiliary_alpha_to_rgba16(&mut pixels, width, height, alpha)?;
     }
-    let (width, height, transformed) = apply_primary_item_transforms_rgba(
-        decoded.width,
-        decoded.height,
-        pixels,
-        remaining_transforms,
-    )?;
+    let (width, height, transformed) =
+        apply_primary_item_transforms_rgba(width, height, pixels, remaining_transforms)?;
     Ok(DecodedRgbaImage {
         width,
         height,
@@ -11267,18 +11474,14 @@ fn decoded_heic_to_rgb8_image(
     transforms: &[isobmff::PrimaryItemTransformProperty],
     icc_profile: Option<Vec<u8>>,
 ) -> Result<DecodedRgbImage, DecodeError> {
-    let (decoded, transforms, _) =
-        crop_heic_through_chroma_unaligned_clean_aperture(decoded, colr, transforms, None)?;
-    let (decoded, remaining_transforms) =
-        crop_heic_by_leading_chroma_aligned_clean_apertures(decoded, transforms)?;
-    let source_bit_depth = heic_bit_depth_for_png_conversion(&decoded)?;
-    let pixels = convert_heic_to_rgb8(&decoded)?;
-    let (width, height, pixels) = apply_primary_item_transforms_rgb8(
-        decoded.width,
-        decoded.height,
-        pixels,
-        remaining_transforms,
-    )?;
+    let (source, transforms, _) = prepare_heic_color_source(decoded, colr, transforms, None)?;
+    let (source, remaining_transforms) =
+        source.crop_by_leading_chroma_aligned_clean_apertures(transforms)?;
+    let (width, height) = source.dimensions();
+    let source_bit_depth = source.bit_depth()?;
+    let pixels = source.convert(3, convert_heic_to_rgb8)?;
+    let (width, height, pixels) =
+        apply_primary_item_transforms_rgb8(width, height, pixels, remaining_transforms)?;
     Ok(DecodedRgbImage {
         width,
         height,
@@ -14871,7 +15074,7 @@ mod tests {
         image: super::DecodedHeicImage,
         clean_aperture: isobmff::ImageCleanApertureProperty,
     ) -> super::DecodedHeicImage {
-        let upsampled = super::chroma_upsampling::upsample_heic_to_yuv444(image)
+        let upsampled = super::chroma_upsampling::upsample_heic_to_yuv444(&image)
             .expect("4:4:4 conversion should succeed");
         super::crop_heic_by_clean_aperture(upsampled, clean_aperture)
             .expect("4:4:4 clap crop should succeed")
@@ -15167,6 +15370,119 @@ mod tests {
             yuv444.height,
             odd_top
         ));
+    }
+
+    #[test]
+    fn odd_clean_aperture_crop_spanning_many_bands_matches_whole_image_conversion() {
+        let (width, height) = (1031_u32, 700_u32);
+        let layout = super::HeicPixelLayout::Yuv420;
+        let (chroma_width, chroma_height) = super::heic_chroma_dimensions(width, height, layout);
+        let plane = |width: u32, height: u32, step: u32| super::HeicPlane {
+            width,
+            height,
+            samples: (0..width * height)
+                .map(|index| (16 + (index * step + index / width * 31) % 220) as u16)
+                .collect(),
+        };
+        let image = super::DecodedHeicImage {
+            width,
+            height,
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            layout,
+            ycbcr_range: super::YCbCrRange::Limited,
+            ycbcr_matrix: super::YCbCrMatrixCoefficients {
+                matrix_coefficients: 1,
+                colour_primaries: 1,
+            },
+            y_plane: plane(width, height, 7),
+            u_plane: Some(plane(chroma_width, chroma_height, 53)),
+            v_plane: Some(plane(chroma_width, chroma_height, 97)),
+        };
+        let alpha = super::HeicAuxiliaryAlphaPlane {
+            width,
+            height,
+            bit_depth: 8,
+            samples: (0..width * height)
+                .map(|index| (index * 13 % 256) as u16)
+                .collect(),
+        };
+        let (crop_width, crop_height) = (1027_u32, 698_u32);
+        let clean_aperture = isobmff::ImageCleanApertureProperty {
+            clean_aperture_width_num: crop_width,
+            clean_aperture_width_den: 1,
+            clean_aperture_height_num: crop_height,
+            clean_aperture_height_den: 1,
+            horizontal_offset_num: -1,
+            horizontal_offset_den: 1,
+            vertical_offset_num: 0,
+            vertical_offset_den: 1,
+        };
+        assert!(!super::heic_clean_aperture_crop_preserves_chroma_phase(
+            layout,
+            width,
+            height,
+            clean_aperture
+        ));
+        assert!(super::HEIC_YUV444_BAND_PIXELS / crop_width < crop_height / 2);
+        let rotation =
+            isobmff::PrimaryItemTransformProperty::Rotation(isobmff::ImageRotationProperty {
+                rotation_ccw_degrees: 90,
+            });
+        let transforms = [
+            isobmff::PrimaryItemTransformProperty::CleanAperture(clean_aperture),
+            rotation,
+        ];
+
+        let cropped = bilinear_yuv444_crop(image.clone(), clean_aperture);
+        assert_eq!((cropped.width, cropped.height), (crop_width, crop_height));
+        let mut pixels = super::convert_heic_to_rgba8(&cropped).expect("conversion");
+        let source_alpha = &alpha.samples;
+        let cropped_alpha = super::HeicAuxiliaryAlphaPlane {
+            width: crop_width,
+            height: crop_height,
+            bit_depth: 8,
+            samples: (1..=crop_height)
+                .flat_map(|y| (1..=crop_width).map(move |x| source_alpha[(y * width + x) as usize]))
+                .collect(),
+        };
+        super::apply_auxiliary_alpha_to_rgba8(&mut pixels, crop_width, crop_height, &cropped_alpha)
+            .expect("alpha");
+        let (_, _, expected) =
+            super::apply_primary_item_transforms_rgba(crop_width, crop_height, pixels, &[rotation])
+                .expect("rotation");
+
+        let decoded = super::decoded_heic_to_rgba_image(
+            image.clone(),
+            super::HeicColrOverride::default(),
+            &transforms,
+            Some(&alpha),
+            None,
+        )
+        .expect("RGBA decode should succeed");
+        assert_eq!((decoded.width, decoded.height), (crop_height, crop_width));
+        assert!(rgba8_pixels(decoded) == expected);
+        let direct = super::decoded_heic_to_rgb8_image(
+            image.clone(),
+            super::HeicColrOverride::default(),
+            &transforms,
+            None,
+        )
+        .expect("RGB8 decode should succeed");
+        assert!(direct.pixels == rgba8_to_rgb8(&expected));
+        #[cfg(feature = "image-integration")]
+        {
+            let mut out = vec![0_u8; expected.len()];
+            super::decoded_heic_to_rgba8_slice(
+                image,
+                super::HeicColrOverride::default(),
+                &transforms,
+                Some(&alpha),
+                &mut out,
+            )
+            .expect("slice decode should succeed");
+            assert!(out == expected);
+        }
     }
 
     #[cfg(feature = "image-integration")]
