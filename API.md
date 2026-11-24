@@ -252,24 +252,35 @@ Default decode behavior:
 - Decode does not implicitly apply EXIF orientation.
 - This keeps output stable for libheif parity and avoids hidden double-rotation behavior.
 
-Clean-aperture crops follow libheif when they would split chroma samples. If a
-leading `clap` on a 4:2:0 image has an odd left or top edge, or one on a 4:2:2
-image has an odd left edge, the HEVC decode paths first convert the image to
-4:4:4 with bilinear chroma. If the coded colour is limited range, they then
-convert it through RGB to full-range 4:4:4, as libheif does, and crop
-afterwards. The coded stream's colour drives that conversion; a `colr` nclx
-property replaces it only after the crop. The same applies to primary items,
-to grids as a whole, and to individual grid tiles. A grid whose tile crops
+Container transforms follow libheif when they would split chroma samples.
+libheif converts a 4:2:0 or 4:2:2 image to 4:4:4 with bilinear chroma before
+any of these, each judged at the size the image has when it applies:
+
+- a `clap` with an odd left edge, or on 4:2:0 an odd top edge;
+- on 4:2:0, an anticlockwise 90° `irot` of an odd width, a 180° `irot` with
+  either side odd, an anticlockwise 270° `irot` of an odd height, or an `imir`
+  with either side odd;
+- on 4:2:2, any 90° or 270° `irot`, a 180° `irot` of an odd height, or a
+  left-right `imir` (axis 1) of an odd width.
+
+The HEVC decode paths do the same. Transforms before the conversion run on the
+subsampled planes in property order, as in libheif; for example, a 180°
+`irot` of an odd-width 4:2:2 image rotates its half-width chroma planes without
+converting them. If the coded colour is limited range, the conversion then
+passes the image through RGB to full-range 4:4:4, as libheif does. The coded
+stream's colour drives that conversion; a `colr` nclx property replaces it only
+after all transforms. The same applies to primary items, to grids as a whole,
+and to the clean apertures of individual grid tiles. A grid whose tile crops
 convert some tiles but not others is rejected with `DecodedLayoutMismatch`,
 because its tiles no longer share one chroma format; libheif rejects it too.
 For primary items and whole grids, the 4:4:4 image is built a few rows at a
 time while converting to RGB, so it is never held at full size. A grid that
-needs this conversion is first assembled into one 4:2:0 canvas, which stays in
-memory alongside the output, instead of being converted tile by tile. Image
-edges use clamped interpolation, matching libheif after its 2026-10 border fix.
-The pinned libheif 1.21.2 validator differs on output rows or columns that keep
-an image edge. A `clap` after `irot`/`imir` keeps the earlier behaviour: the
-crop is taken from RGBA converted with nearest-neighbour chroma.
+needs the conversion, or a transform of its subsampled planes, is first
+assembled into one canvas, which stays in memory alongside the output, instead
+of being converted tile by tile. Image edges use clamped interpolation,
+matching libheif after its 2026-10 border fix. The pinned libheif 1.21.2
+validator differs on output rows or columns that keep an edge of the converted
+image.
 
 Orientation APIs:
 
