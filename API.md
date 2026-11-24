@@ -121,6 +121,11 @@ These are useful for tooling and specialized pipelines, but most applications
 should use the core entry points above.
 
 - `decode_primary_avif_to_image(input)` -> `Result<DecodedAvifImage, DecodeAvifError>`
+  - `ycbcr_range` and `ycbcr_matrix` come from the item's `colr` nclx
+    property, or from the AV1 sequence header when the item has none, as in
+    libheif. Earlier versions reported full range with unspecified
+    coefficients when the item had no nclx property, and the RGBA decode
+    converted such items that way.
 - `assemble_primary_heic_hevc_stream(input)` -> `Result<Vec<u8>, DecodeHeicError>`
 - `decode_primary_heic_to_image(input)` -> `Result<DecodedHeicImage, DecodeHeicError>`
 - `decode_primary_heic_to_metadata(input)` -> `Result<DecodedHeicImageMetadata, DecodeHeicError>`
@@ -263,13 +268,14 @@ any of these, each judged at the size the image has when it applies:
 - on 4:2:2, any 90° or 270° `irot`, a 180° `irot` of an odd height, or a
   left-right `imir` (axis 1) of an odd width.
 
-The HEVC decode paths do the same. Transforms before the conversion run on the
-subsampled planes in property order, as in libheif; for example, a 180°
+The HEVC and AVIF decode paths do the same. Transforms before the conversion
+run on the subsampled planes in property order, as in libheif; for example, a 180°
 `irot` of an odd-width 4:2:2 image rotates its half-width chroma planes without
 converting them. If the coded colour is limited range, the conversion then
 passes the image through RGB to full-range 4:4:4, as libheif does. The coded
-stream's colour drives that conversion; a `colr` nclx property replaces it only
-after all transforms. The same applies to primary items, to grids as a whole,
+stream's colour drives that conversion: the HEVC VUI, or the AV1 sequence
+header's `color_config`. A `colr` nclx property replaces it only after all
+transforms. The same applies to primary items, to grids as a whole,
 and to the clean apertures of individual grid tiles. A grid whose tile crops
 convert some tiles but not others is rejected with `DecodedLayoutMismatch`,
 because its tiles no longer share one chroma format; libheif rejects it too.
@@ -277,7 +283,9 @@ For primary items and whole grids, the 4:4:4 image is built a few rows at a
 time while converting to RGB, so it is never held at full size. A grid that
 needs the conversion, or a transform of its subsampled planes, is first
 assembled into one canvas, which stays in memory alongside the output, instead
-of being converted tile by tile. Image edges use clamped interpolation,
+of being converted tile by tile. An 8-bit AVIF item that needs the conversion
+has its planes widened to 16-bit samples first, which doubles the memory they
+take during the decode. Image edges use clamped interpolation,
 matching libheif after its 2026-10 border fix. The pinned libheif 1.21.2
 validator differs on output rows or columns that keep an edge of the converted
 image.
