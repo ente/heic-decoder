@@ -13,7 +13,19 @@ pictures = nals.select { |nal| [19, 20].include?(nal.getbyte(0) >> 1 & 63) }
 raise 'One IDR required' unless pictures.size == 1
 payload = pictures.map { |nal| [nal.bytesize].pack('N') + nal }.join
 sps = parameters[1].byteslice(2..).gsub(/\x00\x00\x03/n, "\x00\x00".b)
-hvcc = [1].pack('C') + sps.byteslice(1, 12) + [0xf0, 0, 0xfc, 0xfd, 0xf8, 0xf8, 0, 0, 0x0f, 3].pack('C*')
+raise 'SPS sub-layers are unsupported' unless (sps.getbyte(0) >> 1 & 7).zero?
+bits = sps.byteslice(13..).unpack1('B*')
+position = 0
+exp_golomb = lambda do
+  zeros = bits.index('1', position) - position
+  value = (1 << zeros) - 1 + bits[position + zeros + 1, zeros].to_i(2)
+  position += 2 * zeros + 1
+  value
+end
+exp_golomb.call
+chroma_format = exp_golomb.call
+raise 'Only 4:2:0 and 4:2:2 streams are supported' unless [1, 2].include?(chroma_format)
+hvcc = [1].pack('C') + sps.byteslice(1, 12) + [0xf0, 0, 0xfc, 0xfc | chroma_format, 0xf8, 0xf8, 0, 0, 0x0f, 3].pack('C*')
 parameters.each_with_index { |nal, i| hvcc += [0x80 + 32 + i, 1, nal.bytesize].pack('Cnn') + nal }
 def box(kind, data)
   [data.bytesize + 8].pack('N') + kind + data
@@ -48,17 +60,17 @@ if ENV['TILE_CROP']
   tile_crop = properties.length
 end
 extra = []
-if ENV['CROP']
-  w, h = ENV.fetch('CROP').split('x').map { |n| Integer(n) }
-  properties << box('clap', [w, 1, h, 1, 0, 1, 0, 1].pack('N*'))
-  extra << properties.length
-end
-if ENV['ROTATION']
-  properties << box('irot', [Integer(ENV.fetch('ROTATION'))].pack('C'))
-  extra << properties.length
-end
-if ENV['MIRROR']
-  properties << box('imir', [Integer(ENV.fetch('MIRROR'))].pack('C'))
+ENV.fetch('TRANSFORM_ORDER', 'CROP,ROTATION,MIRROR').split(',').each do |key|
+  next unless ENV[key]
+
+  properties << case key
+                when 'CROP'
+                  w, h = ENV.fetch('CROP').split('x').map { |n| Integer(n) }
+                  box('clap', [w, 1, h, 1, 0, 1, 0, 1].pack('N*'))
+                when 'ROTATION' then box('irot', [Integer(ENV.fetch('ROTATION'))].pack('C'))
+                when 'MIRROR' then box('imir', [Integer(ENV.fetch('MIRROR'))].pack('C'))
+                else raise "Unknown transform #{key}"
+                end
   extra << properties.length
 end
 items = (1..total).map do |id|

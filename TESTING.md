@@ -247,8 +247,11 @@ files exactly against `heif-dec`. Regenerate a corpus made before tiles were
 hidden: `heif-dec` writes visible tiles first, and `verify` would compare the
 primary decode against a tile. Cases whose grid tiles carry their own odd
 clean aperture are written to the `tile-crop` subdirectory. The incremental
-and bounded decoders refuse tile crops, so the incremental runner below only
-receives the top-level files, and default `verify` covers the subdirectory.
+and bounded decoders refuse tile crops. Cases that rotate or mirror odd-sized
+or 4:2:2 images are written to the `orientation` subdirectory, because the
+incremental and bounded decoders do not yet reproduce libheif's 4:4:4
+conversion for them. The incremental runner below only receives the top-level
+files, and default `verify` covers both subdirectories.
 
 ```bash
 cmake -S scripts/incremental -B .heic-test-runs/incremental-oracle \
@@ -301,6 +304,22 @@ reproduce both steps for primary items, grids, and grid tiles. Default
 `odd-tall`, `odd-pipeline`, `odd-width-grid`, `odd-height-grid`, and the
 three `tile-crop` cases.
 
+libheif's `irot` and `imir` run the same conversion for some odd-sized 4:2:0
+images and for most 4:2:2 rotations (see [API.md](API.md)). The `orientation`
+cases cover each rule against `heif-dec`. The 4:2:0 cases rotate or mirror an
+odd grid canvas and then apply a `clap` that removes one pixel from every edge,
+because the conversion keeps all four edges of the image and the pinned
+libheif's 4:2:0 border defect (below) would show on them. One case rotates the
+planes before a mirror converts them. The 4:2:2 cases keep their edges, because
+the pinned 4:2:2 kernel has no border defect, and include a 180° turn of an
+odd width that libheif runs on the subsampled planes without converting.
+`odd-height-grid-quarter-turn`, `odd-three-quarter-turn`, and
+`chroma422-odd-vertical-mirror` need no conversion and guard against
+converting too often. A 4:2:0 primary item reaches an odd size only through a
+`clap`, so its converting rotations keep the cropped edges and differ from the
+pinned validator there. Unit tests cover those; on such probes the decoder
+matched `heif-dec` exactly once the pinned border was modelled.
+
 The pinned libheif has a bilinear chroma-border indexing defect, fixed
 upstream by strukturag/libheif commit 215cbdad. The decoders implement the
 fixed border. Odd-grid regressions retain an interior aperture so they still
@@ -350,9 +369,11 @@ REFERENCE_YUV=reference.yuv target/release/incremental-check image.heic
 
 This verification tool is not part of the bounded path or its memory evidence.
 `capability-inspect` prints coded-item SPS/PPS features. `scripts/incremental/wrap.rb`
-packages a supplied one-IDR Annex-B 8-bit 4:2:0 stream into a direct HEIC or
-repeated-tile grid; its dimensions must match the stream. `CROP`, `ROTATION`
-and `MIRROR` environment variables add fixture transforms without re-encoding.
+packages a supplied one-IDR Annex-B 8-bit 4:2:0 or 4:2:2 stream into a direct
+HEIC or repeated-tile grid; its dimensions must match the stream. `CROP`,
+`ROTATION` and `MIRROR` environment variables add fixture transforms without
+re-encoding, in the order `TRANSFORM_ORDER` lists them (default
+`CROP,ROTATION,MIRROR`).
 `GRID=1` creates a single-tile grid, `CANVAS` clips its visible dimensions,
 `TILE_CROP` adds a centred clean aperture to every grid tile,
 `TILE_NCLX` and `PRIMARY_NCLX` set color metadata, and `REFERENCE_COUNT`
