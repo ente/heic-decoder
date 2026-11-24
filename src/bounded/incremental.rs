@@ -713,20 +713,17 @@ impl Conversion {
                 for column in 0..width {
                     let cy = (y + row) / 2;
                     let sy = start as usize + y + row;
-                    let neighbor_y = if sy.is_multiple_of(2) {
-                        (sy / 2)
-                            .saturating_sub(1)
-                            .max(geometry.crop[2] as usize / 2)
-                    } else {
-                        (sy / 2 + 1)
-                            .min(((geometry.crop[2] + geometry.height) as usize).div_ceil(2) - 1)
-                    };
+                    let neighbor_y = crate::chroma_upsampling::bilinear_chroma_neighbour(
+                        sy,
+                        geometry.crop[2] as usize / 2,
+                        ((geometry.crop[2] + geometry.height) as usize).div_ceil(2) - 1,
+                    );
                     let cx = (x + column) / 2;
-                    let neighbor_x = if column % 2 == 0 {
-                        cx.saturating_sub(1).max(x / 2)
-                    } else {
-                        (cx + 1).min((x + width).div_ceil(2) - 1)
-                    };
+                    let neighbor_x = crate::chroma_upsampling::bilinear_chroma_neighbour(
+                        x + column,
+                        x / 2,
+                        (x + width).div_ceil(2) - 1,
+                    );
                     let chroma = |plane: &[u16], component: usize| {
                         let stride = frame.c_stride();
                         let current = &plane[cy * stride..(cy + 1) * stride];
@@ -738,12 +735,12 @@ impl Conversion {
                             let local = neighbor_y - start as usize / 2;
                             &plane[local * stride..(local + 1) * stride]
                         };
-                        (9 * i32::from(current[cx])
-                            + 3 * i32::from(current[neighbor_x])
-                            + 3 * i32::from(neighbor[cx])
-                            + i32::from(neighbor[neighbor_x])
-                            + 8)
-                            / 16
+                        i32::from(crate::chroma_upsampling::bilinear_chroma_sample(
+                            current[cx],
+                            current[neighbor_x],
+                            neighbor[cx],
+                            neighbor[neighbor_x],
+                        ))
                     };
                     let (r, g, b) = converter.convert(
                         i32::from(frame.y_plane[(y + row) * frame.y_stride() + x + column]),
