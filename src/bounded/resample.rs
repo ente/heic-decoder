@@ -5,6 +5,8 @@ use super::grid::Grid;
 use super::memory::{Budget, Buffer};
 use super::{BoundedDecodeError as Error, Result};
 
+const PLACEMENT_BLOCK_ROWS: usize = 16;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Rectangle {
     pub(super) left: u32,
@@ -194,6 +196,38 @@ impl Layout {
             for (offset, pixel) in pixels.chunks_exact(3).enumerate() {
                 let start = self.pixel_index(x + offset as u32, y);
                 output[start..start + 3].copy_from_slice(pixel);
+            }
+        }
+    }
+
+    pub(super) fn place<'a>(
+        &self,
+        region: Region,
+        row: impl Fn(u32) -> &'a [u8],
+        output: &mut [u8],
+    ) {
+        let [a, b, c, d] = self.matrix.map(isize::from);
+        let width = self.display_width as isize;
+        let step_x = (c * width + a) * 3;
+        let step_y = (d * width + b) * 3;
+        let origin = self.pixel_index(0, 0) as isize;
+        let index = |x: u32, y: u32| (origin + x as isize * step_x + y as isize * step_y) as usize;
+        if step_x == 3 {
+            for y in region.top..region.bottom {
+                let pixels = row(y);
+                let start = index(region.left, y);
+                output[start..start + pixels.len()].copy_from_slice(pixels);
+            }
+            return;
+        }
+        for top in (region.top..region.bottom).step_by(PLACEMENT_BLOCK_ROWS) {
+            let bottom = (top + PLACEMENT_BLOCK_ROWS as u32).min(region.bottom);
+            for x in region.left..region.right {
+                let source = (x - region.left) as usize * 3;
+                for y in top..bottom {
+                    let start = index(x, y);
+                    output[start..start + 3].copy_from_slice(&row(y)[source..source + 3]);
+                }
             }
         }
     }

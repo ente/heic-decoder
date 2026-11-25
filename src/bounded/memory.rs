@@ -52,6 +52,7 @@ impl Budget {
         }
     }
 
+    #[cfg(any(feature = "parallel-grid", test))]
     pub(super) fn available(&self) -> usize {
         self.0.limit - self.0.used.load(Ordering::Relaxed)
     }
