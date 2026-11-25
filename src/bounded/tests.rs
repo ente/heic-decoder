@@ -1783,3 +1783,70 @@ fn grid_dimensions_are_limited_to_500_megapixels() {
         Err(BoundedDecodeError::Malformed("ispe differs from SPS"))
     ));
 }
+
+#[cfg(feature = "parallel-grid")]
+#[test]
+fn ordered_tile_decoding_refills_a_freed_slot_before_finishing_the_next_tile() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let events = std::cell::RefCell::new(Vec::new());
+    decode_in_order(
+        &pool,
+        5,
+        |tile| {
+            events.borrow_mut().push(("start", tile));
+            Ok(tile)
+        },
+        |tile| {
+            if tile == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(tile)
+        },
+        |tile| events.borrow_mut().push(("finish", tile)),
+    )
+    .unwrap();
+    assert_eq!(
+        events.into_inner(),
+        [
+            ("start", 0),
+            ("start", 1),
+            ("finish", 0),
+            ("start", 2),
+            ("finish", 1),
+            ("start", 3),
+            ("finish", 2),
+            ("start", 4),
+            ("finish", 3),
+            ("finish", 4),
+        ]
+    );
+}
+
+#[cfg(feature = "parallel-grid")]
+#[test]
+fn ordered_tile_decoding_propagates_tile_panics_alongside_tile_errors() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    for panicking in [0, 1] {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decode_in_order(
+                &pool,
+                2,
+                Ok,
+                |tile| {
+                    if tile == panicking {
+                        panic!("tile {tile}");
+                    }
+                    Err::<(), _>(BoundedDecodeError::Malformed("tile"))
+                },
+                |()| {},
+            )
+        }));
+        assert!(outcome.is_err(), "tile {panicking}");
+    }
+}

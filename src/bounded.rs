@@ -211,73 +211,58 @@ pub fn decode_bounded(
             (None, None)
         }
     };
-    let mut next = 0;
-    while next < grid.tiles.len() {
-        let mut jobs = Vec::with_capacity(8);
-        #[cfg(feature = "parallel-grid")]
-        let workers = pool
-            .as_ref()
-            .map_or(1, rayon::ThreadPool::current_num_threads);
-        #[cfg(not(feature = "parallel-grid"))]
-        let workers = 1;
-        while next < grid.tiles.len() && jobs.len() < workers {
-            let tile = &grid.tiles[next];
-            let tile_x = (next as u32 % grid.columns) * first.geometry.width;
-            let tile_y = (next as u32 / grid.columns) * first.geometry.height;
-            let region = layout.region(tile_x, tile_y, tile.geometry.width, tile.geometry.height);
-            let bytes = job_bytes(tile, region, layout);
-            if bytes > budget.available() && !jobs.is_empty() {
-                break;
+    let start = |next: usize| -> Result<Job<'_, '_>> {
+        let tile = &grid.tiles[next];
+        let tile_x = (next as u32 % grid.columns) * first.geometry.width;
+        let tile_y = (next as u32 / grid.columns) * first.geometry.height;
+        let region = layout.region(tile_x, tile_y, tile.geometry.width, tile.geometry.height);
+        let reservation = budget.reserve(job_bytes(tile, region, layout), "tile workspace")?;
+        let mut payload = resample::zeroed(tile.payload_len)?;
+        index.read_item(tile.item, &mut source, &mut payload)?;
+        Ok(Job {
+            index: next,
+            tile,
+            tile_x,
+            tile_y,
+            region,
+            payload,
+            reservation,
+        })
+    };
+    let run = |job| run_job(job, layout, &color, &transform);
+    let finish = |result: TileResult| {
+        match &result.data {
+            TileData::Pixels(pixels) => {
+                let tile_width = first.geometry.width as usize;
+                let left = (result.region.left + layout.left - result.tile_x) as usize;
+                let width = (result.region.right - result.region.left) as usize;
+                layout.place(
+                    result.region,
+                    |y| {
+                        let row_start =
+                            ((y + layout.top - result.tile_y) as usize * tile_width + left) * 3;
+                        &pixels[row_start..row_start + width * 3]
+                    },
+                    &mut output,
+                );
             }
-            let reservation = budget.reserve(bytes, "tile workspace")?;
-            let mut payload = resample::zeroed(tile.payload_len)?;
-            index.read_item(tile.item, &mut source, &mut payload)?;
-            jobs.push(Job {
-                index: next,
-                tile,
-                tile_x,
-                tile_y,
-                region,
-                payload,
-                reservation,
-            });
-            next += 1;
+            TileData::Sums(sums) if !sums.is_empty() => {
+                accumulator.merge(result.region, sums, &mut output)
+            }
+            TileData::Sums(_) => {}
         }
-        let run = |job| run_job(job, layout, &color, &transform);
-        #[cfg(feature = "parallel-grid")]
-        let results: Vec<_> = if let Some(pool) = &pool {
-            use rayon::prelude::*;
-            pool.install(|| jobs.into_par_iter().map(run).collect())
-        } else {
-            jobs.into_iter().map(run).collect()
-        };
-        #[cfg(not(feature = "parallel-grid"))]
-        let results: Vec<_> = jobs.into_iter().map(run).collect();
-        for result in results {
-            let result = result?;
-            match &result.data {
-                TileData::Pixels(pixels) => {
-                    for y in result.region.top..result.region.bottom {
-                        for x in result.region.left..result.region.right {
-                            let src = ((y + layout.top - result.tile_y) as usize
-                                * first.geometry.width as usize
-                                + (x + layout.left - result.tile_x) as usize)
-                                * 3;
-                            let dst = layout.pixel_index(x, y);
-                            output[dst..dst + 3].copy_from_slice(&pixels[src..src + 3]);
-                        }
-                    }
-                }
-                TileData::Sums(sums) if !sums.is_empty() => {
-                    accumulator.merge(result.region, sums, &mut output)
-                }
-                TileData::Sums(_) => {}
-            }
-            if (result.index + 1) % grid.columns as usize == 0 {
-                accumulator.finish_tile_row();
-            }
+        if (result.index + 1).is_multiple_of(grid.columns as usize) {
+            accumulator.finish_tile_row();
         }
+    };
+    #[cfg(feature = "parallel-grid")]
+    if let Some(pool) = &pool {
+        decode_in_order(pool, grid.tiles.len(), start, run, finish)?;
+    } else {
+        decode_sequentially(grid.tiles.len(), start, run, finish)?;
     }
+    #[cfg(not(feature = "parallel-grid"))]
+    decode_sequentially(grid.tiles.len(), start, run, finish)?;
     Ok(BoundedRgbImage {
         image: DecodedRgbImage {
             width: layout.display_width,
@@ -287,6 +272,58 @@ pub fn decode_bounded(
             icc_profile: None,
         },
         original_dimensions: layout.original_dimensions,
+    })
+}
+
+fn decode_sequentially<J, R>(
+    count: usize,
+    mut start: impl FnMut(usize) -> Result<J>,
+    run: impl Fn(J) -> Result<R>,
+    mut finish: impl FnMut(R),
+) -> Result<()> {
+    for next in 0..count {
+        finish(run(start(next)?)?);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parallel-grid")]
+fn decode_in_order<J: Send, R: Send>(
+    pool: &rayon::ThreadPool,
+    count: usize,
+    mut start: impl FnMut(usize) -> Result<J>,
+    run: impl Fn(J) -> Result<R> + Sync,
+    mut finish: impl FnMut(R),
+) -> Result<()> {
+    use std::collections::VecDeque;
+    use std::sync::mpsc::{Receiver, channel};
+
+    let workers = pool.current_num_threads();
+    let wait = |receiver: Receiver<Result<R>>| {
+        receiver
+            .recv()
+            .unwrap_or_else(|_| Err(BoundedDecodeError::Decode("tile worker panicked".into())))
+    };
+    pool.in_place_scope_fifo(|scope| {
+        let mut pending = VecDeque::with_capacity(workers);
+        for next in 0..count {
+            if pending.len() == workers
+                && let Some(receiver) = pending.pop_front()
+            {
+                finish(wait(receiver)?);
+            }
+            let job = start(next)?;
+            let (sender, receiver) = channel();
+            let run = &run;
+            scope.spawn_fifo(move |_| {
+                let _ = sender.send(run(job));
+            });
+            pending.push_back(receiver);
+        }
+        for receiver in pending {
+            finish(wait(receiver)?);
+        }
+        Ok(())
     })
 }
 
