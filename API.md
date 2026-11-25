@@ -470,23 +470,26 @@ The primary item may be a grid of uniform HEVC tiles or a single HEVC image
 (`hvc1`/`hev1`). Every coded item must be opaque 8-bit 4:2:0 HEVC with one IDR
 slice; WPP is supported. A single image is decoded as a grid with one tile.
 `clap`/`irot`/`imir` are applied, and Exif orientation applies when no
-effective container orientation is present. Container transforms for which
-libheif first converts 4:2:0 chroma to 4:4:4 return `Unsupported`. Each is
-judged at the size the image has when it applies: a `clap` with an odd left or
-top edge, an anticlockwise 90° rotation (`irot` 1) of an odd width, a 180°
-rotation with either side odd, an anticlockwise 270° rotation (`irot` 3) of an
-odd height, or a mirror with either side odd. A display area that starts on an
-odd source row or column is also refused, which is stricter than libheif when
-a rotation or mirror comes before the crop. RGB matrix/TRC ICC profiles and
-SDR nclx colour with BT.709, BT.2020 or Display P3 primaries are converted to
-sRGB. HDR transfer functions, grayscale or
-lookup-table ICC profiles, unprofiled wide-gamut HEVC colour, alpha, and
-unknown required auxiliaries return errors. Known depth, semantic matte, and
+effective container orientation is present. When a container transform makes
+libheif convert 4:2:0 chroma to 4:4:4 (the 4:2:0 rules under Container
+transforms above), the output matches the regular decoders: bilinear chroma
+with clamped edges, the limited-range round trip through RGB, and the `colr`
+nclx override after all transforms. The 4:4:4 samples are built a band of rows
+at a time while each tile is converted to RGB, so no full-size 4:4:4 image is
+held. Grid tiles are then converted in units shifted one pixel up and left, so
+each unit needs only the last chroma row and column of tiles decoded before
+it; those edges are kept in strips as wide as the canvas. Clean apertures,
+rotations and mirrors on individual grid tiles are refused. RGB matrix/TRC ICC
+profiles and SDR nclx colour with BT.709, BT.2020 or Display P3 primaries are
+converted to sRGB. HDR transfer functions, grayscale or lookup-table ICC
+profiles, unprofiled wide-gamut HEVC colour, alpha, and unknown required
+auxiliaries return errors. Known depth, semantic matte, and
 gain-map auxiliaries are ignored.
 
 Before any pixel decoding, preflight reads every coded item's headers and
 reserves its reconstruction workspace, and admission then reserves the output
-together with the largest tile workspace. Inputs that do not fit return
+together with the largest tile workspace, which includes the 4:4:4 band
+buffers when the conversion applies. Inputs that do not fit return
 `MemoryBudgetExceeded` or `LimitExceeded` without decoding pixels. Grid tiles
 decode one at a time, or concurrently with `parallel-grid` when the budget
 allows. A single image's full-resolution reconstruction must fit the budget at
@@ -525,9 +528,9 @@ payloads. Use Path input when avoiding a caller-owned compressed input buffer
 is also important.
 
 This first subset retains limits of 16384 per coded side, 256 million display
-pixels, bounded metadata, and a 64 KiB slice-header prefix. It supports one
-clean-aperture crop before orientation, with chroma interpolation for odd
-origins on a single coded image or one-tile grid. Odd-origin crops across
-multiple grid items and repeated crops or crops after orientation are
-unsupported. Exif orientation applies when no effective container orientation
-is present. `decoder-tracing` disables bounded decoding.
+pixels, bounded metadata, and a 64 KiB slice-header prefix. It applies
+`clap`/`irot`/`imir` in property order and converts to 4:4:4 like
+`decode_bounded` on a single coded image or a one-tile grid. Grids of several
+coded items that need the 4:4:4 conversion return `Unsupported`. Exif
+orientation applies when no effective container orientation is present.
+`decoder-tracing` disables bounded decoding.

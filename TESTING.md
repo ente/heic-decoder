@@ -195,11 +195,15 @@ These files are kept out of `incremental-corpus` because `verify.rb` requires
 every file there to decode with the incremental experiment. The script refuses
 an output folder that overlaps the incremental corpus, or that is not empty
 and lacks the `.generate-bounded` marker it writes, and it only replaces the
-`pass-*` and `refuse-*` files in its own folder. `refuse-*` files use rotations, mirrors or
-grid canvases for which libheif converts to 4:4:4, so `decode_bounded` must
-refuse them; if one decodes, the pixel comparison fails. `pass-*` files are
-the matching controls and the Display P3 and BT.2020 nclx cases. CI passes
-every `pass-*` file, `IMG_0983.HEIC` and `1718_rotate_90_cw.HEIC` with
+`pass-*` files in its own folder, deleting any `refuse-*` files left by older
+versions. The files cover odd crops with rotations that keep 4:2:0 chroma, the
+Display P3 and BT.2020 nclx cases, and transforms for which libheif converts
+to 4:4:4: odd-origin crops and odd-sized rotations and mirrors, on one tile and
+on 2×2 and 3×2 grids whose seams fall inside the converted area. Rotations and
+mirrors that convert are followed by a crop that trims one pixel from every
+side, because the pinned libheif 1.21.2 interpolates the converted image's
+edge rows and columns differently from the fixed kernel the decoders use. CI
+passes every `pass-*` file, `IMG_0983.HEIC` and `1718_rotate_90_cw.HEIC` with
 `--require-pass`, which fails the run unless that file passes at both sizes.
 
 Every HEIC, HEIF and AVIF file under the given paths is decoded at max side
@@ -250,12 +254,13 @@ hidden: `heif-dec` writes visible tiles first, and `verify` would compare the
 primary decode against a tile. Cases whose grid tiles carry their own odd
 clean aperture are written to the `tile-crop` subdirectory. The incremental
 and bounded decoders refuse tile crops. Cases that rotate or mirror odd-sized
-or 4:2:2 images are written to the `orientation` subdirectory, because the
-incremental and bounded decoders do not yet reproduce libheif's 4:4:4
-conversion for them. AVIF cases are written to the `avif` subdirectory; the
-incremental and bounded decoders only decode HEVC. The incremental runner below
-only receives the top-level files, and default `verify` covers all three
-subdirectories.
+or 4:2:2 images are written to the `orientation` subdirectory. The bounded
+decoder reproduces libheif's 4:4:4 conversion for the 4:2:0 cases there and
+refuses the 4:2:2 ones, which its HEVC decoder does not support. AVIF cases are
+written to the `avif` subdirectory; the incremental and bounded decoders only
+decode HEVC, so the bounded comparison records them as refusals. The
+incremental runner below only receives the top-level files, and default
+`verify` and the bounded comparison cover all three subdirectories.
 
 ```bash
 cmake -S scripts/incremental -B .heic-test-runs/incremental-oracle \

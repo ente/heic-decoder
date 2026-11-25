@@ -3,10 +3,11 @@ use std::io::{BufReader, Read};
 use crate::heic_decoder::hevc::DecodedFrame;
 use crate::heic_decoder::hevc::bounded::{Geometry, Prepared};
 
+use super::chroma::{Samples, Yuv444};
 use super::container::{Index, Reader, Source};
 use super::grid::{Grid, Properties, Tile};
 use super::memory::Budget;
-use super::resample::{Accumulator, Layout, Region, zeroed};
+use super::resample::{Accumulator, Layout, Rectangle, Region, zeroed};
 use super::{
     BoundedDecodeError as Error, BoundedDecodeOptions, BoundedInput, BoundedRgbImage, Result,
     codec, color,
@@ -264,30 +265,6 @@ pub fn decode(
     let index = Index::parse(&metadata, source.len(), &budget)?;
     let grid = plan(&index, &mut source, &budget)?;
     let layout = Layout::new(&grid, options.max_side)?;
-    for (i, transform) in grid.properties.transforms.iter().flatten().enumerate() {
-        if i > 0
-            && matches!(
-                transform,
-                crate::isobmff::PrimaryItemTransformProperty::CleanAperture(_)
-            )
-        {
-            return Err(Error::Unsupported(
-                "repeated crop or crop after orientation",
-            ));
-        }
-    }
-    let bilinear = layout.left % 2 != 0 || layout.top % 2 != 0;
-    if bilinear && grid.tiles.len() != 1 {
-        return Err(Error::Unsupported("odd grid crop chroma interpolation"));
-    }
-    let _chroma_workspace = if bilinear {
-        Some(budget.reserve(
-            grid.tiles[0].geometry.coded_width as usize * 4 * 65,
-            "chroma interpolation band",
-        )?)
-    } else {
-        None
-    };
     let mut color = grid.tiles[0].color.clone();
     if grid
         .properties
@@ -301,6 +278,19 @@ pub fn decode(
     if grid.properties.color.icc.is_some() {
         color.icc = grid.properties.color.icc;
     }
+    let yuv444 = Yuv444::new(&grid, &color)?;
+    if yuv444.is_some() && grid.tiles.len() != 1 {
+        return Err(Error::Unsupported("grid 4:4:4 chroma conversion"));
+    }
+    let _chroma_workspace = if yuv444.is_some() {
+        Some(budget.reserve(
+            grid.tiles[0].geometry.coded_width as usize * 4 * 65
+                + Yuv444::workspace_bytes(layout.width),
+            "chroma interpolation band",
+        )?)
+    } else {
+        None
+    };
     let transform = color::ColorTransform::new(
         &color,
         grid.tiles[0].geometry.primaries,
@@ -335,7 +325,7 @@ pub fn decode(
             zeroes: 0,
         };
         let mut conversion = Conversion::default();
-        let mut bands = ChromaBands::new(if bilinear {
+        let mut bands = ChromaBands::new(if yuv444.is_some() {
             Some(prepared.output_band()?)
         } else {
             None
@@ -353,28 +343,50 @@ pub fn decode(
                 if first >= last {
                     return Ok(());
                 }
-                let pixels = conversion.convert(
-                    frame,
-                    g,
-                    ConversionRegion {
-                        start,
-                        y: first - start,
-                        height: last - first,
-                        halo,
-                    },
-                    &color,
-                    &transform,
-                )?;
-                for row in 0..last - first {
-                    let y = ty + first - g.crop[2] + row;
+                let band = Rectangle {
+                    left: tx,
+                    top: ty + first - g.crop[2],
+                    width: g.width,
+                    height: last - first,
+                };
+                let (area, pixels) = match (&yuv444, halo) {
+                    (Some(yuv444), Some(halo)) => {
+                        let area = band.intersection(layout.source());
+                        if area.is_empty() {
+                            return Ok(());
+                        }
+                        let samples = BandSamples {
+                            frame,
+                            start,
+                            crop: [g.crop[0], g.crop[2]],
+                            halo,
+                        };
+                        let pixels =
+                            conversion.convert_yuv444(yuv444, &samples, area, &transform)?;
+                        (area, pixels)
+                    }
+                    _ => {
+                        let pixels = conversion.convert(
+                            frame,
+                            g,
+                            ConversionRegion {
+                                y: first - start,
+                                height: last - first,
+                            },
+                            &color,
+                            &transform,
+                        )?;
+                        (band, pixels)
+                    }
+                };
+                for (y, row) in (area.top..).zip(pixels.chunks_exact(area.width as usize * 3)) {
                     if y < layout.top + region.top || y >= layout.top + region.bottom {
                         continue;
                     }
-                    let offset = row as usize * g.width as usize * 3;
                     rows.add(
                         y - layout.top,
-                        tx,
-                        &pixels[offset..offset + g.width as usize * 3],
+                        area.left,
+                        row,
                         &mut accumulator,
                         &mut output,
                     );
@@ -588,11 +600,44 @@ struct ChromaHalo<'a> {
     after: [&'a [u16]; 2],
 }
 
-struct ConversionRegion<'a> {
-    start: u32,
+struct ConversionRegion {
     y: u32,
     height: u32,
-    halo: Option<ChromaHalo<'a>>,
+}
+
+struct BandSamples<'a> {
+    frame: &'a DecodedFrame,
+    start: u32,
+    crop: [u32; 2],
+    halo: ChromaHalo<'a>,
+}
+
+impl Samples for BandSamples<'_> {
+    fn luma(&self, x: u32, y: u32, out: &mut [u16]) {
+        let start = (y + self.crop[1] - self.start) as usize * self.frame.y_stride()
+            + (x + self.crop[0]) as usize;
+        out.copy_from_slice(&self.frame.y_plane[start..start + out.len()]);
+    }
+
+    fn chroma(&self, plane: usize, x: u32, y: u32, out: &mut [u16]) {
+        let y = y + self.crop[1] / 2;
+        let first = self.start / 2;
+        let stride = self.frame.c_stride();
+        let row = if y < first {
+            self.halo.before[plane]
+        } else if y >= (self.start + self.frame.height) / 2 {
+            self.halo.after[plane]
+        } else {
+            let samples = if plane == 0 {
+                &self.frame.cb_plane
+            } else {
+                &self.frame.cr_plane
+            };
+            &samples[(y - first) as usize * stride..][..stride]
+        };
+        let x = (x + self.crop[0] / 2) as usize;
+        out.copy_from_slice(&row[x..x + out.len()]);
+    }
 }
 
 struct ChromaBands {
@@ -666,20 +711,31 @@ impl ChromaBands {
 }
 
 impl Conversion {
+    fn convert_yuv444(
+        &mut self,
+        yuv444: &Yuv444,
+        samples: &BandSamples<'_>,
+        area: Rectangle,
+        transform: &color::ColorTransform,
+    ) -> Result<&[u8]> {
+        let len = area.width as usize * area.height as usize * 3;
+        self.rgb
+            .try_reserve_exact(len.saturating_sub(self.rgb.len()))
+            .map_err(|_| Error::AllocationFailed)?;
+        self.rgb.resize(len, 0);
+        yuv444.convert(samples, area, &mut self.rgb)?;
+        self.finish(transform)
+    }
+
     fn convert(
         &mut self,
         frame: &DecodedFrame,
         geometry: Geometry,
-        region: ConversionRegion<'_>,
+        region: ConversionRegion,
         color: &super::grid::Color<'_>,
         transform: &color::ColorTransform,
     ) -> Result<&[u8]> {
-        let ConversionRegion {
-            start,
-            y,
-            height,
-            halo,
-        } = region;
+        let ConversionRegion { y, height } = region;
         let colr = crate::isobmff::PrimaryItemColorProperties {
             nclx: color.nclx.clone(),
             icc: None,
@@ -708,51 +764,7 @@ impl Conversion {
             .try_reserve_exact(len.saturating_sub(self.rgb.len()))
             .map_err(|_| Error::AllocationFailed)?;
         self.rgb.resize(len, 0);
-        if let Some(halo) = halo {
-            for row in 0..height {
-                for column in 0..width {
-                    let cy = (y + row) / 2;
-                    let sy = start as usize + y + row;
-                    let neighbor_y = crate::chroma_upsampling::bilinear_chroma_neighbour(
-                        sy,
-                        geometry.crop[2] as usize / 2,
-                        ((geometry.crop[2] + geometry.height) as usize).div_ceil(2) - 1,
-                    );
-                    let cx = (x + column) / 2;
-                    let neighbor_x = crate::chroma_upsampling::bilinear_chroma_neighbour(
-                        x + column,
-                        x / 2,
-                        (x + width).div_ceil(2) - 1,
-                    );
-                    let chroma = |plane: &[u16], component: usize| {
-                        let stride = frame.c_stride();
-                        let current = &plane[cy * stride..(cy + 1) * stride];
-                        let neighbor = if neighbor_y < start as usize / 2 {
-                            halo.before[component]
-                        } else if neighbor_y >= (start as usize + frame.height as usize) / 2 {
-                            halo.after[component]
-                        } else {
-                            let local = neighbor_y - start as usize / 2;
-                            &plane[local * stride..(local + 1) * stride]
-                        };
-                        i32::from(crate::chroma_upsampling::bilinear_chroma_sample(
-                            current[cx],
-                            current[neighbor_x],
-                            neighbor[cx],
-                            neighbor[neighbor_x],
-                        ))
-                    };
-                    let (r, g, b) = converter.convert(
-                        i32::from(frame.y_plane[(y + row) * frame.y_stride() + x + column]),
-                        chroma(&frame.cb_plane, 0),
-                        chroma(&frame.cr_plane, 1),
-                    );
-                    self.rgb[(row * width + column) * 3..(row * width + column) * 3 + 3]
-                        .copy_from_slice(&[r as u8, g as u8, b as u8]);
-                }
-            }
-        } else if let crate::PreparedYcbcrTransform::MatrixFull { coeffs, .. } = converter.transform
-        {
+        if let crate::PreparedYcbcrTransform::MatrixFull { coeffs, .. } = converter.transform {
             crate::heic_decoder::hevc::color_convert::convert_420_8bit_region_to_interleaved(
                 &frame.y_plane,
                 &frame.cb_plane,
@@ -791,9 +803,14 @@ impl Conversion {
                 }
             }
         }
+        self.finish(transform)
+    }
+
+    fn finish(&mut self, transform: &color::ColorTransform) -> Result<&[u8]> {
         if transform.is_identity() {
             return Ok(&self.rgb);
         }
+        let len = self.rgb.len();
         self.converted
             .try_reserve_exact(len.saturating_sub(self.converted.len()))
             .map_err(|_| Error::AllocationFailed)?;
