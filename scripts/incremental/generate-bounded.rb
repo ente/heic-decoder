@@ -25,20 +25,35 @@ cases = {
   'pass-odd-canvas-grid-rotate-270' => { 'GRID' => '1', 'CANVAS' => '255x256', 'ROTATION' => '3' },
   'pass-nclx-display-p3' => { 'TILE_NCLX' => '12/13/6/0' },
   'pass-nclx-bt2020' => { 'TILE_NCLX' => '9/1/9/0' },
-  'refuse-odd-width-crop-rotate-90' => { 'CROP' => '131x192', 'ROTATION' => '1' },
-  'refuse-odd-width-crop-rotate-180' => { 'CROP' => '131x192', 'ROTATION' => '2' },
-  'refuse-odd-height-crop-rotate-180' => { 'CROP' => '192x129', 'ROTATION' => '2' },
-  'refuse-odd-height-crop-rotate-270' => { 'CROP' => '192x129', 'ROTATION' => '3' },
-  'refuse-odd-width-crop-mirror-vertical-axis' => { 'CROP' => '131x192', 'MIRROR' => '0' },
-  'refuse-odd-width-crop-mirror-horizontal-axis' => { 'CROP' => '131x192', 'MIRROR' => '1' },
-  'refuse-odd-canvas-grid-rotate-180' => { 'GRID' => '1', 'CANVAS' => '255x256', 'ROTATION' => '2' }
+  'pass-odd-origin-crop' => { 'CROP' => '130x190' },
+  'pass-odd-origin-crop-rotate-90-mirror' => { 'CROP' => '130x190', 'ROTATION' => '1', 'MIRROR' => '1' },
+  'pass-odd-canvas-grid-rotate-90-trimmed' => {
+    'GRID' => '1', 'CANVAS' => '255x256', 'ROTATION' => '1', 'CROP' => '254x253', 'TRANSFORM_ORDER' => 'ROTATION,CROP'
+  },
+  'pass-odd-canvas-grid-rotate-180-trimmed' => {
+    'GRID' => '1', 'CANVAS' => '255x256', 'ROTATION' => '2', 'CROP' => '253x254', 'TRANSFORM_ORDER' => 'ROTATION,CROP'
+  },
+  'pass-odd-canvas-grid-mirror-trimmed' => {
+    'GRID' => '1', 'CANVAS' => '256x255', 'MIRROR' => '0', 'CROP' => '254x253', 'TRANSFORM_ORDER' => 'MIRROR,CROP'
+  },
+  'pass-tiled-odd-origin-crop' => { 'TILES' => '2x2', 'CROP' => '510x510' },
+  'pass-tiled-rotate-90-odd-origin-crop' => {
+    'TILES' => '2x2', 'ROTATION' => '1', 'CROP' => '510x508', 'TRANSFORM_ORDER' => 'ROTATION,CROP'
+  },
+  'pass-tiled-odd-canvas-rotate-90-trimmed' => {
+    'TILES' => '2x2', 'CANVAS' => '511x512', 'ROTATION' => '1', 'CROP' => '510x509', 'TRANSFORM_ORDER' => 'ROTATION,CROP'
+  },
+  'pass-tiled-odd-canvas-mirror-trimmed' => {
+    'TILES' => '3x2', 'CANVAS' => '767x511', 'MIRROR' => '1', 'CROP' => '765x509', 'TRANSFORM_ORDER' => 'MIRROR,CROP'
+  }
 }
-keys = %w[GRID CANVAS CROP ROTATION MIRROR TILE_NCLX PRIMARY_NCLX REFERENCE_COUNT]
+keys = %w[GRID CANVAS CROP ROTATION MIRROR TRANSFORM_ORDER TILE_NCLX PRIMARY_NCLX REFERENCE_COUNT]
 cases.each do |name, options|
   path = File.join(output, "#{name}.heic")
-  environment = keys.to_h { |key| [key, nil] }.merge(options)
+  columns, rows = options.fetch('TILES', '1x1').split('x')
+  environment = keys.to_h { |key| [key, nil] }.merge(options.except('TILES'))
   _, stderr, status = Open3.capture3(environment, RbConfig.ruby, File.join(__dir__, 'wrap.rb'), source, path,
-                                     '256', '256', '1', '1')
+                                     '256', '256', columns, rows)
   abort "wrap.rb failed for #{name}:\n#{stderr}" unless status.success?
   puts "Generated #{path}"
 end
