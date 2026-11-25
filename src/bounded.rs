@@ -1,3 +1,4 @@
+mod chroma;
 mod codec;
 mod color;
 mod container;
@@ -13,6 +14,8 @@ use std::fmt::{Display, Formatter};
 use std::path::Path;
 
 use crate::DecodedRgbImage;
+use crate::heic_decoder::hevc::DecodedFrame;
+use resample::Rectangle;
 
 #[derive(Clone, Copy, Debug)]
 pub enum BoundedInput<'a> {
@@ -131,11 +134,6 @@ pub fn decode_bounded(
     let index = container::Index::parse(&metadata, source.len(), &budget)?;
     let grid = grid::Grid::preflight(&index, &mut source, &budget)?;
     let layout = resample::Layout::new(&grid, options.max_side)?;
-    if layout.left % 2 != 0 || layout.top % 2 != 0 || !grid.transforms_keep_subsampled_chroma()? {
-        return Err(BoundedDecodeError::Unsupported(
-            "transform that needs 4:4:4 chroma",
-        ));
-    }
     let first = &grid.tiles[0];
     let mut color = first.color.clone();
     if grid
@@ -150,6 +148,7 @@ pub fn decode_bounded(
     if grid.properties.color.icc.is_some() {
         color.icc = grid.properties.color.icc;
     }
+    let yuv444 = chroma::Yuv444::new(&grid, &color)?;
     let transform = color::ColorTransform::new(
         &color,
         first.geometry.primaries,
@@ -157,20 +156,19 @@ pub fn decode_bounded(
         &budget,
     )?;
     let mut accumulator = resample::Accumulator::new(layout, &budget)?;
+    let mut edges = if yuv444.is_some() && grid.tiles.len() > 1 {
+        Some(chroma::Edges::new(&grid, &budget)?)
+    } else {
+        None
+    };
     let output_len = layout.display_width as usize * layout.display_height as usize * 3;
-    let max_job = grid
-        .tiles
-        .iter()
-        .enumerate()
-        .map(|(i, tile)| {
-            let region = layout.region(
-                (i as u32 % grid.columns) * first.geometry.width,
-                (i as u32 / grid.columns) * first.geometry.height,
-                tile.geometry.width,
-                tile.geometry.height,
-            );
-            job_bytes(tile, region, layout)
-        })
+    let plan = Plan {
+        grid: &grid,
+        layout,
+        converts: yuv444.is_some(),
+    };
+    let max_job = (0..grid.tiles.len())
+        .map(|i| plan.job_bytes(i))
         .max()
         .unwrap();
     {
@@ -184,63 +182,37 @@ pub fn decode_bounded(
         )?;
     }
     let mut output = budget.zeroed(output_len, "RGB output")?;
-    #[cfg(feature = "parallel-grid")]
-    let (pool, _pool_reservation) = {
-        let threads = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(8)
-            .min(grid.tiles.len());
-        let mut workers = threads;
-        while workers > 1
-            && max_job
-                .saturating_mul(workers)
-                .saturating_add(pool_bytes(workers))
-                > budget.available()
-        {
-            workers -= 1;
-        }
-        if workers > 1 {
-            let reservation = budget.reserve(pool_bytes(workers), "worker pool")?;
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(workers)
-                .stack_size(WORKER_STACK_BYTES)
-                .build()
-                .map_err(|_| BoundedDecodeError::AllocationFailed)?;
-            (Some(pool), Some(reservation))
-        } else {
-            (None, None)
-        }
-    };
-    let start = |next: usize| -> Result<Job<'_, '_>> {
+    let workers = Workers::new(grid.tiles.len(), max_job, &budget)?;
+    let mut start = |next: usize| -> Result<Job<'_, '_>> {
         let tile = &grid.tiles[next];
-        let tile_x = (next as u32 % grid.columns) * first.geometry.width;
-        let tile_y = (next as u32 / grid.columns) * first.geometry.height;
-        let region = layout.region(tile_x, tile_y, tile.geometry.width, tile.geometry.height);
-        let reservation = budget.reserve(job_bytes(tile, region, layout), "tile workspace")?;
+        let reservation = budget.reserve(plan.job_bytes(next), "tile workspace")?;
         let mut payload = resample::zeroed(tile.payload_len)?;
         index.read_item(tile.item, &mut source, &mut payload)?;
+        let (unit, region) = plan.unit(next);
+        let tile_area = plan.tile(next);
         Ok(Job {
             index: next,
             tile,
-            tile_x,
-            tile_y,
+            origin: [tile_area.left, tile_area.top],
+            unit,
             region,
+            decode: plan.decodes(next),
             payload,
             reservation,
         })
     };
-    let run = |job| run_job(job, layout, &color, &transform);
-    let finish = |result: TileResult| {
+    let render = |job| render_job(job, layout, &color, &transform, yuv444.as_ref());
+    let mut finish = |result: TileResult| {
         match &result.data {
             TileData::Pixels(pixels) => {
-                let tile_width = first.geometry.width as usize;
-                let left = (result.region.left + layout.left - result.tile_x) as usize;
+                let unit_width = result.unit.width as usize;
+                let left = (result.region.left + layout.left - result.unit.left) as usize;
                 let width = (result.region.right - result.region.left) as usize;
                 layout.place(
                     result.region,
                     |y| {
                         let row_start =
-                            ((y + layout.top - result.tile_y) as usize * tile_width + left) * 3;
+                            ((y + layout.top - result.unit.top) as usize * unit_width + left) * 3;
                         &pixels[row_start..row_start + width * 3]
                     },
                     &mut output,
@@ -255,14 +227,31 @@ pub fn decode_bounded(
             accumulator.finish_tile_row();
         }
     };
-    #[cfg(feature = "parallel-grid")]
-    if let Some(pool) = &pool {
-        decode_in_order(pool, grid.tiles.len(), start, run, finish)?;
+    if let Some(edges) = &mut edges {
+        let mut next = 0;
+        while next < grid.tiles.len() {
+            let end = grid.tiles.len().min(next + workers.count());
+            let jobs = (next..end).map(&mut start).collect::<Result<Vec<_>>>()?;
+            next = end;
+            let mut decoded = workers
+                .map(jobs, decode_job)
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            for job in &mut decoded {
+                job.halo = edges.advance(job.index, job.frame.as_ref(), job.tile.geometry)?;
+            }
+            for result in workers.map(decoded, render) {
+                finish(result?);
+            }
+        }
     } else {
-        decode_sequentially(grid.tiles.len(), start, run, finish)?;
+        workers.decode_in_order(
+            grid.tiles.len(),
+            start,
+            |job| decode_job(job).and_then(render),
+            finish,
+        )?;
     }
-    #[cfg(not(feature = "parallel-grid"))]
-    decode_sequentially(grid.tiles.len(), start, run, finish)?;
     Ok(BoundedRgbImage {
         image: DecodedRgbImage {
             width: layout.display_width,
@@ -327,23 +316,153 @@ fn decode_in_order<J: Send, R: Send>(
     })
 }
 
-fn job_bytes(tile: &grid::Tile<'_>, region: resample::Region, layout: resample::Layout) -> usize {
-    let contributions = if layout.is_unscaled() {
-        0
-    } else {
-        resample::Contribution::workspace_bytes(region)
-    };
-    tile.workspace_bytes
-        .saturating_add(tile.payload_len)
-        .saturating_add(contributions)
+struct Plan<'a, 'b> {
+    grid: &'b grid::Grid<'a>,
+    layout: resample::Layout,
+    converts: bool,
 }
 
-fn render_tile(
-    tile: &grid::Tile<'_>,
-    payload: &[u8],
-    color: &grid::Color<'_>,
-    transform: &color::ColorTransform,
-) -> Result<Vec<u8>> {
+impl Plan<'_, '_> {
+    fn tile(&self, index: usize) -> Rectangle {
+        let first = self.grid.tiles[0].geometry;
+        let tile = self.grid.tiles[index].geometry;
+        Rectangle {
+            left: (index as u32 % self.grid.columns) * first.width,
+            top: (index as u32 / self.grid.columns) * first.height,
+            width: tile.width,
+            height: tile.height,
+        }
+    }
+
+    fn unit(&self, index: usize) -> (Rectangle, resample::Region) {
+        let tile = self.tile(index);
+        let unit = if self.converts {
+            let column = index as u32 % self.grid.columns;
+            let row = index as u32 / self.grid.columns;
+            let rows = self.grid.tiles.len() as u32 / self.grid.columns;
+            Rectangle::from_edges(
+                tile.left.saturating_sub(1),
+                tile.top.saturating_sub(1),
+                tile.right() - u32::from(column + 1 < self.grid.columns),
+                tile.bottom() - u32::from(row + 1 < rows),
+            )
+            .intersection(self.layout.source())
+        } else {
+            tile
+        };
+        let region = self
+            .layout
+            .region(unit.left, unit.top, unit.width, unit.height);
+        (unit, region)
+    }
+
+    fn decodes(&self, index: usize) -> bool {
+        if self.converts {
+            !self
+                .tile(index)
+                .expanded(2)
+                .intersection(self.layout.source())
+                .is_empty()
+        } else {
+            self.unit(index).1.len() != 0
+        }
+    }
+
+    fn job_bytes(&self, index: usize) -> usize {
+        let tile = &self.grid.tiles[index];
+        let (unit, region) = self.unit(index);
+        let contributions = if self.layout.is_unscaled() {
+            0
+        } else {
+            resample::Contribution::workspace_bytes(region)
+        };
+        let conversion = if self.converts {
+            3 * (tile.geometry.width as usize + tile.geometry.height as usize + 1)
+                + chroma::Yuv444::workspace_bytes(unit.width)
+                + chroma::Halo::bytes(tile.geometry)
+        } else {
+            0
+        };
+        tile.workspace_bytes
+            .saturating_add(tile.payload_len)
+            .saturating_add(contributions)
+            .saturating_add(conversion)
+    }
+}
+
+struct Workers {
+    #[cfg(feature = "parallel-grid")]
+    pool: Option<(rayon::ThreadPool, memory::Reservation)>,
+}
+
+impl Workers {
+    #[cfg(feature = "parallel-grid")]
+    fn new(tiles: usize, max_job: usize, budget: &memory::Budget) -> Result<Self> {
+        let threads = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(8)
+            .min(tiles);
+        let mut workers = threads;
+        while workers > 1
+            && max_job
+                .saturating_mul(workers)
+                .saturating_add(pool_bytes(workers))
+                > budget.available()
+        {
+            workers -= 1;
+        }
+        if workers <= 1 {
+            return Ok(Self { pool: None });
+        }
+        let reservation = budget.reserve(pool_bytes(workers), "worker pool")?;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .stack_size(WORKER_STACK_BYTES)
+            .build()
+            .map_err(|_| BoundedDecodeError::AllocationFailed)?;
+        Ok(Self {
+            pool: Some((pool, reservation)),
+        })
+    }
+
+    #[cfg(not(feature = "parallel-grid"))]
+    fn new(_tiles: usize, _max_job: usize, _budget: &memory::Budget) -> Result<Self> {
+        Ok(Self {})
+    }
+
+    fn count(&self) -> usize {
+        #[cfg(feature = "parallel-grid")]
+        if let Some((pool, _)) = &self.pool {
+            return pool.current_num_threads();
+        }
+        1
+    }
+
+    fn map<T: Send, U: Send>(&self, items: Vec<T>, f: impl Fn(T) -> U + Sync + Send) -> Vec<U> {
+        #[cfg(feature = "parallel-grid")]
+        if let Some((pool, _)) = &self.pool {
+            use rayon::prelude::*;
+            return pool.install(|| items.into_par_iter().map(f).collect());
+        }
+        items.into_iter().map(f).collect()
+    }
+
+    fn decode_in_order<J: Send, R: Send>(
+        &self,
+        count: usize,
+        start: impl FnMut(usize) -> Result<J>,
+        run: impl Fn(J) -> Result<R> + Sync,
+        finish: impl FnMut(R),
+    ) -> Result<()> {
+        #[cfg(feature = "parallel-grid")]
+        if let Some((pool, _)) = &self.pool {
+            return decode_in_order(pool, count, start, run, finish);
+        }
+        decode_sequentially(count, start, run, finish)
+    }
+}
+
+fn decode_tile(tile: &grid::Tile<'_>, payload: &[u8]) -> Result<DecodedFrame> {
     let prepared = codec::prepare(tile.config, payload)?;
     if prepared.reconstruction_bytes() + payload.len() as u64 * 3 + 1024 * 1024
         > tile.workspace_bytes as u64
@@ -357,7 +476,15 @@ fn render_tile(
             "coded headers changed after preflight",
         ));
     }
-    let frame = prepared.decode()?;
+    Ok(prepared.decode()?)
+}
+
+fn render_tile(
+    tile: &grid::Tile<'_>,
+    frame: DecodedFrame,
+    color: &grid::Color<'_>,
+    transform: &color::ColorTransform,
+) -> Result<Vec<u8>> {
     let mut decoded = crate::DecodedHeicImage {
         width: frame.width,
         height: frame.height,
@@ -413,6 +540,31 @@ fn render_tile(
     )
     .map_err(|_| BoundedDecodeError::Unsupported("tile YCbCr conversion"))?;
     drop(decoded);
+    apply_color(rgb, transform)
+}
+
+fn render_yuv444(
+    job: &Decoded<'_, '_>,
+    frame: DecodedFrame,
+    yuv444: &chroma::Yuv444,
+    transform: &color::ColorTransform,
+) -> Result<Vec<u8>> {
+    let mut rgb = resample::zeroed(job.unit.width as usize * job.unit.height as usize * 3)?;
+    yuv444.convert(
+        &chroma::TileSamples {
+            frame: &frame,
+            geometry: job.tile.geometry,
+            origin: job.origin,
+            halo: &job.halo,
+        },
+        job.unit,
+        &mut rgb,
+    )?;
+    drop(frame);
+    apply_color(rgb, transform)
+}
+
+fn apply_color(rgb: Vec<u8>, transform: &color::ColorTransform) -> Result<Vec<u8>> {
     if transform.is_identity() {
         return Ok(rgb);
     }
@@ -429,10 +581,22 @@ fn pool_bytes(workers: usize) -> usize {
 struct Job<'a, 'b> {
     index: usize,
     tile: &'b grid::Tile<'a>,
-    tile_x: u32,
-    tile_y: u32,
+    origin: [u32; 2],
+    unit: Rectangle,
     region: resample::Region,
+    decode: bool,
     payload: Vec<u8>,
+    reservation: memory::Reservation,
+}
+
+struct Decoded<'a, 'b> {
+    index: usize,
+    tile: &'b grid::Tile<'a>,
+    origin: [u32; 2],
+    unit: Rectangle,
+    region: resample::Region,
+    frame: Option<DecodedFrame>,
+    halo: chroma::Halo,
     reservation: memory::Reservation,
 }
 
@@ -443,41 +607,59 @@ enum TileData {
 
 struct TileResult {
     index: usize,
-    tile_x: u32,
-    tile_y: u32,
+    unit: Rectangle,
     region: resample::Region,
     data: TileData,
     _reservation: memory::Reservation,
 }
 
-fn run_job(
-    job: Job<'_, '_>,
+fn decode_job<'a, 'b>(job: Job<'a, 'b>) -> Result<Decoded<'a, 'b>> {
+    let frame = if job.decode {
+        Some(decode_tile(job.tile, &job.payload)?)
+    } else {
+        None
+    };
+    Ok(Decoded {
+        index: job.index,
+        tile: job.tile,
+        origin: job.origin,
+        unit: job.unit,
+        region: job.region,
+        frame,
+        halo: chroma::Halo::default(),
+        reservation: job.reservation,
+    })
+}
+
+fn render_job(
+    mut job: Decoded<'_, '_>,
     layout: resample::Layout,
     color: &grid::Color<'_>,
     transform: &color::ColorTransform,
+    yuv444: Option<&chroma::Yuv444>,
 ) -> Result<TileResult> {
-    let data = if job.region.len() == 0 {
-        TileData::Sums(resample::Contribution::default())
-    } else {
-        let pixels = render_tile(job.tile, &job.payload, color, transform)?;
-        if layout.is_unscaled() {
-            TileData::Pixels(pixels)
-        } else {
-            TileData::Sums(resample::contributions(
-                layout,
-                job.region,
-                &pixels,
-                job.tile_x,
-                job.tile_y,
-                job.tile.geometry.width,
-            )?)
+    let (index, unit, region) = (job.index, job.unit, job.region);
+    let data = match job.frame.take() {
+        Some(frame) if region.len() != 0 => {
+            let tile = job.tile;
+            let pixels = match yuv444 {
+                Some(yuv444) => render_yuv444(&job, frame, yuv444, transform)?,
+                None => render_tile(tile, frame, color, transform)?,
+            };
+            if layout.is_unscaled() {
+                TileData::Pixels(pixels)
+            } else {
+                TileData::Sums(resample::contributions(
+                    layout, region, &pixels, unit.left, unit.top, unit.width,
+                )?)
+            }
         }
+        _ => TileData::Sums(resample::Contribution::default()),
     };
     Ok(TileResult {
-        index: job.index,
-        tile_x: job.tile_x,
-        tile_y: job.tile_y,
-        region: job.region,
+        index,
+        unit,
+        region,
         data,
         _reservation: job.reservation,
     })
