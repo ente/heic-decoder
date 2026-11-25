@@ -601,6 +601,26 @@ fn avif_matching_alpha_is_preserved() {
 }
 
 #[test]
+fn avif_without_colr_reports_the_sequence_header_colour() {
+    let input = image_fixture(
+        b"av01",
+        (256, 2048),
+        boxed(b"av1C", &[0x81, 0x04, 0x0c, 0]),
+        av1_payload(),
+        None,
+    );
+    let decoded = decode_primary_avif_to_image(&input).unwrap();
+    assert_eq!(decoded.ycbcr_range, YCbCrRange::Limited);
+    assert_eq!(
+        decoded.ycbcr_matrix,
+        YCbCrMatrixCoefficients {
+            matrix_coefficients: 6,
+            colour_primaries: 2,
+        }
+    );
+}
+
+#[test]
 fn avif_zero_pixel_limit_cannot_disable_backend_limit() {
     let input = image_fixture(
         b"av01",

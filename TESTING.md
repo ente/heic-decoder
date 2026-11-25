@@ -239,12 +239,14 @@ from the positive `*.heic` oracle comparisons.
 The external primary-image oracle is only a test executable; it adds no native
 dependency to the Rust decoder. After the existing harness builds libheif,
 build and run it with CMake, libpng development files, Ruby, and FFmpeg with
-libx265. No incremental image assets are committed. The generator starts
+libx265 and an AV1 encoder (libaom-av1, or libsvtav1 when FFmpeg lacks
+libaom). No incremental image assets are committed. The generator starts
 from the existing external libheif corpus and creates the geometry, metadata,
 and height-growth cases missing from that corpus in the ignored
 `.heic-test-assets/incremental-corpus` directory. All reference PNGs come from
-live strict libheif decoding. Its manifest records source, oracle, FFmpeg,
-and input identities; encoded bytes can differ across libx265 versions.
+live strict libheif decoding. Its manifest records source, oracle, FFmpeg, AV1
+encoder, and input identities; encoded bytes can differ across encoder
+versions.
 Grid tiles are hidden items, so `heif-dec` writes only the primary image.
 Once the corpus exists, default `verify` runs also compare each of its `.heic`
 files exactly against `heif-dec`. Regenerate a corpus made before tiles were
@@ -254,9 +256,11 @@ clean aperture are written to the `tile-crop` subdirectory. The incremental
 and bounded decoders refuse tile crops. Cases that rotate or mirror odd-sized
 or 4:2:2 images are written to the `orientation` subdirectory. The bounded
 decoder reproduces libheif's 4:4:4 conversion for the 4:2:0 cases there and
-refuses the 4:2:2 ones, which its HEVC decoder does not support. The
+refuses the 4:2:2 ones, which its HEVC decoder does not support. AVIF cases are
+written to the `avif` subdirectory; the incremental and bounded decoders only
+decode HEVC, so the bounded comparison records them as refusals. The
 incremental runner below only receives the top-level files, and default
-`verify` and the bounded comparison cover both subdirectories.
+`verify` and the bounded comparison cover all three subdirectories.
 
 ```bash
 cmake -S scripts/incremental -B .heic-test-runs/incremental-oracle \
@@ -320,10 +324,18 @@ the pinned 4:2:2 kernel has no border defect, and include a 180° turn of an
 odd width that libheif runs on the subsampled planes without converting.
 `odd-height-grid-quarter-turn`, `odd-three-quarter-turn`, and
 `chroma422-odd-vertical-mirror` need no conversion and guard against
-converting too often. A 4:2:0 primary item reaches an odd size only through a
-`clap`, so its converting rotations keep the cropped edges and differ from the
-pinned validator there. Unit tests cover those; on such probes the decoder
-matched `heif-dec` exactly once the pinned border was modelled.
+converting too often. An HEVC 4:2:0 primary item reaches an odd size only
+through a `clap`, so its converting rotations keep the cropped edges and differ
+from the pinned validator there. Unit tests cover those; on such probes the
+decoder matched `heif-dec` exactly once the pinned border was modelled.
+
+The `avif` cases run the same rules on AV1 items: `clap`s with an odd origin,
+an odd left edge, or an odd top edge, and 90°, 180° and 270° `irot`s and
+`imir`s of odd-sized stills followed by an edge-trimming `clap`. They cover
+8-bit and 10-bit, full and limited range, a `colr` nclx override that differs
+from the AV1 sequence header, and items without `colr` that convert with the
+sequence header's colour. `even-clap` and `odd-width-three-quarter-turn` need
+no conversion.
 
 The pinned libheif has a bilinear chroma-border indexing defect, fixed
 upstream by strukturag/libheif commit 215cbdad. The decoders implement the
