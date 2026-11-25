@@ -324,7 +324,10 @@ the pinned 4:2:2 kernel has no border defect, and include a 180° turn of an
 odd width that libheif runs on the subsampled planes without converting.
 `odd-height-grid-quarter-turn`, `odd-three-quarter-turn`, and
 `chroma422-odd-vertical-mirror` need no conversion and guard against
-converting too often.
+converting too often. An HEVC 4:2:0 primary item reaches an odd size only
+through a `clap`, so its converting rotations keep the cropped edges and differ
+from the pinned validator there. Unit tests cover those; on such probes the
+decoder matched `heif-dec` exactly once the pinned border was modelled.
 
 The `avif` cases run the same rules on AV1 items: `clap`s with an odd origin,
 an odd left edge, or an odd top edge, and 90°, 180° and 270° `irot`s and
@@ -332,10 +335,7 @@ an odd left edge, or an odd top edge, and 90°, 180° and 270° `irot`s and
 8-bit and 10-bit, full and limited range, a `colr` nclx override that differs
 from the AV1 sequence header, and items without `colr` that convert with the
 sequence header's colour. `even-clap` and `odd-width-three-quarter-turn` need
-no conversion. A 4:2:0 primary item reaches an odd size only through a
-`clap`, so its converting rotations keep the cropped edges and differ from the
-pinned validator there. Unit tests cover those; on such probes the decoder
-matched `heif-dec` exactly once the pinned border was modelled.
+no conversion.
 
 The pinned libheif has a bilinear chroma-border indexing defect, fixed
 upstream by strukturag/libheif commit 215cbdad. The decoders implement the
