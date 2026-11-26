@@ -25,6 +25,9 @@ pub(crate) fn decode(
     {
         return Err(HevcError::Unsupported("incremental coding structure"));
     }
+    if sps.bit_depth_y() != 8 || sps.bit_depth_c() != 8 {
+        return Err(HevcError::Unsupported("incremental bit depth"));
+    }
     let size = sps.ctb_size();
     let width = sps.pic_width_in_luma_samples;
     let height = sps.pic_height_in_luma_samples;

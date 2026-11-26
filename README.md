@@ -13,7 +13,7 @@ Pure Rust HEIF/HEIC/AVIF decoder with first-class `image` crate integration.
   - `path_extension_is_heif`
   - `DecodedRgbaImage::apply_exif_orientation`
   - `image_integration::apply_exif_orientation_dynamic`
-- Memory-budgeted HEIC decoding with `decode_bounded`: grid and single-image HEVC primaries decode to display-oriented sRGB RGB8 with a capped maximum side, and inputs that would exceed the budget are refused before pixel decoding.
+- Memory-budgeted HEIC decoding with `decode_bounded`: grid and single-image HEVC primaries decode to display-oriented sRGB RGB8 with a capped maximum side, PQ and HLG HDR images are tone mapped to SDR, and inputs that would exceed the budget are refused before pixel decoding.
 - Optional guardrails for bounded production use:
   - max input bytes
   - max decoded pixel count

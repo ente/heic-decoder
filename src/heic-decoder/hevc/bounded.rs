@@ -17,6 +17,7 @@ pub(crate) struct Geometry {
     pub(crate) coded_width: u32,
     pub(crate) coded_height: u32,
     pub(crate) crop: [u32; 4],
+    pub(crate) bit_depth: u8,
     pub(crate) full_range: bool,
     pub(crate) matrix: u8,
     pub(crate) primaries: u8,
@@ -58,8 +59,9 @@ impl<'a> Prepared<'a> {
         {
             return Err(HevcError::Unsupported("bounded PPS references"));
         }
+        let qp_bd_offset = 6 * i32::from(sps.bit_depth_luma_minus8);
         if pps.diff_cu_qp_delta_depth > sps.log2_diff_max_min_luma_coding_block_size
-            || !(-26..=25).contains(&pps.init_qp_minus26)
+            || !(-26 - qp_bd_offset..=25).contains(&i32::from(pps.init_qp_minus26))
             || !(-12..=12).contains(&pps.pps_cb_qp_offset)
             || !(-12..=12).contains(&pps.pps_cr_qp_offset)
             || !(-6..=6).contains(&pps.pps_beta_offset_div2)
@@ -83,7 +85,7 @@ impl<'a> Prepared<'a> {
             return Err(HevcError::Unsupported("bounded non-intra slice"));
         }
         let parsed = SliceHeader::parse_bounded(&slice, &sps, &pps)?;
-        if !(0..=51).contains(&parsed.header.slice_qp_y)
+        if !(-qp_bd_offset..=51).contains(&parsed.header.slice_qp_y)
             || !(-12..=12).contains(&parsed.header.slice_cb_qp_offset)
             || !(-12..=12).contains(&parsed.header.slice_cr_qp_offset)
             || !(-6..=6).contains(&parsed.header.slice_beta_offset_div2)
@@ -107,6 +109,7 @@ impl<'a> Prepared<'a> {
             coded_width: sps.pic_width_in_luma_samples,
             coded_height: sps.pic_height_in_luma_samples,
             crop,
+            bit_depth: sps.bit_depth_y(),
             full_range: sps.video_full_range_flag,
             matrix: sps.matrix_coeffs,
             primaries: sps.colour_primaries,
@@ -147,7 +150,8 @@ impl<'a> Prepared<'a> {
 
     pub(crate) fn output_band(&self) -> Result<DecodedFrame> {
         let g = self.geometry;
-        let mut frame = DecodedFrame::try_with_params(g.coded_width, self.sps.ctb_size(), 8, 1)?;
+        let mut frame =
+            DecodedFrame::try_with_params(g.coded_width, self.sps.ctb_size(), g.bit_depth, 1)?;
         frame.full_range = g.full_range;
         frame.matrix_coeffs = g.matrix;
         frame.colour_primaries = g.primaries;
@@ -174,7 +178,8 @@ impl<'a> Prepared<'a> {
 
     pub(crate) fn decode(self) -> Result<DecodedFrame> {
         let g = self.geometry;
-        let mut frame = DecodedFrame::try_with_params(g.coded_width, g.coded_height, 8, 1)?;
+        let mut frame =
+            DecodedFrame::try_with_params(g.coded_width, g.coded_height, g.bit_depth, 1)?;
         frame.set_crop(g.crop[0], g.crop[1], g.crop[2], g.crop[3]);
         frame.full_range = g.full_range;
         frame.matrix_coeffs = g.matrix;
@@ -193,8 +198,8 @@ fn validate_sps(sps: &Sps) -> Result<()> {
     if sps.sps_id > 15
         || sps.max_sub_layers_minus1 != 0
         || sps.chroma_format_idc != 1
-        || sps.bit_depth_luma_minus8 != 0
-        || sps.bit_depth_chroma_minus8 != 0
+        || !matches!(sps.bit_depth_luma_minus8, 0 | 2 | 4)
+        || sps.bit_depth_chroma_minus8 != sps.bit_depth_luma_minus8
         || sps.separate_colour_plane_flag
         || sps.pcm_enabled_flag
         || sps.unsupported_rext_tool.is_some()

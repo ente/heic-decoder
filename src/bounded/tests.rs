@@ -82,7 +82,7 @@ fn fixture_with_exif_info(
         payload,
         extra_properties,
         primary_extras,
-        tile_extras,
+        &vec![tile_extras; configs.len()],
         orientation,
         exif_info,
         (configs.len() as u32 * 16 - 1, 15),
@@ -95,7 +95,7 @@ fn fixture_with_canvas(
     payload: &[u8],
     extra_properties: &[Vec<u8>],
     primary_extras: &[usize],
-    tile_extras: &[usize],
+    tile_extras: &[&[usize]],
     orientation: Option<u8>,
     exif_info: &[u8],
     (width, height): (u32, u32),
@@ -147,6 +147,7 @@ fn fixture_with_canvas(
                 associations.push(0x80 | (3 + configs.len() + i) as u8);
             }
         } else {
+            let tile_extras = tile_extras.get(usize::from(id) - 1).copied().unwrap_or(&[]);
             associations.extend_from_slice(&[
                 2 + tile_extras.len() as u8,
                 0x81,
@@ -1293,6 +1294,7 @@ fn render_rejects_workspace_and_geometry_changes_after_preflight() {
         &color,
         tile.geometry.primaries,
         tile.geometry.transfer,
+        tile.geometry.bit_depth,
         &budget,
     )
     .unwrap();
@@ -1782,4 +1784,310 @@ fn grid_dimensions_are_limited_to_500_megapixels() {
         decode((22_360, 22_360)),
         Err(BoundedDecodeError::Malformed("ispe differs from SPS"))
     ));
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn ten_bit_sdr_matches_normal_decode_and_icc_conversion() {
+    let bytes = include_bytes!("testdata/apple-p3-10bit-64x48.heic");
+    let normal = crate::decode_bytes_to_rgb8(bytes).unwrap();
+    assert_eq!(normal.source_bit_depth, 10);
+    let mut expected = vec![0; normal.pixels.len()];
+    moxcms::ColorProfile::new_from_slice(normal.icc_profile.as_ref().unwrap())
+        .unwrap()
+        .create_transform_8bit(
+            moxcms::Layout::Rgb,
+            &moxcms::ColorProfile::new_srgb(),
+            moxcms::Layout::Rgb,
+            Default::default(),
+        )
+        .unwrap()
+        .transform(&normal.pixels, &mut expected)
+        .unwrap();
+    let bounded = decode_bounded(BoundedInput::Bytes(bytes), Default::default())
+        .unwrap()
+        .image;
+    assert_eq!((bounded.width, bounded.height), (64, 48));
+    assert_eq!(bounded.source_bit_depth, 10);
+    assert_eq!(bounded.pixels, expected);
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn ten_bit_slices_may_use_negative_qp() {
+    let bytes = include_bytes!("testdata/x265-10bit-negative-qp-32x32.heic");
+    let normal = crate::decode_bytes_to_rgb8(bytes).unwrap();
+    let bounded = decode_bounded(BoundedInput::Bytes(bytes), Default::default())
+        .unwrap()
+        .image;
+    assert_eq!((bounded.width, bounded.height), (32, 32));
+    assert_eq!(bounded.source_bit_depth, 10);
+    assert_eq!(bounded.pixels, normal.pixels);
+}
+
+#[test]
+fn rolling_decoder_refuses_high_bit_depth() {
+    let bytes = include_bytes!("testdata/x265-10bit-negative-qp-32x32.heic");
+    let budget = memory::Budget::new(128 * 1024 * 1024);
+    let mut source = container::Source::new(BoundedInput::Bytes(bytes)).unwrap();
+    let metadata = source.metadata(&budget).unwrap();
+    let index = container::Index::parse(&metadata, source.len(), &budget).unwrap();
+    let grid = grid::Grid::preflight(&index, &mut source, &budget).unwrap();
+    let tile = &grid.tiles[0];
+    let mut payload = vec![0; tile.payload_len];
+    index
+        .read_item(tile.item, &mut source, &mut payload)
+        .unwrap();
+    assert!(matches!(
+        codec::prepare(tile.config, &payload)
+            .unwrap()
+            .decode_incremental(|_, _| Ok(())),
+        Err(crate::heic_decoder::HevcError::Unsupported(
+            "incremental bit depth"
+        ))
+    ));
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn hdr_output_is_area_averaged_after_tone_mapping() {
+    let bytes = include_bytes!("testdata/apple-pq-64x48.heic");
+    let full = decode_bounded(BoundedInput::Bytes(bytes), Default::default())
+        .unwrap()
+        .image;
+    let reduced = decode_bounded(
+        BoundedInput::Bytes(bytes),
+        BoundedDecodeOptions {
+            max_side: 16,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(reduced.original_dimensions, (64, 48));
+    assert_eq!((reduced.image.width, reduced.image.height), (16, 12));
+    for y in 0..12 {
+        for x in 0..16 {
+            for channel in 0..3 {
+                let sum: u32 = (0..16)
+                    .map(|i| {
+                        let index = ((y * 4 + i / 4) * 64 + x * 4 + i % 4) * 3 + channel;
+                        u32::from(full.pixels[index])
+                    })
+                    .sum();
+                let actual = reduced.image.pixels[(y * 16 + x) * 3 + channel];
+                assert!(u32::from(actual).abs_diff((sum + 8) / 16) <= 1);
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn repeated_pixi_must_agree() {
+    let nals = nal_sets();
+    let config = configuration(&nals[1]);
+    let pixi = |depth: u8| full_box(b"pixi", 0, &[3, depth, depth, depth]);
+    let decode = |properties: &[Vec<u8>]| {
+        let bytes = fixture(std::slice::from_ref(&config), &nals[3], properties);
+        decode_bounded(BoundedInput::Bytes(&bytes), Default::default()).map(|d| d.image.pixels)
+    };
+    assert_eq!(decode(&[pixi(8), pixi(8)]).unwrap(), decode(&[]).unwrap());
+    assert!(matches!(
+        decode(&[pixi(8), pixi(10)]),
+        Err(BoundedDecodeError::Malformed("conflicting pixi"))
+    ));
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn pixi_must_match_the_coded_bit_depth() {
+    let original = include_bytes!("testdata/apple-pq-64x48.heic");
+    let pixi = original.windows(4).position(|b| b == b"pixi").unwrap();
+    assert_eq!(original[pixi + 8..pixi + 12], [3, 10, 10, 10]);
+    for (depths, expected) in [
+        ([8, 8, 8], "pixi differs from SPS bit depth"),
+        ([12, 12, 12], "pixi differs from SPS bit depth"),
+        ([10, 8, 10], "pixi channels"),
+    ] {
+        let mut bytes = original.to_vec();
+        bytes[pixi + 9..pixi + 12].copy_from_slice(&depths);
+        assert!(matches!(
+            decode_bounded(BoundedInput::Bytes(&bytes), Default::default()),
+            Err(BoundedDecodeError::Unsupported(message)) if message == expected
+        ));
+    }
+    #[cfg(feature = "incremental-experiment")]
+    for bytes in [
+        include_bytes!("testdata/apple-pq-64x48.heic").as_slice(),
+        include_bytes!("testdata/apple-p3-10bit-64x48.heic"),
+    ] {
+        assert!(matches!(
+            incremental::decode(BoundedInput::Bytes(bytes), Default::default()),
+            Err(BoundedDecodeError::Unsupported(
+                "experiment requires 8-bit HEVC"
+            ))
+        ));
+    }
+}
+
+#[test]
+fn light_level_properties_are_read_from_primary_and_tiles() {
+    let nals = nal_sets();
+    let config = configuration(&nals[1]);
+    let clli = box_bytes(b"clli", &[3, 112, 0, 200]);
+    let mdcv = box_bytes(
+        b"mdcv",
+        &[
+            [0; 16].as_slice(),
+            &10_000_000u32.to_be_bytes(),
+            &[0, 0, 0, 50],
+        ]
+        .concat(),
+    );
+    let preflight = |properties: &[Vec<u8>], primary: &[usize], tiles: &[usize]| {
+        let bytes = fixture_with_exif_info(
+            std::slice::from_ref(&config),
+            &nals[3],
+            properties,
+            primary,
+            tiles,
+            None,
+            b"Exif\0",
+        );
+        let budget = memory::Budget::new(128 * 1024 * 1024);
+        let mut source = container::Source::new(BoundedInput::Bytes(&bytes)).unwrap();
+        let metadata = source.metadata(&budget).unwrap();
+        let index = container::Index::parse(&metadata, source.len(), &budget).unwrap();
+        grid::Grid::preflight(&index, &mut source, &budget).map(|grid| {
+            let color = grid.tiles[0].color.overridden_by(&grid.properties.color);
+            (
+                color.content_light_level,
+                color.mastering_luminance,
+                color.peak_luminance(),
+            )
+        })
+    };
+    let properties = [clli.clone(), mdcv.clone()];
+    assert_eq!(
+        preflight(&properties, &[0], &[1]).unwrap(),
+        (Some(880), Some(10_000_000), Some(880.0))
+    );
+    assert_eq!(
+        preflight(&properties, &[], &[1]).unwrap(),
+        (None, Some(10_000_000), Some(1000.0))
+    );
+    let short_clli = box_bytes(b"clli", &[3, 112, 0]);
+    let long_clli = box_bytes(b"clli", &[3, 112, 0, 200, 0]);
+    let short_mdcv = box_bytes(b"mdcv", &[0; 23]);
+    for (properties, expected) in [
+        (
+            vec![clli.clone(), box_bytes(b"clli", &[1, 244, 0, 100])],
+            (Some(880), None, Some(880.0)),
+        ),
+        (
+            vec![mdcv.clone(), box_bytes(b"mdcv", &[0; 24])],
+            (None, Some(10_000_000), Some(1000.0)),
+        ),
+        (
+            vec![short_clli.clone(), clli.clone()],
+            (Some(880), None, Some(880.0)),
+        ),
+        (vec![long_clli, short_mdcv.clone()], (None, None, None)),
+    ] {
+        assert_eq!(preflight(&properties, &[0, 1], &[]).unwrap(), expected);
+    }
+    #[cfg(not(feature = "decoder-tracing"))]
+    {
+        let decode = |properties: &[Vec<u8>]| {
+            let bytes = fixture(std::slice::from_ref(&config), &nals[3], properties);
+            decode_bounded(BoundedInput::Bytes(&bytes), Default::default())
+                .unwrap()
+                .image
+                .pixels
+        };
+        let plain = decode(&[]);
+        assert_eq!(decode(&properties), plain);
+        assert_eq!(decode(&[short_clli, short_mdcv]), plain);
+    }
+}
+
+#[test]
+fn tiles_with_different_light_levels_form_one_grid() {
+    let nals = nal_sets();
+    let config = configuration(&nals[1]);
+    let tiles = [config.clone(), config];
+    let mastering = |units: u32| {
+        box_bytes(
+            b"mdcv",
+            &[[0; 16].as_slice(), &units.to_be_bytes(), &[0; 4]].concat(),
+        )
+    };
+    let properties = [
+        box_bytes(b"clli", &[3, 112, 0, 200]),
+        box_bytes(b"clli", &[1, 244, 0, 100]),
+        box_bytes(b"clli", &[3, 112, 0]),
+        box_bytes(b"clli", &[0; 4]),
+        mastering(0),
+        mastering(40_000_000),
+    ];
+    let grid = |primary: &[usize], first: &[usize], second: &[usize]| {
+        fixture_with_canvas(
+            &tiles,
+            &nals[3],
+            &properties,
+            primary,
+            &[first, second],
+            None,
+            b"Exif\0",
+            (31, 15),
+        )
+    };
+    let peak = |bytes: &[u8]| {
+        let budget = memory::Budget::new(128 * 1024 * 1024);
+        let mut source = container::Source::new(BoundedInput::Bytes(bytes)).unwrap();
+        let metadata = source.metadata(&budget).unwrap();
+        let index = container::Index::parse(&metadata, source.len(), &budget).unwrap();
+        let grid = grid::Grid::preflight(&index, &mut source, &budget).unwrap();
+        grid.tiles[0]
+            .color
+            .overridden_by(&grid.properties.color)
+            .peak_luminance()
+    };
+    #[cfg(not(feature = "decoder-tracing"))]
+    let plain = decode_bounded(
+        BoundedInput::Bytes(&grid(&[], &[], &[])),
+        Default::default(),
+    )
+    .unwrap()
+    .image
+    .pixels;
+    for (primary, first, second, expected) in [
+        (&[][..], &[0][..], &[1][..], Some(880.0)),
+        (&[], &[0], &[2], Some(880.0)),
+        (&[], &[2], &[0], None),
+        (&[], &[], &[0], None),
+        (&[3], &[0], &[], Some(880.0)),
+        (&[4], &[5], &[5], Some(4000.0)),
+        (&[3, 4], &[0, 5], &[], Some(880.0)),
+    ] {
+        let bytes = grid(primary, first, second);
+        assert_eq!(peak(&bytes), expected);
+        #[cfg(not(feature = "decoder-tracing"))]
+        assert_eq!(
+            decode_bounded(BoundedInput::Bytes(&bytes), Default::default())
+                .unwrap()
+                .image
+                .pixels,
+            plain
+        );
+        #[cfg(all(feature = "incremental-experiment", not(feature = "decoder-tracing")))]
+        assert_eq!(
+            incremental::decode(BoundedInput::Bytes(&bytes), Default::default())
+                .unwrap()
+                .0
+                .image
+                .pixels,
+            plain
+        );
+    }
 }

@@ -12,11 +12,45 @@ use super::{BoundedDecodeError as Error, Result, codec};
 pub(super) struct Color<'a> {
     pub(super) nclx: Option<NclxColorProfile>,
     pub(super) icc: Option<&'a [u8]>,
+    pub(super) content_light_level: Option<u16>,
+    pub(super) mastering_luminance: Option<u32>,
+}
+
+impl<'a> Color<'a> {
+    pub(super) fn overridden_by(&self, container: &Color<'a>) -> Color<'a> {
+        let mut color = self.clone();
+        if container.nclx.as_ref().is_some_and(|n| !n.is_undefined()) {
+            color.nclx = container.nclx.clone();
+        }
+        color.icc = container.icc.or(color.icc);
+        color.content_light_level = container
+            .content_light_level
+            .filter(|&nits| nits != 0)
+            .or(color.content_light_level);
+        color.mastering_luminance = container
+            .mastering_luminance
+            .filter(|&units| units != 0)
+            .or(color.mastering_luminance);
+        color
+    }
+
+    pub(super) fn same_profile(&self, other: &Color<'_>) -> bool {
+        self.nclx == other.nclx && self.icc == other.icc
+    }
+
+    pub(super) fn peak_luminance(&self) -> Option<f32> {
+        let content = self.content_light_level.filter(|&nits| nits != 0);
+        let mastering = self.mastering_luminance.filter(|&units| units != 0);
+        content
+            .map(f32::from)
+            .or(mastering.map(|units| units as f32 / 10000.0))
+    }
 }
 
 pub(super) struct Properties<'a> {
     pub(super) config: Option<&'a [u8]>,
     pub(super) dimensions: Option<(u32, u32)>,
+    pub(super) bit_depth: Option<u8>,
     pub(super) color: Color<'a>,
     pub(super) transforms: [Option<Transform>; 16],
     pub(super) transform_count: usize,
@@ -27,6 +61,7 @@ impl<'a> Properties<'a> {
         let mut result = Self {
             config: None,
             dimensions: None,
+            bit_depth: None,
             color: Color::default(),
             transforms: [None; 16],
             transform_count: 0,
@@ -78,10 +113,31 @@ impl<'a> Properties<'a> {
                         return Err(Error::Unsupported("pixi version or flags"));
                     }
                     let count = r.uint(1)? as usize;
-                    if !matches!(count, 1 | 3) || r.take(count)?.iter().any(|&n| n != 8) {
-                        return Err(Error::Unsupported("8-bit channels required"));
+                    let depths = r.take(count)?;
+                    if !matches!(count, 1 | 3) || depths.iter().any(|&n| n != depths[0]) {
+                        return Err(Error::Unsupported("pixi channels"));
                     }
                     r.finish()?;
+                    if result
+                        .bit_depth
+                        .replace(depths[0])
+                        .is_some_and(|depth| depth != depths[0])
+                    {
+                        return Err(Error::Malformed("conflicting pixi"));
+                    }
+                }
+                b"clli" => {
+                    if b.data.len() == 4 {
+                        let level = r.uint(2)? as u16;
+                        result.color.content_light_level.get_or_insert(level);
+                    }
+                }
+                b"mdcv" => {
+                    if b.data.len() == 24 {
+                        r.take(16)?;
+                        let luminance = r.uint(4)? as u32;
+                        result.color.mastering_luminance.get_or_insert(luminance);
+                    }
                 }
                 b"irot" => {
                     let value = r.uint(1)?;
@@ -208,6 +264,12 @@ impl<'a> Tile<'a> {
         };
         if properties.dimensions != Some((geometry.width, geometry.height)) {
             return Err(Error::Malformed("ispe differs from SPS"));
+        }
+        if properties
+            .bit_depth
+            .is_some_and(|depth| depth != geometry.bit_depth)
+        {
+            return Err(Error::Unsupported("pixi differs from SPS bit depth"));
         }
         let workspace_bytes = (reconstruction_bytes + payload_len as u64 * 3 + 1024 * 1024)
             .try_into()
@@ -354,6 +416,7 @@ impl<'a> Grid<'a> {
                 (
                     tile.geometry.width,
                     tile.geometry.height,
+                    tile.geometry.bit_depth,
                     tile.geometry.full_range,
                     tile.geometry.matrix,
                     tile.geometry.primaries,
@@ -361,17 +424,24 @@ impl<'a> Grid<'a> {
                 ) != (
                     first.geometry.width,
                     first.geometry.height,
+                    first.geometry.bit_depth,
                     first.geometry.full_range,
                     first.geometry.matrix,
                     first.geometry.primaries,
                     first.geometry.transfer,
-                ) || tile.color != first.color
+                ) || !tile.color.same_profile(&first.color)
             }) {
                 return Err(Error::Unsupported("nonuniform grid tiles"));
             }
             tiles.push(tile)?;
         }
         let tile = &tiles[0];
+        if properties
+            .bit_depth
+            .is_some_and(|depth| depth != tile.geometry.bit_depth)
+        {
+            return Err(Error::Unsupported("pixi differs from SPS bit depth"));
+        }
         if u64::from(tile.geometry.width) * u64::from(columns) < u64::from(width)
             || u64::from(tile.geometry.height) * u64::from(rows) < u64::from(height)
             || u64::from(tile.geometry.width) * u64::from(columns - 1) >= u64::from(width)

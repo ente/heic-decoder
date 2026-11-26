@@ -212,6 +212,9 @@ item's BT.2020 or Display P3 nclx primaries to sRGB, and area-averages to the
 output size. The `rgb8-rounding` gate described below applies. The Exif value
 comes from the decoder's own parser and the colour conversion from moxcms;
 the comparator's orientation mapping and area average are independent.
+These corpora currently contain no PQ or HLG images. `decode_bounded` tone
+maps those and the oracle does not, so unit tests compare their output with a
+floating-point reference instead.
 
 Refusals with `Unsupported`, `LimitExceeded` or `MemoryBudgetExceeded` are
 counted but do not fail the run. The run fails on a crash, a timeout, an
@@ -283,7 +286,11 @@ as successful comparisons. CI also exercises the six currently supported
 files in the libheif/stress corpus. The separate normal suite keeps its exact
 RGB/ICC comparisons and existing expected-failure accounting.
 
-The oracle enables libheif strict decoding and rejects warnings. RGB display
+The oracle enables libheif strict decoding and rejects warnings. It decodes
+images coded above 8 bits at their coded depth and rounds each sample to
+8 bits, because libheif's own 8-bit output truncates them. When libheif cannot
+convert an image to RGB at its coded depth, the oracle uses libheif's 8-bit
+output. RGB display
 comparisons normalize embedded ICC to sRGB and apply an independent floating
 point area average. The `rgb8-rounding` profile allows at most one value per
 RGB channel per pixel; alpha remains exact. The `exact` profile allows no
