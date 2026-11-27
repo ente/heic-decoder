@@ -467,24 +467,50 @@ averaging so that neither side exceeds `max_side` (1 through 6000, default
 memory that depends on the input. `decoder-tracing` disables bounded decoding.
 
 The primary item may be a grid of uniform HEVC tiles or a single HEVC image
-(`hvc1`/`hev1`). Every coded item must be opaque 8-bit 4:2:0 HEVC with one IDR
-slice; WPP is supported. A single image is decoded as a grid with one tile.
+(`hvc1`/`hev1`). Every coded item must be opaque 8-, 10- or 12-bit 4:2:0 HEVC
+with one IDR slice, and a `pixi` property must match the coded bit depth; WPP
+is supported. A single image is decoded as a grid with one tile.
 `clap`/`irot`/`imir` are applied, and Exif orientation applies when no
 effective container orientation is present. When a container transform makes
 libheif convert 4:2:0 chroma to 4:4:4 (the 4:2:0 rules under Container
 transforms above), the output matches the regular decoders: bilinear chroma
 with clamped edges, the limited-range round trip through RGB, and the `colr`
-nclx override after all transforms. The 4:4:4 samples are built a band of rows
-at a time while each tile is converted to RGB, so no full-size 4:4:4 image is
-held. Grid tiles are then converted in units shifted one pixel up and left, so
-each unit needs only the last chroma row and column of tiles decoded before
-it; those edges are kept in strips as wide as the canvas. Clean apertures,
-rotations and mirrors on individual grid tiles are refused. RGB matrix/TRC ICC
-profiles and SDR nclx colour with BT.709, BT.2020 or Display P3 primaries are
-converted to sRGB. HDR transfer functions, grayscale or lookup-table ICC
-profiles, unprofiled wide-gamut HEVC colour, alpha, and unknown required
-auxiliaries return errors. Known depth, semantic matte, and
-gain-map auxiliaries are ignored.
+nclx override after all transforms, at the coded bit depth. The 4:4:4 samples
+are built a band of rows at a time while each tile is converted to RGB, so no
+full-size 4:4:4 image is held. Grid tiles are then converted in units shifted
+one pixel up and left, so each unit needs only the last chroma row and column
+of tiles decoded before it; those edges are kept in strips as wide as the
+canvas. Clean apertures, rotations and mirrors on individual grid tiles are
+refused. RGB matrix/TRC ICC profiles and SDR nclx colour with BT.709, BT.2020
+or Display P3 primaries are converted to sRGB, and PQ or HLG colour is tone
+mapped to sRGB as described below. Grayscale ICC profiles, lookup-table ICC
+profiles without a PQ or HLG `cicp` tag, unprofiled wide-gamut SDR HEVC colour,
+matrix coefficients 8, 11, 14 (ICtCp) or 16, PQ or HLG in the nclx or HEVC VUI
+when higher-precedence colour says otherwise, alpha, and unknown required
+auxiliaries return errors. Known depth, semantic matte, and gain-map
+auxiliaries are ignored, so an Apple gain-map HDR photo decodes as its SDR base
+image.
+
+PQ (transfer 16) and HLG (transfer 18) are taken from the `cicp` tag of an RGB
+ICC profile, whatever its other tags, otherwise from the container nclx,
+otherwise, when the container has no colour, from the HEVC VUI. Their primaries
+must be BT.709, BT.2020 or Display P3; unspecified primaries are treated as
+BT.2020. Samples are converted to display light with 203 cd/m² as SDR reference
+white: PQ directly, and HLG through the BT.2100 OOTF for a 1000 cd/m² display,
+so 75% HLG is also 203 cd/m². The colour is converted to BT.709 primaries with
+negative components clipped, and the BT.2390 EETF is applied to the largest
+component so that the source peak becomes SDR white. The source peak is the
+`clli` maximum content light level, otherwise the `mdcv` maximum mastering
+luminance, each taken from the primary item or else its first tile, otherwise
+1000 cd/m², limited to 203 through 10000 cd/m²; HLG always uses 1000 cd/m². A
+`clli` or `mdcv` box of the wrong size or with a zero value is ignored, a
+repeated one does not replace the first, and grid tiles may carry different
+ones. With a 1000 cd/m² peak, light up to about 88 cd/m² is unchanged,
+reference white encodes as 229 of 255, and brighter light rolls off to 255. The
+output is sRGB-encoded without an ICC profile, and `source_bit_depth` reports
+the coded bit depth. The other decode functions do not tone map: they return
+the HDR samples with the container's embedded ICC profile or one made from its
+nclx, so with no profile when only the HEVC VUI signals PQ or HLG.
 
 Before any pixel decoding, preflight reads every coded item's headers and
 reserves its reconstruction workspace, and admission then reserves the output
@@ -510,11 +536,11 @@ their behavior and do not select this path automatically.
 The incremental path supports opaque 8-bit 4:2:0 HEVC still images with one
 IDR slice per coded item, including non-grid images and uniform grids whose
 individual tiles exceed the output cap. WPP, HEVC tiles, multiple slices,
-higher bit depths, alpha, other chroma formats, and unsupported color profiles
-return errors. The output is display-oriented sRGB RGB8, using area averaging
-when reduced, with a maximum side from 1 through 6000. Known depth, semantic
-matte, and gain-map auxiliaries may accompany the SDR base image; this does
-not apply their effects or provide HDR output.
+higher bit depths, PQ or HLG colour, alpha, other chroma formats, and
+unsupported color profiles return errors. The output is display-oriented sRGB
+RGB8, using area averaging when reduced, with a maximum side from 1 through
+6000. Known depth, semantic matte, and gain-map auxiliaries may accompany the
+SDR base image; this does not apply their effects or provide HDR output.
 
 Reconstruction, deblocking, and SAO finish in rolling bands before conversion
 and reduction. Large coded images use a bounded two-thread pipeline. The

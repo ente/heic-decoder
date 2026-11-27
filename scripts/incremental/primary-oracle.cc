@@ -37,9 +37,20 @@ int main(int argc, char **argv) {
       throw std::runtime_error("Cannot allocate decoder options");
     }
     options->strict_decoding = argc < 4 || std::string(argv[3]) != "recover";
+    bool high_bit_depth = heif_image_handle_get_luma_bits_per_pixel(handle.get()) > 8 ||
+                          heif_image_handle_get_chroma_bits_per_pixel(handle.get()) > 8;
     heif_image *raw_image = nullptr;
-    check(heif_decode_image(handle.get(), &raw_image, heif_colorspace_RGB,
-                           heif_chroma_interleaved_RGBA, options.get()));
+    heif_error error = heif_decode_image(handle.get(), &raw_image, heif_colorspace_RGB,
+                                         high_bit_depth ? heif_chroma_interleaved_RRGGBBAA_LE
+                                                        : heif_chroma_interleaved_RGBA,
+                                         options.get());
+    if (high_bit_depth && error.code == heif_error_Unsupported_feature &&
+        error.subcode == heif_suberror_Unsupported_color_conversion) {
+      high_bit_depth = false;
+      error = heif_decode_image(handle.get(), &raw_image, heif_colorspace_RGB,
+                                heif_chroma_interleaved_RGBA, options.get());
+    }
+    check(error);
     auto image = std::unique_ptr<heif_image, decltype(&heif_image_release)>(
         raw_image, heif_image_release);
     int warnings = heif_image_get_decoding_warnings(image.get(), 0, nullptr, 0);
@@ -65,6 +76,8 @@ int main(int argc, char **argv) {
       }
       int stride = 0;
       const uint8_t *plane = heif_image_get_plane_readonly(image.get(), heif_channel_interleaved, &stride);
+      uint32_t maximum = (1u << heif_image_get_bits_per_pixel_range(image.get(), heif_channel_interleaved)) - 1;
+      std::vector<uint8_t> row(high_bit_depth ? static_cast<size_t>(width) * 4 : 0);
       FILE *file = std::fopen(argv[2], "wb");
       if (!file) {
         throw std::runtime_error("Cannot open PNG output");
@@ -88,7 +101,15 @@ int main(int argc, char **argv) {
       }
       png_write_info(png, info);
       for (int y = 0; y < height; ++y) {
-        png_write_row(png, plane + static_cast<size_t>(y) * stride);
+        const uint8_t *source = plane + static_cast<size_t>(y) * stride;
+        if (high_bit_depth) {
+          for (size_t i = 0; i < row.size(); ++i) {
+            uint32_t sample = source[2 * i] | (static_cast<uint32_t>(source[2 * i + 1]) << 8);
+            row[i] = static_cast<uint8_t>((sample * 255 + maximum / 2) / maximum);
+          }
+          source = row.data();
+        }
+        png_write_row(png, source);
       }
       png_write_end(png, info);
       png_destroy_write_struct(&png, &info);

@@ -210,14 +210,24 @@ fn plan<'a>(index: &Index<'a>, source: &mut Source<'_>, budget: &Budget) -> Resu
         let slice = slice(index, source, item, config)?;
         let prepared = prepared(config, &slice)?;
         let geometry = prepared.geometry;
+        if [
+            Some(geometry.bit_depth),
+            props.bit_depth,
+            properties.bit_depth,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|depth| depth != 8)
+        {
+            return Err(Error::Unsupported("experiment requires 8-bit HEVC"));
+        }
         let workspace_bytes = prepared.incremental_workspace()?;
         if props.dimensions != Some((geometry.width, geometry.height)) {
             return Err(Error::Malformed("ispe differs from SPS"));
         }
-        if tiles
-            .first()
-            .is_some_and(|first| first.geometry != geometry || first.color != props.color)
-        {
+        if tiles.first().is_some_and(|first| {
+            first.geometry != geometry || !first.color.same_profile(&props.color)
+        }) {
             return Err(Error::Unsupported("nonuniform grid"));
         }
         tiles.push(Tile {
@@ -265,19 +275,7 @@ pub fn decode(
     let index = Index::parse(&metadata, source.len(), &budget)?;
     let grid = plan(&index, &mut source, &budget)?;
     let layout = Layout::new(&grid, options.max_side)?;
-    let mut color = grid.tiles[0].color.clone();
-    if grid
-        .properties
-        .color
-        .nclx
-        .as_ref()
-        .is_some_and(|n| !n.is_undefined())
-    {
-        color.nclx = grid.properties.color.nclx.clone();
-    }
-    if grid.properties.color.icc.is_some() {
-        color.icc = grid.properties.color.icc;
-    }
+    let color = grid.tiles[0].color.overridden_by(&grid.properties.color);
     let yuv444 = Yuv444::new(&grid, &color)?;
     if yuv444.is_some() && grid.tiles.len() != 1 {
         return Err(Error::Unsupported("grid 4:4:4 chroma conversion"));
@@ -295,8 +293,12 @@ pub fn decode(
         &color,
         grid.tiles[0].geometry.primaries,
         grid.tiles[0].geometry.transfer,
+        grid.tiles[0].geometry.bit_depth,
         &budget,
     )?;
+    if transform.tone_map().is_some() {
+        return Err(Error::Unsupported("experiment requires SDR color"));
+    }
     let mut accumulator = Accumulator::new(layout, &budget)?;
     let output_len = layout.display_width as usize * layout.display_height as usize * 3;
     let workspace = grid.tiles.iter().map(|t| t.workspace_bytes).max().unwrap();
@@ -723,7 +725,7 @@ impl Conversion {
             .try_reserve_exact(len.saturating_sub(self.rgb.len()))
             .map_err(|_| Error::AllocationFailed)?;
         self.rgb.resize(len, 0);
-        yuv444.convert(samples, area, &mut self.rgb)?;
+        yuv444.convert(samples, area, None, &mut self.rgb)?;
         self.finish(transform)
     }
 

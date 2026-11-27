@@ -7,6 +7,7 @@ use crate::{
     YCbCrMatrixCoefficients, YCbCrRange,
 };
 
+use super::color::ToneMap;
 use super::grid::{Color, Grid};
 use super::memory::{Budget, Buffer};
 use super::resample::{Rectangle, transformed_source, zeroed};
@@ -21,6 +22,7 @@ pub(super) trait Samples {
 
 pub(super) struct Yuv444 {
     window: Rectangle,
+    bit_depth: u8,
     range: YCbCrRange,
     matrix: YCbCrMatrixCoefficients,
     colr: HeicColrOverride,
@@ -46,6 +48,7 @@ impl Yuv444 {
                 let geometry = grid.tiles[0].geometry;
                 return Ok(Some(Self {
                     window,
+                    bit_depth: geometry.bit_depth,
                     range: if geometry.full_range {
                         YCbCrRange::Full
                     } else {
@@ -74,6 +77,7 @@ impl Yuv444 {
         &self,
         samples: &impl Samples,
         area: Rectangle,
+        tone_map: Option<&ToneMap>,
         out: &mut [u8],
     ) -> Result<()> {
         if area.is_empty() {
@@ -118,8 +122,8 @@ impl Yuv444 {
             let source = DecodedHeicImage {
                 width: 2 * chroma_width as u32,
                 height: 2 * chroma_height as u32,
-                bit_depth_luma: 8,
-                bit_depth_chroma: 8,
+                bit_depth_luma: self.bit_depth,
+                bit_depth_chroma: self.bit_depth,
                 layout: HeicPixelLayout::Yuv420,
                 ycbcr_range: self.range,
                 ycbcr_matrix: self.matrix,
@@ -145,17 +149,35 @@ impl Yuv444 {
             self.colr.apply(&mut band);
             let start = (top - area.top) as usize * width * 3;
             let end = (bottom - area.top) as usize * width * 3;
-            crate::convert_heic_to_interleaved_rgb8_region_slice::<3>(
-                &band,
-                0,
-                0,
-                width,
-                (bottom - top) as usize,
-                &mut out[start..end],
-                crate::scale_heic_sample_to_image_rgb8,
-                "bounded RGB",
-            )
-            .map_err(conversion_error)?;
+            let output = &mut out[start..end];
+            match tone_map {
+                Some(tone_map) => {
+                    let mut samples = zeroed::<u16>(width * 3)?;
+                    for (row, output) in output.chunks_exact_mut(width * 3).enumerate() {
+                        crate::convert_heic_to_rgb_samples_region_slice(
+                            &band,
+                            0,
+                            row,
+                            width,
+                            1,
+                            &mut samples,
+                        )
+                        .map_err(conversion_error)?;
+                        tone_map.apply(&samples, output);
+                    }
+                }
+                None => crate::convert_heic_to_interleaved_rgb8_region_slice::<3>(
+                    &band,
+                    0,
+                    0,
+                    width,
+                    (bottom - top) as usize,
+                    output,
+                    crate::scale_heic_sample_to_image_rgb8,
+                    "bounded RGB",
+                )
+                .map_err(conversion_error)?,
+            }
             top = bottom;
         }
         Ok(())

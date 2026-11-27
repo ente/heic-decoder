@@ -12951,83 +12951,16 @@ fn convert_heic_to_interleaved_rgb8_region_slice<const CHANNELS: usize>(
     output_label: &str,
 ) -> Result<(), DecodeHeicError> {
     debug_assert!(matches!(CHANNELS, 3 | 4));
-    let ycbcr_transform =
-        ycbcr_transform_from_matrix(decoded.ycbcr_matrix).map_err(|matrix_coefficients| {
-            DecodeHeicError::UnsupportedMatrixCoefficients {
-                matrix_coefficients,
-            }
-        })?;
-
-    let bit_depth = heic_bit_depth_for_png_conversion(decoded)?;
-
-    validate_heic_plane_dimensions(&decoded.y_plane, decoded.width, decoded.height, "Y")?;
-    let expected_y_samples = heic_sample_count(decoded.width, decoded.height, "Y")?;
-    if decoded.y_plane.samples.len() != expected_y_samples {
-        return Err(DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "Y plane has {} samples, expected {expected_y_samples}",
-                decoded.y_plane.samples.len()
-            ),
-        });
-    }
-
-    let source_width =
-        usize::try_from(decoded.width).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-            detail: format!("HEIC width does not fit in usize ({})", decoded.width),
-        })?;
-    let source_height =
-        usize::try_from(decoded.height).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
-            detail: format!("HEIC height does not fit in usize ({})", decoded.height),
-        })?;
-    let source_x_end =
-        source_x_start
-            .checked_add(width)
-            .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                detail: format!("{output_label} source region x extent overflow"),
-            })?;
-    let source_y_end =
-        source_y_start
-            .checked_add(height)
-            .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-                detail: format!("{output_label} source region y extent overflow"),
-            })?;
-    if source_x_end > source_width || source_y_end > source_height {
-        return Err(DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "{output_label} source region ({source_x_start},{source_y_start}) {width}x{height} exceeds {}x{}",
-                decoded.width, decoded.height
-            ),
-        });
-    }
-    let output_len = width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(CHANNELS))
-        .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "{output_label} region output sample count overflow for {width}x{height}"
-            ),
-        })?;
-    if out.len() != output_len {
-        return Err(DecodeHeicError::InvalidDecodedFrame {
-            detail: format!(
-                "{output_label} output has {} samples, expected {output_len}",
-                out.len()
-            ),
-        });
-    }
-
-    let chroma = prepare_heic_chroma(decoded)?;
-    let chroma_midpoint = chroma_midpoint(bit_depth);
-    // Alpha does not change kernel selection: libheif's fixed-point
-    // Op_YCbCr420_to_RGB32 handles the with-alpha case.
-    let converter = PreparedYcbcrToRgb::new(
-        bit_depth,
-        decoded.ycbcr_range,
-        ycbcr_transform,
-        decoded.layout == HeicPixelLayout::Yuv420,
-    );
-    // 8-bit grayscale: libheif's Op_mono_to_RGB24_32 copies Y verbatim.
-    let mono_verbatim = matches!(chroma, HeicChromaPlanes::Monochrome) && bit_depth == 8;
+    let conversion = HeicRegionConversion::new(
+        decoded,
+        source_x_start,
+        source_y_start,
+        width,
+        height,
+        CHANNELS,
+        out.len(),
+        output_label,
+    )?;
 
     if let (
         HeicChromaPlanes::Color {
@@ -13037,13 +12970,13 @@ fn convert_heic_to_interleaved_rgb8_region_slice<const CHANNELS: usize>(
             layout: HeicPixelLayout::Yuv420,
         },
         PreparedYcbcrTransform::MatrixFull { coeffs, .. },
-    ) = (&chroma, converter.transform)
+    ) = (&conversion.chroma, conversion.converter.transform)
     {
         heic_decoder::hevc::color_convert::convert_420_8bit_region_to_interleaved(
-            &decoded.y_plane.samples,
+            conversion.y_samples,
             u_samples,
             v_samples,
-            source_width,
+            conversion.source_width,
             *chroma_width,
             source_x_start,
             source_y_start,
@@ -13065,21 +12998,21 @@ fn convert_heic_to_interleaved_rgb8_region_slice<const CHANNELS: usize>(
     // scalar implementation selected by the converter module. High-bit-depth
     // RGB8 has distinct image-crate rounding, so it stays on the established
     // loop below (the production RGBA16 hook is accelerated separately).
-    if bit_depth == 8
+    if conversion.bit_depth == 8
         && let HeicChromaPlanes::Color {
             u_samples,
             v_samples,
             chroma_width,
             layout,
-        } = &chroma
-        && let Some(params) = prepared_float_matrix_params(converter.transform)
+        } = &conversion.chroma
+        && let Some(params) = prepared_float_matrix_params(conversion.converter.transform)
     {
         let (subsample_x, subsample_y) = heic_chroma_subsampling(*layout);
         heic_decoder::hevc::color_convert::convert_float_matrix_8bit_region_to_interleaved(
-            &decoded.y_plane.samples,
+            conversion.y_samples,
             u_samples,
             v_samples,
-            source_width,
+            conversion.source_width,
             *chroma_width,
             subsample_x as usize,
             subsample_y as usize,
@@ -13094,50 +13027,207 @@ fn convert_heic_to_interleaved_rgb8_region_slice<const CHANNELS: usize>(
         return Ok(());
     }
 
-    for output_y in 0..height {
-        let source_y = source_y_start + output_y;
-        let row_start = source_y * source_width;
-        let out_row_start = output_y * width * CHANNELS;
+    conversion.convert::<u8, CHANNELS>(
+        source_x_start,
+        source_y_start,
+        width,
+        height,
+        out,
+        scale_sample,
+        u8::MAX,
+    );
+    Ok(())
+}
 
-        for output_x in 0..width {
-            let source_x = source_x_start + output_x;
-            let y_index = row_start + source_x;
-            let y_sample = i32::from(decoded.y_plane.samples[y_index]);
+fn convert_heic_to_rgb_samples_region_slice(
+    decoded: &DecodedHeicImage,
+    source_x_start: usize,
+    source_y_start: usize,
+    width: usize,
+    height: usize,
+    out: &mut [u16],
+) -> Result<(), DecodeHeicError> {
+    let conversion = HeicRegionConversion::new(
+        decoded,
+        source_x_start,
+        source_y_start,
+        width,
+        height,
+        3,
+        out.len(),
+        "RGB samples",
+    )?;
+    conversion.convert::<u16, 3>(
+        source_x_start,
+        source_y_start,
+        width,
+        height,
+        out,
+        |sample, _| sample,
+        u16::MAX,
+    );
+    Ok(())
+}
 
-            let (cb_sample, cr_sample) = match &chroma {
-                HeicChromaPlanes::Monochrome => (chroma_midpoint, chroma_midpoint),
-                HeicChromaPlanes::Color {
-                    u_samples,
-                    v_samples,
-                    chroma_width,
-                    layout,
-                } => {
-                    let chroma_index =
-                        heic_chroma_sample_index(source_x, source_y, *chroma_width, *layout);
-                    (
-                        i32::from(u_samples[chroma_index]),
-                        i32::from(v_samples[chroma_index]),
-                    )
+struct HeicRegionConversion<'a> {
+    bit_depth: u8,
+    source_width: usize,
+    y_samples: &'a [u16],
+    chroma: HeicChromaPlanes<'a>,
+    converter: PreparedYcbcrToRgb,
+}
+
+impl<'a> HeicRegionConversion<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        decoded: &'a DecodedHeicImage,
+        source_x_start: usize,
+        source_y_start: usize,
+        width: usize,
+        height: usize,
+        channels: usize,
+        actual_output_len: usize,
+        output_label: &str,
+    ) -> Result<Self, DecodeHeicError> {
+        let ycbcr_transform =
+            ycbcr_transform_from_matrix(decoded.ycbcr_matrix).map_err(|matrix_coefficients| {
+                DecodeHeicError::UnsupportedMatrixCoefficients {
+                    matrix_coefficients,
                 }
-            };
+            })?;
 
-            let (r, g, b) = if mono_verbatim {
-                let y_u16 = y_sample.clamp(0, 255) as u16;
-                (y_u16, y_u16, y_u16)
-            } else {
-                converter.convert(y_sample, cb_sample, cr_sample)
-            };
-            let out_index = out_row_start + (output_x * CHANNELS);
-            out[out_index] = scale_sample(r, bit_depth);
-            out[out_index + 1] = scale_sample(g, bit_depth);
-            out[out_index + 2] = scale_sample(b, bit_depth);
-            if CHANNELS == 4 {
-                out[out_index + 3] = u8::MAX;
+        let bit_depth = heic_bit_depth_for_png_conversion(decoded)?;
+
+        validate_heic_plane_dimensions(&decoded.y_plane, decoded.width, decoded.height, "Y")?;
+        let expected_y_samples = heic_sample_count(decoded.width, decoded.height, "Y")?;
+        if decoded.y_plane.samples.len() != expected_y_samples {
+            return Err(DecodeHeicError::InvalidDecodedFrame {
+                detail: format!(
+                    "Y plane has {} samples, expected {expected_y_samples}",
+                    decoded.y_plane.samples.len()
+                ),
+            });
+        }
+
+        let source_width =
+            usize::try_from(decoded.width).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+                detail: format!("HEIC width does not fit in usize ({})", decoded.width),
+            })?;
+        let source_height =
+            usize::try_from(decoded.height).map_err(|_| DecodeHeicError::InvalidDecodedFrame {
+                detail: format!("HEIC height does not fit in usize ({})", decoded.height),
+            })?;
+        let source_x_end = source_x_start.checked_add(width).ok_or_else(|| {
+            DecodeHeicError::InvalidDecodedFrame {
+                detail: format!("{output_label} source region x extent overflow"),
+            }
+        })?;
+        let source_y_end = source_y_start.checked_add(height).ok_or_else(|| {
+            DecodeHeicError::InvalidDecodedFrame {
+                detail: format!("{output_label} source region y extent overflow"),
+            }
+        })?;
+        if source_x_end > source_width || source_y_end > source_height {
+            return Err(DecodeHeicError::InvalidDecodedFrame {
+                detail: format!(
+                    "{output_label} source region ({source_x_start},{source_y_start}) {width}x{height} exceeds {}x{}",
+                    decoded.width, decoded.height
+                ),
+            });
+        }
+        let output_len = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(channels))
+            .ok_or_else(|| DecodeHeicError::InvalidDecodedFrame {
+                detail: format!(
+                    "{output_label} region output sample count overflow for {width}x{height}"
+                ),
+            })?;
+        if actual_output_len != output_len {
+            return Err(DecodeHeicError::InvalidDecodedFrame {
+                detail: format!(
+                    "{output_label} output has {actual_output_len} samples, expected {output_len}"
+                ),
+            });
+        }
+
+        let chroma = prepare_heic_chroma(decoded)?;
+        // Alpha does not change kernel selection: libheif's fixed-point
+        // Op_YCbCr420_to_RGB32 handles the with-alpha case.
+        let converter = PreparedYcbcrToRgb::new(
+            bit_depth,
+            decoded.ycbcr_range,
+            ycbcr_transform,
+            decoded.layout == HeicPixelLayout::Yuv420,
+        );
+        Ok(Self {
+            bit_depth,
+            source_width,
+            y_samples: &decoded.y_plane.samples,
+            chroma,
+            converter,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn convert<T: Copy, const CHANNELS: usize>(
+        &self,
+        source_x_start: usize,
+        source_y_start: usize,
+        width: usize,
+        height: usize,
+        out: &mut [T],
+        scale_sample: fn(u16, u8) -> T,
+        opaque: T,
+    ) {
+        let midpoint = chroma_midpoint(self.bit_depth);
+        // 8-bit grayscale: libheif's Op_mono_to_RGB24_32 copies Y verbatim.
+        let mono_verbatim =
+            matches!(self.chroma, HeicChromaPlanes::Monochrome) && self.bit_depth == 8;
+
+        for output_y in 0..height {
+            let source_y = source_y_start + output_y;
+            let row_start = source_y * self.source_width;
+            let out_row_start = output_y * width * CHANNELS;
+
+            for output_x in 0..width {
+                let source_x = source_x_start + output_x;
+                let y_index = row_start + source_x;
+                let y_sample = i32::from(self.y_samples[y_index]);
+
+                let (cb_sample, cr_sample) = match &self.chroma {
+                    HeicChromaPlanes::Monochrome => (midpoint, midpoint),
+                    HeicChromaPlanes::Color {
+                        u_samples,
+                        v_samples,
+                        chroma_width,
+                        layout,
+                    } => {
+                        let chroma_index =
+                            heic_chroma_sample_index(source_x, source_y, *chroma_width, *layout);
+                        (
+                            i32::from(u_samples[chroma_index]),
+                            i32::from(v_samples[chroma_index]),
+                        )
+                    }
+                };
+
+                let (r, g, b) = if mono_verbatim {
+                    let y_u16 = y_sample.clamp(0, 255) as u16;
+                    (y_u16, y_u16, y_u16)
+                } else {
+                    self.converter.convert(y_sample, cb_sample, cr_sample)
+                };
+                let out_index = out_row_start + (output_x * CHANNELS);
+                out[out_index] = scale_sample(r, self.bit_depth);
+                out[out_index + 1] = scale_sample(g, self.bit_depth);
+                out[out_index + 2] = scale_sample(b, self.bit_depth);
+                if CHANNELS == 4 {
+                    out[out_index + 3] = opaque;
+                }
             }
         }
     }
-
-    Ok(())
 }
 
 fn convert_heic_to_rgba16(decoded: &DecodedHeicImage) -> Result<Vec<u16>, DecodeHeicError> {

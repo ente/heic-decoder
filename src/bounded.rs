@@ -135,24 +135,13 @@ pub fn decode_bounded(
     let grid = grid::Grid::preflight(&index, &mut source, &budget)?;
     let layout = resample::Layout::new(&grid, options.max_side)?;
     let first = &grid.tiles[0];
-    let mut color = first.color.clone();
-    if grid
-        .properties
-        .color
-        .nclx
-        .as_ref()
-        .is_some_and(|n| !n.is_undefined())
-    {
-        color.nclx = grid.properties.color.nclx.clone();
-    }
-    if grid.properties.color.icc.is_some() {
-        color.icc = grid.properties.color.icc;
-    }
+    let color = first.color.overridden_by(&grid.properties.color);
     let yuv444 = chroma::Yuv444::new(&grid, &color)?;
     let transform = color::ColorTransform::new(
         &color,
         first.geometry.primaries,
         first.geometry.transfer,
+        first.geometry.bit_depth,
         &budget,
     )?;
     let mut accumulator = resample::Accumulator::new(layout, &budget)?;
@@ -256,7 +245,7 @@ pub fn decode_bounded(
         image: DecodedRgbImage {
             width: layout.display_width,
             height: layout.display_height,
-            source_bit_depth: 8,
+            source_bit_depth: first.geometry.bit_depth,
             pixels: output.into_vec(),
             icc_profile: None,
         },
@@ -488,8 +477,8 @@ fn render_tile(
     let mut decoded = crate::DecodedHeicImage {
         width: frame.width,
         height: frame.height,
-        bit_depth_luma: 8,
-        bit_depth_chroma: 8,
+        bit_depth_luma: tile.geometry.bit_depth,
+        bit_depth_chroma: tile.geometry.bit_depth,
         layout: crate::HeicPixelLayout::Yuv420,
         ycbcr_range: if frame.full_range {
             crate::YCbCrRange::Full
@@ -526,14 +515,33 @@ fn render_tile(
     if let Some(matrix) = crate::ycbcr_matrix_override_from_primary_colr(&colr) {
         decoded.ycbcr_matrix = matrix;
     }
-    let mut rgb =
-        resample::zeroed(tile.geometry.width as usize * tile.geometry.height as usize * 3)?;
+    let left = tile.geometry.crop[0] as usize;
+    let top = tile.geometry.crop[2] as usize;
+    let width = tile.geometry.width as usize;
+    let height = tile.geometry.height as usize;
+    let mut rgb = resample::zeroed(width * height * 3)?;
+    if let Some(tone_map) = transform.tone_map() {
+        let mut samples = resample::zeroed(width * 3)?;
+        for (row, output) in rgb.chunks_exact_mut(width * 3).enumerate() {
+            crate::convert_heic_to_rgb_samples_region_slice(
+                &decoded,
+                left,
+                top + row,
+                width,
+                1,
+                &mut samples,
+            )
+            .map_err(|_| BoundedDecodeError::Unsupported("tile YCbCr conversion"))?;
+            tone_map.apply(&samples, output);
+        }
+        return Ok(rgb);
+    }
     crate::convert_heic_to_interleaved_rgb8_region_slice::<3>(
         &decoded,
-        tile.geometry.crop[0] as usize,
-        tile.geometry.crop[2] as usize,
-        tile.geometry.width as usize,
-        tile.geometry.height as usize,
+        left,
+        top,
+        width,
+        height,
         &mut rgb,
         crate::scale_heic_sample_to_image_rgb8,
         "bounded RGB",
@@ -558,9 +566,13 @@ fn render_yuv444(
             halo: &job.halo,
         },
         job.unit,
+        transform.tone_map(),
         &mut rgb,
     )?;
     drop(frame);
+    if transform.tone_map().is_some() {
+        return Ok(rgb);
+    }
     apply_color(rgb, transform)
 }
 
