@@ -121,6 +121,11 @@ These are useful for tooling and specialized pipelines, but most applications
 should use the core entry points above.
 
 - `decode_primary_avif_to_image(input)` -> `Result<DecodedAvifImage, DecodeAvifError>`
+  - `ycbcr_range` and `ycbcr_matrix` come from the item's `colr` nclx
+    property, or from the AV1 sequence header when the item has none, as in
+    libheif. Earlier versions reported full range with unspecified
+    coefficients when the item had no nclx property, and the RGBA decode
+    converted such items that way.
 - `assemble_primary_heic_hevc_stream(input)` -> `Result<Vec<u8>, DecodeHeicError>`
 - `decode_primary_heic_to_image(input)` -> `Result<DecodedHeicImage, DecodeHeicError>`
 - `decode_primary_heic_to_metadata(input)` -> `Result<DecodedHeicImageMetadata, DecodeHeicError>`
@@ -263,13 +268,14 @@ any of these, each judged at the size the image has when it applies:
 - on 4:2:2, any 90° or 270° `irot`, a 180° `irot` of an odd height, or a
   left-right `imir` (axis 1) of an odd width.
 
-The HEVC decode paths do the same. Transforms before the conversion run on the
-subsampled planes in property order, as in libheif; for example, a 180°
+The HEVC and AVIF decode paths do the same. Transforms before the conversion
+run on the subsampled planes in property order, as in libheif; for example, a 180°
 `irot` of an odd-width 4:2:2 image rotates its half-width chroma planes without
 converting them. If the coded colour is limited range, the conversion then
 passes the image through RGB to full-range 4:4:4, as libheif does. The coded
-stream's colour drives that conversion; a `colr` nclx property replaces it only
-after all transforms. The same applies to primary items, to grids as a whole,
+stream's colour drives that conversion: the HEVC VUI, or the AV1 sequence
+header's `color_config`. A `colr` nclx property replaces it only after all
+transforms. The same applies to primary items, to grids as a whole,
 and to the clean apertures of individual grid tiles. A grid whose tile crops
 convert some tiles but not others is rejected with `DecodedLayoutMismatch`,
 because its tiles no longer share one chroma format; libheif rejects it too.
@@ -277,7 +283,9 @@ For primary items and whole grids, the 4:4:4 image is built a few rows at a
 time while converting to RGB, so it is never held at full size. A grid that
 needs the conversion, or a transform of its subsampled planes, is first
 assembled into one canvas, which stays in memory alongside the output, instead
-of being converted tile by tile. Image edges use clamped interpolation,
+of being converted tile by tile. An 8-bit AVIF item that needs the conversion
+has its planes widened to 16-bit samples first, which doubles the memory they
+take during the decode. Image edges use clamped interpolation,
 matching libheif after its 2026-10 border fix. The pinned libheif 1.21.2
 validator differs on output rows or columns that keep an edge of the converted
 image.
@@ -463,48 +471,51 @@ The primary item may be a grid of uniform HEVC tiles or a single HEVC image
 with one IDR slice, and a `pixi` property must match the coded bit depth; WPP
 is supported. A single image is decoded as a grid with one tile.
 `clap`/`irot`/`imir` are applied, and Exif orientation applies when no
-effective container orientation is present. Container transforms for which
-libheif first converts 4:2:0 chroma to 4:4:4 return `Unsupported`. Each is
-judged at the size the image has when it applies: a `clap` with an odd left or
-top edge, an anticlockwise 90° rotation (`irot` 1) of an odd width, a 180°
-rotation with either side odd, an anticlockwise 270° rotation (`irot` 3) of an
-odd height, or a mirror with either side odd. A display area that starts on an
-odd source row or column is also refused, which is stricter than libheif when
-a rotation or mirror comes before the crop. RGB matrix/TRC ICC profiles and
-SDR nclx colour with BT.709, BT.2020 or Display P3 primaries are converted to
-sRGB, and PQ or HLG colour is tone mapped to sRGB as described below.
-Grayscale ICC profiles, lookup-table ICC profiles without a PQ or HLG `cicp`
-tag, unprofiled wide-gamut SDR HEVC colour, matrix coefficients 8, 11, 14
-(ICtCp) or 16, PQ or HLG in the nclx or HEVC VUI when higher-precedence colour
-says otherwise, alpha, and unknown required auxiliaries return errors. Known
-depth, semantic matte, and gain-map auxiliaries are ignored, so an Apple
-gain-map HDR photo decodes as its SDR base image.
+effective container orientation is present. When a container transform makes
+libheif convert 4:2:0 chroma to 4:4:4 (the 4:2:0 rules under Container
+transforms above), the output matches the regular decoders: bilinear chroma
+with clamped edges, the limited-range round trip through RGB, and the `colr`
+nclx override after all transforms, at the coded bit depth. The 4:4:4 samples
+are built a band of rows at a time while each tile is converted to RGB, so no
+full-size 4:4:4 image is held. Grid tiles are then converted in units shifted
+one pixel up and left, so each unit needs only the last chroma row and column
+of tiles decoded before it; those edges are kept in strips as wide as the
+canvas. Clean apertures, rotations and mirrors on individual grid tiles are
+refused. RGB matrix/TRC ICC profiles and SDR nclx colour with BT.709, BT.2020
+or Display P3 primaries are converted to sRGB, and PQ or HLG colour is tone
+mapped to sRGB as described below. Grayscale ICC profiles, lookup-table ICC
+profiles without a PQ or HLG `cicp` tag, unprofiled wide-gamut SDR HEVC colour,
+matrix coefficients 8, 11, 14 (ICtCp) or 16, PQ or HLG in the nclx or HEVC VUI
+when higher-precedence colour says otherwise, alpha, and unknown required
+auxiliaries return errors. Known depth, semantic matte, and gain-map
+auxiliaries are ignored, so an Apple gain-map HDR photo decodes as its SDR base
+image.
 
 PQ (transfer 16) and HLG (transfer 18) are taken from the `cicp` tag of an RGB
 ICC profile, whatever its other tags, otherwise from the container nclx,
-otherwise, when the container has no colour, from the HEVC VUI. Their
-primaries must be BT.709, BT.2020 or Display P3; unspecified primaries are
-treated as BT.2020. Samples are converted to display light with 203 cd/m² as
-SDR reference white: PQ directly, and HLG through the BT.2100 OOTF for a
-1000 cd/m² display, so 75% HLG is also 203 cd/m². The colour is converted to
-BT.709 primaries with negative components clipped, and the BT.2390 EETF is
-applied to the largest component so that the source peak becomes SDR white.
-The source peak is the `clli` maximum
-content light level, otherwise the `mdcv` maximum mastering luminance, each
-taken from the primary item or else its first tile, otherwise 1000 cd/m²,
-limited to 203 through 10000 cd/m²; HLG always uses 1000 cd/m². A `clli` or
-`mdcv` box of the wrong size is ignored, a repeated one does not replace the
-first, and grid tiles may carry different ones. With a 1000 cd/m² peak, light
-up to about 88 cd/m² is unchanged, reference white encodes as 229 of 255, and
-brighter light rolls off to 255. The output is sRGB-encoded without an ICC
-profile, and `source_bit_depth` reports the coded bit depth. The other decode
-functions do not tone map: they return the HDR samples with the container's
-embedded ICC profile or one made from its nclx, so with no profile when only
-the HEVC VUI signals PQ or HLG.
+otherwise, when the container has no colour, from the HEVC VUI. Their primaries
+must be BT.709, BT.2020 or Display P3; unspecified primaries are treated as
+BT.2020. Samples are converted to display light with 203 cd/m² as SDR reference
+white: PQ directly, and HLG through the BT.2100 OOTF for a 1000 cd/m² display,
+so 75% HLG is also 203 cd/m². The colour is converted to BT.709 primaries with
+negative components clipped, and the BT.2390 EETF is applied to the largest
+component so that the source peak becomes SDR white. The source peak is the
+`clli` maximum content light level, otherwise the `mdcv` maximum mastering
+luminance, each taken from the primary item or else its first tile, otherwise
+1000 cd/m², limited to 203 through 10000 cd/m²; HLG always uses 1000 cd/m². A
+`clli` or `mdcv` box of the wrong size or with a zero value is ignored, a
+repeated one does not replace the first, and grid tiles may carry different
+ones. With a 1000 cd/m² peak, light up to about 88 cd/m² is unchanged,
+reference white encodes as 229 of 255, and brighter light rolls off to 255. The
+output is sRGB-encoded without an ICC profile, and `source_bit_depth` reports
+the coded bit depth. The other decode functions do not tone map: they return
+the HDR samples with the container's embedded ICC profile or one made from its
+nclx, so with no profile when only the HEVC VUI signals PQ or HLG.
 
 Before any pixel decoding, preflight reads every coded item's headers and
 reserves its reconstruction workspace, and admission then reserves the output
-together with the largest tile workspace. Inputs that do not fit return
+together with the largest tile workspace, which includes the 4:4:4 band
+buffers when the conversion applies. Inputs that do not fit return
 `MemoryBudgetExceeded` or `LimitExceeded` without decoding pixels. Grid tiles
 decode one at a time, or concurrently with `parallel-grid` when the budget
 allows. A single image's full-resolution reconstruction must fit the budget at
@@ -543,9 +554,9 @@ payloads. Use Path input when avoiding a caller-owned compressed input buffer
 is also important.
 
 This first subset retains limits of 16384 per coded side, 256 million display
-pixels, bounded metadata, and a 64 KiB slice-header prefix. It supports one
-clean-aperture crop before orientation, with chroma interpolation for odd
-origins on a single coded image or one-tile grid. Odd-origin crops across
-multiple grid items and repeated crops or crops after orientation are
-unsupported. Exif orientation applies when no effective container orientation
-is present. `decoder-tracing` disables bounded decoding.
+pixels, bounded metadata, and a 64 KiB slice-header prefix. It applies
+`clap`/`irot`/`imir` in property order and converts to 4:4:4 like
+`decode_bounded` on a single coded image or a one-tile grid. Grids of several
+coded items that need the 4:4:4 conversion return `Unsupported`. Exif
+orientation applies when no effective container orientation is present.
+`decoder-tracing` disables bounded decoding.

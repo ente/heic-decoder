@@ -1312,7 +1312,10 @@ fn decode_primary_avif_to_image_internal(
     source: &mut Option<&mut dyn RandomAccessSource>,
 ) -> Result<DecodedAvifImage, DecodeAvifError> {
     let (meta, resolved) = isobmff::resolve_primary_avif_item_graph(input)?;
-    decode_primary_avif_to_image_from_resolved_graph(input, source, &meta, &resolved, None)
+    let (mut decoded, colr) =
+        decode_primary_avif_to_image_from_resolved_graph(input, source, &meta, &resolved, None)?;
+    colr.apply_to_avif(&mut decoded);
+    Ok(decoded)
 }
 
 fn decode_primary_avif_to_image_from_resolved_graph(
@@ -1321,7 +1324,7 @@ fn decode_primary_avif_to_image_from_resolved_graph(
     meta: &isobmff::MetaBox<'_>,
     resolved: &isobmff::ResolvedPrimaryItemGraph<'_>,
     max_pixels: Option<u64>,
-) -> Result<DecodedAvifImage, DecodeAvifError> {
+) -> Result<(DecodedAvifImage, HeicColrOverride), DecodeAvifError> {
     let item_id = resolved.primary_item.item_id;
     let item_type = resolved
         .primary_item
@@ -1346,8 +1349,7 @@ fn decode_primary_avif_to_image_from_resolved_graph(
     let properties =
         isobmff::parse_primary_avif_item_preflight_properties_from_resolved_graph(resolved)
             .map_err(DecodeAvifError::ParsePrimaryProperties)?;
-    let ycbcr_range = ycbcr_range_from_primary_colr(&properties.colr);
-    let ycbcr_matrix = ycbcr_matrix_from_primary_colr(&properties.colr);
+    let colr = HeicColrOverride::from_colr(&properties.colr);
     let mut elementary_stream = properties.av1c.config_obus;
     elementary_stream.extend_from_slice(&payload);
 
@@ -1356,8 +1358,6 @@ fn decode_primary_avif_to_image_from_resolved_graph(
         Some((properties.ispe.width, properties.ispe.height)),
         max_pixels,
     )?;
-    decoded.ycbcr_range = ycbcr_range;
-    decoded.ycbcr_matrix = ycbcr_matrix;
     if decoded.width != properties.ispe.width || decoded.height != properties.ispe.height {
         return Err(DecodeAvifError::DecodedGeometryMismatch {
             expected_width: properties.ispe.width,
@@ -1377,7 +1377,7 @@ fn decode_primary_avif_to_image_from_resolved_graph(
         max_pixels,
     );
 
-    Ok(decoded)
+    Ok((decoded, colr))
 }
 
 pub fn assemble_primary_heic_hevc_stream(input: &[u8]) -> Result<Vec<u8>, DecodeHeicError> {
@@ -6593,6 +6593,15 @@ impl HeicColrOverride {
             decoded.ycbcr_matrix = ycbcr_matrix;
         }
     }
+
+    fn apply_to_avif(self, decoded: &mut DecodedAvifImage) {
+        if let Some(ycbcr_range) = self.ycbcr_range {
+            decoded.ycbcr_range = ycbcr_range;
+        }
+        if let Some(ycbcr_matrix) = self.ycbcr_matrix {
+            decoded.ycbcr_matrix = ycbcr_matrix;
+        }
+    }
 }
 
 const HEIC_YUV444_BAND_PIXELS: u32 = 1 << 18;
@@ -8655,7 +8664,7 @@ fn decode_avif_to_rgba_from_resolved_graph(
     let transforms = isobmff::parse_primary_item_transform_properties_from_resolved_graph(resolved)
         .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
     let icc_profile = primary_icc_profile_from_resolved_avif_graph(resolved);
-    let decoded = decode_primary_avif_to_image_from_resolved_graph(
+    let (decoded, colr) = decode_primary_avif_to_image_from_resolved_graph(
         input,
         source,
         meta,
@@ -8663,7 +8672,7 @@ fn decode_avif_to_rgba_from_resolved_graph(
         guardrails.max_pixels,
     )?;
     guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
-    decoded_avif_to_rgba_image(&decoded, &transforms.transforms, icc_profile)
+    decoded_avif_to_rgba_image(decoded, colr, &transforms.transforms, icc_profile)
 }
 
 fn decode_avif_source_to_rgba<S: RandomAccessSource>(
@@ -9910,7 +9919,7 @@ fn decode_avif_bytes_to_rgba8_slice(
         isobmff::parse_primary_item_transform_properties_from_resolved_graph(&resolved)
             .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
     let mut source: Option<&mut dyn RandomAccessSource> = None;
-    let decoded = decode_primary_avif_to_image_from_resolved_graph(
+    let (decoded, colr) = decode_primary_avif_to_image_from_resolved_graph(
         input,
         &mut source,
         &meta,
@@ -9918,7 +9927,7 @@ fn decode_avif_bytes_to_rgba8_slice(
         guardrails.max_pixels,
     )?;
     guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
-    decoded_avif_to_rgba8_slice(&decoded, &transforms.transforms, out)
+    decoded_avif_to_rgba8_slice(decoded, colr, &transforms.transforms, out)
 }
 
 #[cfg(feature = "image-integration")]
@@ -9933,7 +9942,7 @@ fn decode_avif_bytes_to_rgba16_native_endian_bytes(
         isobmff::parse_primary_item_transform_properties_from_resolved_graph(&resolved)
             .map_err(DecodeAvifError::ParsePrimaryTransforms)?;
     let mut source: Option<&mut dyn RandomAccessSource> = None;
-    let decoded = decode_primary_avif_to_image_from_resolved_graph(
+    let (decoded, colr) = decode_primary_avif_to_image_from_resolved_graph(
         input,
         &mut source,
         &meta,
@@ -9941,13 +9950,13 @@ fn decode_avif_bytes_to_rgba16_native_endian_bytes(
         guardrails.max_pixels,
     )?;
     guardrails.enforce_pixel_count(decoded.width, decoded.height)?;
-    let mut output = NativeEndianRgba16Output(out);
-    decoded_avif_to_rgba16_output(&decoded, &transforms.transforms, &mut output)
+    decoded_avif_to_rgba16_native_endian_bytes(decoded, colr, &transforms.transforms, out)
 }
 
 #[cfg(feature = "image-integration")]
 fn decoded_avif_to_rgba8_slice(
-    decoded: &DecodedAvifImage,
+    mut decoded: DecodedAvifImage,
+    colr: HeicColrOverride,
     transforms: &[isobmff::PrimaryItemTransformProperty],
     out: &mut [u8],
 ) -> Result<(), DecodeError> {
@@ -9956,11 +9965,15 @@ fn decoded_avif_to_rgba8_slice(
             "AVIF storage is RGBA16, not RGBA8".to_string(),
         ));
     }
-    let mut output = SliceRgbaOutput(out);
+    if avif_needs_libheif_yuv_transforms(&decoded, transforms) {
+        let (decoded, alpha) = avif_into_heic_planes(decoded)?;
+        return decoded_heic_to_rgba8_slice(decoded, colr, transforms, alpha.as_ref(), out);
+    }
+    colr.apply_to_avif(&mut decoded);
     decoded_avif_to_rgba_output(
-        decoded,
+        &decoded,
         transforms,
-        &mut output,
+        &mut SliceRgbaOutput(out),
         "AVIF direct transformed RGBA8 image adapter output",
         plane_samples_u8,
         avif_auxiliary_alpha_sample_to_u8,
@@ -9970,20 +9983,32 @@ fn decoded_avif_to_rgba8_slice(
 }
 
 #[cfg(feature = "image-integration")]
-fn decoded_avif_to_rgba16_output<O: RgbaSampleOutput<u16>>(
-    decoded: &DecodedAvifImage,
+fn decoded_avif_to_rgba16_native_endian_bytes(
+    mut decoded: DecodedAvifImage,
+    colr: HeicColrOverride,
     transforms: &[isobmff::PrimaryItemTransformProperty],
-    out: &mut O,
+    out: &mut [u8],
 ) -> Result<(), DecodeError> {
     if decoded.bit_depth <= 8 {
         return Err(DecodeError::Unsupported(
             "AVIF storage is RGBA8, not RGBA16".to_string(),
         ));
     }
+    if avif_needs_libheif_yuv_transforms(&decoded, transforms) {
+        let (decoded, alpha) = avif_into_heic_planes(decoded)?;
+        return decoded_heic_to_rgba16_native_endian_bytes(
+            decoded,
+            colr,
+            transforms,
+            alpha.as_ref(),
+            out,
+        );
+    }
+    colr.apply_to_avif(&mut decoded);
     decoded_avif_to_rgba_output(
-        decoded,
+        &decoded,
         transforms,
-        out,
+        &mut NativeEndianRgba16Output(out),
         "AVIF direct transformed RGBA16 image adapter output",
         plane_samples_u16,
         avif_auxiliary_alpha_sample_to_u16,
@@ -11423,10 +11448,17 @@ fn colour_primaries_from_index(primaries_idx: u16) -> Option<ColourPrimaries> {
 }
 
 fn decoded_avif_to_rgba_image(
-    decoded: &DecodedAvifImage,
+    mut decoded: DecodedAvifImage,
+    colr: HeicColrOverride,
     transforms: &[isobmff::PrimaryItemTransformProperty],
     icc_profile: Option<Vec<u8>>,
 ) -> Result<DecodedRgbaImage, DecodeError> {
+    if avif_needs_libheif_yuv_transforms(&decoded, transforms) {
+        let (decoded, alpha) = avif_into_heic_planes(decoded)?;
+        return decoded_heic_to_rgba_image(decoded, colr, transforms, alpha.as_ref(), icc_profile);
+    }
+    colr.apply_to_avif(&mut decoded);
+    let decoded = &decoded;
     if decoded.bit_depth <= 8 {
         let pixels = convert_avif_to_rgba8(decoded)?;
         let (width, height, transformed) =
@@ -11450,6 +11482,101 @@ fn decoded_avif_to_rgba_image(
         pixels: DecodedRgbaPixels::U16(transformed),
         icc_profile,
     })
+}
+
+fn heic_layout_from_avif(layout: AvifPixelLayout) -> HeicPixelLayout {
+    match layout {
+        AvifPixelLayout::Yuv400 => HeicPixelLayout::Yuv400,
+        AvifPixelLayout::Yuv420 => HeicPixelLayout::Yuv420,
+        AvifPixelLayout::Yuv422 => HeicPixelLayout::Yuv422,
+        AvifPixelLayout::Yuv444 => HeicPixelLayout::Yuv444,
+    }
+}
+
+fn avif_needs_libheif_yuv_transforms(
+    decoded: &DecodedAvifImage,
+    transforms: &[isobmff::PrimaryItemTransformProperty],
+) -> bool {
+    yuv_transforms::libheif_yuv_transform_count(
+        heic_layout_from_avif(decoded.layout),
+        decoded.width,
+        decoded.height,
+        transforms,
+    ) > 0
+}
+
+fn avif_into_heic_planes(
+    decoded: DecodedAvifImage,
+) -> Result<(DecodedHeicImage, Option<HeicAuxiliaryAlphaPlane>), DecodeError> {
+    let DecodedAvifImage {
+        width,
+        height,
+        bit_depth,
+        layout,
+        ycbcr_range,
+        ycbcr_matrix,
+        y_plane,
+        u_plane,
+        v_plane,
+        alpha_plane,
+    } = decoded;
+    let plane = |plane: AvifPlane, label| {
+        Ok::<_, DecodeError>(HeicPlane {
+            width: plane.width,
+            height: plane.height,
+            samples: avif_samples_into_u16(plane.samples, bit_depth, label)?,
+        })
+    };
+    let alpha = alpha_plane
+        .map(|alpha| {
+            Ok::<_, DecodeError>(HeicAuxiliaryAlphaPlane {
+                width: alpha.width,
+                height: alpha.height,
+                bit_depth: alpha.bit_depth,
+                samples: avif_samples_into_u16(alpha.samples, alpha.bit_depth, "A")?,
+            })
+        })
+        .transpose()?;
+    let decoded = DecodedHeicImage {
+        width,
+        height,
+        bit_depth_luma: bit_depth,
+        bit_depth_chroma: bit_depth,
+        layout: heic_layout_from_avif(layout),
+        ycbcr_range,
+        ycbcr_matrix,
+        y_plane: plane(y_plane, "Y")?,
+        u_plane: u_plane.map(|u_plane| plane(u_plane, "U")).transpose()?,
+        v_plane: v_plane.map(|v_plane| plane(v_plane, "V")).transpose()?,
+    };
+    Ok((decoded, alpha))
+}
+
+fn avif_samples_into_u16(
+    samples: AvifPlaneSamples,
+    bit_depth: u8,
+    plane: &'static str,
+) -> Result<Vec<u16>, DecodeError> {
+    match samples {
+        AvifPlaneSamples::U8(samples) if bit_depth <= 8 => {
+            let mut widened = try_rgba_buffer(samples.len(), "AVIF plane widening")?;
+            widened.extend(samples.into_iter().map(u16::from));
+            Ok(widened)
+        }
+        AvifPlaneSamples::U16(samples) if bit_depth > 8 => Ok(samples),
+        AvifPlaneSamples::U8(_) => Err(DecodeAvifError::PlaneSampleTypeMismatch {
+            plane,
+            expected: "u16",
+            actual: "u8",
+        }
+        .into()),
+        AvifPlaneSamples::U16(_) => Err(DecodeAvifError::PlaneSampleTypeMismatch {
+            plane,
+            expected: "u8",
+            actual: "u16",
+        }
+        .into()),
+    }
 }
 
 fn decoded_heic_to_rgba_image(
@@ -14221,13 +14348,32 @@ fn picture_to_internal_image(picture: &Dav1dPicture) -> Result<DecodedAvifImage,
         }
     };
 
+    let (ycbcr_range, ycbcr_matrix) = picture.seq_hdr.map_or(
+        (YCbCrRange::Full, YCbCrMatrixCoefficients::default()),
+        |sequence_header| {
+            // SAFETY: the picture keeps its sequence header alive until it is unreferenced.
+            let sequence_header = unsafe { sequence_header.as_ref() };
+            (
+                if sequence_header.color_range == 0 {
+                    YCbCrRange::Limited
+                } else {
+                    YCbCrRange::Full
+                },
+                YCbCrMatrixCoefficients {
+                    matrix_coefficients: sequence_header.mtrx as u16,
+                    colour_primaries: sequence_header.pri as u16,
+                },
+            )
+        },
+    );
+
     Ok(DecodedAvifImage {
         width,
         height,
         bit_depth,
         layout,
-        ycbcr_range: YCbCrRange::Full,
-        ycbcr_matrix: YCbCrMatrixCoefficients::default(),
+        ycbcr_range,
+        ycbcr_matrix,
         y_plane,
         u_plane,
         v_plane,
@@ -15710,6 +15856,216 @@ mod tests {
         assert_eq!(decoded16, owned16);
     }
 
+    fn avif_image(image: &super::DecodedHeicImage) -> super::DecodedAvifImage {
+        let bit_depth = image.bit_depth_luma;
+        let plane = |plane: &super::HeicPlane| super::AvifPlane {
+            width: plane.width,
+            height: plane.height,
+            samples: if bit_depth <= 8 {
+                super::AvifPlaneSamples::U8(
+                    plane.samples.iter().map(|&sample| sample as u8).collect(),
+                )
+            } else {
+                super::AvifPlaneSamples::U16(plane.samples.clone())
+            },
+        };
+        super::DecodedAvifImage {
+            width: image.width,
+            height: image.height,
+            bit_depth,
+            layout: match image.layout {
+                super::HeicPixelLayout::Yuv400 => super::AvifPixelLayout::Yuv400,
+                super::HeicPixelLayout::Yuv420 => super::AvifPixelLayout::Yuv420,
+                super::HeicPixelLayout::Yuv422 => super::AvifPixelLayout::Yuv422,
+                super::HeicPixelLayout::Yuv444 => super::AvifPixelLayout::Yuv444,
+            },
+            ycbcr_range: image.ycbcr_range,
+            ycbcr_matrix: image.ycbcr_matrix,
+            y_plane: plane(&image.y_plane),
+            u_plane: image.u_plane.as_ref().map(plane),
+            v_plane: image.v_plane.as_ref().map(plane),
+            alpha_plane: None,
+        }
+    }
+
+    fn bt2020_full_range_colr() -> super::HeicColrOverride {
+        super::HeicColrOverride {
+            ycbcr_range: Some(super::YCbCrRange::Full),
+            ycbcr_matrix: Some(super::YCbCrMatrixCoefficients {
+                matrix_coefficients: 9,
+                colour_primaries: 9,
+            }),
+        }
+    }
+
+    #[test]
+    fn avif_transforms_follow_the_libheif_yuv_conversion_of_heic() {
+        use super::HeicPixelLayout::{Yuv420, Yuv422};
+        use isobmff::ImageMirrorDirection::Horizontal;
+        let odd_crop =
+            isobmff::PrimaryItemTransformProperty::CleanAperture(synthetic_clean_aperture(-1, -1));
+        let odd_left_crop =
+            isobmff::PrimaryItemTransformProperty::CleanAperture(synthetic_clean_aperture(-1, 0));
+        let aligned_crop =
+            isobmff::PrimaryItemTransformProperty::CleanAperture(synthetic_clean_aperture(0, 0));
+        let colr = bt2020_full_range_colr();
+        for bit_depth in [8, 10] {
+            for (layout, width, height, transform, matches_rgba_transforms) in [
+                (Yuv420, 8, 8, odd_crop, false),
+                (Yuv422, 8, 8, odd_left_crop, false),
+                (Yuv420, 7, 6, rotation(90), false),
+                (Yuv420, 6, 7, mirror(Horizontal), false),
+                (Yuv422, 6, 6, rotation(270), false),
+                (Yuv422, 7, 6, rotation(180), false),
+                (Yuv420, 8, 8, aligned_crop, true),
+                (Yuv420, 7, 6, rotation(270), true),
+            ] {
+                let context = format!("{bit_depth}-bit {layout:?} {width}x{height} {transform:?}");
+                let image = super::DecodedHeicImage {
+                    bit_depth_luma: bit_depth,
+                    bit_depth_chroma: bit_depth,
+                    ..patterned_yuv_image(layout, width, height)
+                };
+                let transforms = [transform];
+                let heic =
+                    super::decoded_heic_to_rgba_image(image.clone(), colr, &transforms, None, None)
+                        .expect("HEIC decode should succeed");
+                let avif =
+                    super::decoded_avif_to_rgba_image(avif_image(&image), colr, &transforms, None)
+                        .expect("AVIF decode should succeed");
+                assert_eq!(avif, heic, "{context}");
+
+                let mut relabelled = avif_image(&image);
+                colr.apply_to_avif(&mut relabelled);
+                let nearest = super::decoded_avif_to_rgba_image(
+                    relabelled,
+                    super::HeicColrOverride::default(),
+                    &[],
+                    None,
+                )
+                .expect("untransformed AVIF decode should succeed");
+                let nearest = match nearest.pixels {
+                    super::DecodedRgbaPixels::U8(pixels) => super::DecodedRgbaPixels::U8(
+                        super::apply_primary_item_transforms_rgba(
+                            width,
+                            height,
+                            pixels,
+                            &transforms,
+                        )
+                        .expect("RGBA transform should succeed")
+                        .2,
+                    ),
+                    super::DecodedRgbaPixels::U16(pixels) => super::DecodedRgbaPixels::U16(
+                        super::apply_primary_item_transforms_rgba(
+                            width,
+                            height,
+                            pixels,
+                            &transforms,
+                        )
+                        .expect("RGBA transform should succeed")
+                        .2,
+                    ),
+                };
+                assert_eq!(avif.pixels == nearest, matches_rgba_transforms, "{context}");
+            }
+        }
+    }
+
+    #[cfg(feature = "image-integration")]
+    #[test]
+    fn avif_converting_transform_slice_decodes_match_owned_decodes() {
+        let transforms = [
+            rotation(90),
+            mirror(isobmff::ImageMirrorDirection::Horizontal),
+        ];
+        let colr = bt2020_full_range_colr();
+        for bit_depth in [8_u8, 10] {
+            let image = super::DecodedHeicImage {
+                bit_depth_luma: bit_depth,
+                bit_depth_chroma: bit_depth,
+                ..patterned_yuv_image(super::HeicPixelLayout::Yuv420, 7, 6)
+            };
+            let alpha = super::HeicAuxiliaryAlphaPlane {
+                width: 7,
+                height: 6,
+                bit_depth,
+                samples: (0..42).map(|index| index * 5).collect(),
+            };
+            let mut avif = avif_image(&image);
+            avif.alpha_plane = Some(super::AvifAuxiliaryAlphaPlane {
+                width: 7,
+                height: 6,
+                bit_depth,
+                samples: avif_image(&super::DecodedHeicImage {
+                    y_plane: super::HeicPlane {
+                        width: 7,
+                        height: 6,
+                        samples: alpha.samples.clone(),
+                    },
+                    ..image.clone()
+                })
+                .y_plane
+                .samples,
+            });
+            let owned = super::decoded_avif_to_rgba_image(avif.clone(), colr, &transforms, None)
+                .expect("owned AVIF decode should succeed");
+            assert_eq!(
+                owned,
+                super::decoded_heic_to_rgba_image(image, colr, &transforms, Some(&alpha), None)
+                    .expect("HEIC decode should succeed"),
+                "{bit_depth}-bit"
+            );
+            match owned.pixels {
+                super::DecodedRgbaPixels::U8(pixels) => {
+                    let mut out = vec![0_u8; pixels.len()];
+                    super::decoded_avif_to_rgba8_slice(avif, colr, &transforms, &mut out)
+                        .expect("RGBA8 slice decode should succeed");
+                    assert_eq!(out, pixels);
+                }
+                super::DecodedRgbaPixels::U16(pixels) => {
+                    let mut bytes = vec![0_u8; pixels.len() * 2];
+                    super::decoded_avif_to_rgba16_native_endian_bytes(
+                        avif,
+                        colr,
+                        &transforms,
+                        &mut bytes,
+                    )
+                    .expect("RGBA16 slice decode should succeed");
+                    let decoded: Vec<u16> = bytes
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+                        .collect();
+                    assert_eq!(decoded, pixels);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn avif_plane_samples_must_match_the_bit_depth_to_widen() {
+        assert_eq!(
+            super::avif_samples_into_u16(super::AvifPlaneSamples::U8(vec![0, 7, 255]), 8, "Y")
+                .expect("8-bit samples should widen"),
+            [0, 7, 255]
+        );
+        assert_eq!(
+            super::avif_samples_into_u16(super::AvifPlaneSamples::U16(vec![0, 1023]), 10, "Y")
+                .expect("10-bit samples should pass through"),
+            [0, 1023]
+        );
+        for (samples, bit_depth) in [
+            (super::AvifPlaneSamples::U8(vec![1]), 10),
+            (super::AvifPlaneSamples::U16(vec![1]), 8),
+        ] {
+            assert!(matches!(
+                super::avif_samples_into_u16(samples, bit_depth, "U"),
+                Err(super::DecodeError::AvifDecode(
+                    super::DecodeAvifError::PlaneSampleTypeMismatch { plane: "U", .. }
+                ))
+            ));
+        }
+    }
+
     #[test]
     fn chroma_aligned_clean_aperture_yuv_crop_matches_rgba_transform_path() {
         let image = synthetic_yuv_image(super::HeicPixelLayout::Yuv420);
@@ -16124,17 +16480,26 @@ mod tests {
                 rotation_ccw_degrees: 270,
             }),
         ];
-        let owned = super::decoded_avif_to_rgba_image(&decoded, &transforms, None)
-            .expect("owned AVIF conversion should succeed");
+        let owned = super::decoded_avif_to_rgba_image(
+            decoded.clone(),
+            super::HeicColrOverride::default(),
+            &transforms,
+            None,
+        )
+        .expect("owned AVIF conversion should succeed");
         let expected = match owned.pixels {
             super::DecodedRgbaPixels::U16(pixels) => pixels,
             other => panic!("expected RGBA16 pixels, got {other:?}"),
         };
 
         let mut bytes = vec![0_u8; expected.len() * 2];
-        let mut output = super::NativeEndianRgba16Output(&mut bytes);
-        super::decoded_avif_to_rgba16_output(&decoded, &transforms, &mut output)
-            .expect("direct AVIF byte conversion should succeed");
+        super::decoded_avif_to_rgba16_native_endian_bytes(
+            decoded,
+            super::HeicColrOverride::default(),
+            &transforms,
+            &mut bytes,
+        )
+        .expect("direct AVIF byte conversion should succeed");
         let actual: Vec<u16> = bytes
             .chunks_exact(2)
             .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))

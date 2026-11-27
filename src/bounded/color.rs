@@ -717,14 +717,21 @@ mod tests {
     #[cfg(not(feature = "decoder-tracing"))]
     #[test]
     fn hdr_fixtures_match_a_float_tone_mapping_reference() {
-        for (bytes, hlg) in [
+        for (bytes, hlg, size) in [
             (
                 include_bytes!("testdata/apple-pq-64x48.heic").as_slice(),
                 false,
+                (64, 48),
             ),
             (
                 include_bytes!("testdata/apple-hlg-64x48.heic").as_slice(),
                 true,
+                (64, 48),
+            ),
+            (
+                include_bytes!("testdata/x265-10bit-pq-odd-crop-61x60.heic").as_slice(),
+                false,
+                (61, 60),
             ),
         ] {
             let bounded =
@@ -733,7 +740,7 @@ mod tests {
                     .image;
             assert_eq!(
                 (bounded.width, bounded.height, bounded.source_bit_depth),
-                (64, 48, 10)
+                (size.0, size.1, 10)
             );
             assert_eq!(bounded.icc_profile, None);
             let normal = crate::decode_bytes_to_rgba(bytes).unwrap();

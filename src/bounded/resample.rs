@@ -5,6 +5,96 @@ use super::grid::Grid;
 use super::memory::{Budget, Buffer};
 use super::{BoundedDecodeError as Error, Result};
 
+const PLACEMENT_BLOCK_ROWS: usize = 16;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Rectangle {
+    pub(super) left: u32,
+    pub(super) top: u32,
+    pub(super) width: u32,
+    pub(super) height: u32,
+}
+
+impl Rectangle {
+    pub(super) fn from_edges(left: u32, top: u32, right: u32, bottom: u32) -> Self {
+        Self {
+            left,
+            top,
+            width: right.saturating_sub(left),
+            height: bottom.saturating_sub(top),
+        }
+    }
+
+    pub(super) fn right(&self) -> u32 {
+        self.left + self.width
+    }
+
+    pub(super) fn bottom(&self) -> u32 {
+        self.top + self.height
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    pub(super) fn contains(&self, other: Rectangle) -> bool {
+        other.left >= self.left
+            && other.top >= self.top
+            && other.right() <= self.right()
+            && other.bottom() <= self.bottom()
+    }
+
+    pub(super) fn intersection(&self, other: Rectangle) -> Self {
+        let left = self.left.max(other.left);
+        let top = self.top.max(other.top);
+        Self::from_edges(
+            left,
+            top,
+            self.right().min(other.right()).max(left),
+            self.bottom().min(other.bottom()).max(top),
+        )
+    }
+
+    pub(super) fn expanded(&self, margin: u32) -> Self {
+        Self::from_edges(
+            self.left.saturating_sub(margin),
+            self.top.saturating_sub(margin),
+            self.right() + margin,
+            self.bottom() + margin,
+        )
+    }
+}
+
+pub(super) fn transformed_source(
+    width: u32,
+    height: u32,
+    transforms: &[Transform],
+) -> Result<(RgbaTransformPlan, Rectangle)> {
+    let plan = RgbaTransformPlan::from_primary_transforms(width, height, transforms)
+        .map_err(|_| Error::Malformed("display transform"))?;
+    let mut left = usize::MAX;
+    let mut top = usize::MAX;
+    let mut right = 0;
+    let mut bottom = 0;
+    for (x, y) in [
+        (0, 0),
+        (plan.destination_width - 1, 0),
+        (0, plan.destination_height - 1),
+        (plan.destination_width - 1, plan.destination_height - 1),
+    ] {
+        let (x, y) = plan
+            .map_destination_pixel(x as usize, y as usize)
+            .map_err(|_| Error::Malformed("display crop"))?;
+        left = left.min(x);
+        top = top.min(y);
+        right = right.max(x);
+        bottom = bottom.max(y);
+    }
+    let source =
+        Rectangle::from_edges(left as u32, top as u32, right as u32 + 1, bottom as u32 + 1);
+    Ok((plan, source))
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Layout {
     pub(super) left: u32,
@@ -30,28 +120,13 @@ impl Layout {
         {
             transforms.extend(exif);
         }
-        let plan = RgbaTransformPlan::from_primary_transforms(grid.width, grid.height, &transforms)
-            .map_err(|_| Error::Malformed("display transform"))?;
-        let mut left = usize::MAX;
-        let mut top = usize::MAX;
-        let mut right = 0;
-        let mut bottom = 0;
-        for (x, y) in [
-            (0, 0),
-            (plan.destination_width - 1, 0),
-            (0, plan.destination_height - 1),
-            (plan.destination_width - 1, plan.destination_height - 1),
-        ] {
-            let (x, y) = plan
-                .map_destination_pixel(x as usize, y as usize)
-                .map_err(|_| Error::Malformed("display crop"))?;
-            left = left.min(x);
-            top = top.min(y);
-            right = right.max(x);
-            bottom = bottom.max(y);
-        }
-        let width = (right - left + 1) as u32;
-        let height = (bottom - top + 1) as u32;
+        let (plan, source) = transformed_source(grid.width, grid.height, &transforms)?;
+        let Rectangle {
+            left,
+            top,
+            width,
+            height,
+        } = source;
         let longest = width.max(height);
         let output_width = if longest <= max_side {
             width
@@ -86,8 +161,8 @@ impl Layout {
             (output_width, output_height)
         };
         Ok(Self {
-            left: left as u32,
-            top: top as u32,
+            left,
+            top,
             width,
             height,
             output_width,
@@ -97,6 +172,15 @@ impl Layout {
             original_dimensions: (plan.destination_width, plan.destination_height),
             matrix,
         })
+    }
+
+    pub(super) fn source(&self) -> Rectangle {
+        Rectangle {
+            left: self.left,
+            top: self.top,
+            width: self.width,
+            height: self.height,
+        }
     }
 
     pub(super) fn is_unscaled(&self) -> bool {
@@ -112,6 +196,38 @@ impl Layout {
             for (offset, pixel) in pixels.chunks_exact(3).enumerate() {
                 let start = self.pixel_index(x + offset as u32, y);
                 output[start..start + 3].copy_from_slice(pixel);
+            }
+        }
+    }
+
+    pub(super) fn place<'a>(
+        &self,
+        region: Region,
+        row: impl Fn(u32) -> &'a [u8],
+        output: &mut [u8],
+    ) {
+        let [a, b, c, d] = self.matrix.map(isize::from);
+        let width = self.display_width as isize;
+        let step_x = (c * width + a) * 3;
+        let step_y = (d * width + b) * 3;
+        let origin = self.pixel_index(0, 0) as isize;
+        let index = |x: u32, y: u32| (origin + x as isize * step_x + y as isize * step_y) as usize;
+        if step_x == 3 {
+            for y in region.top..region.bottom {
+                let pixels = row(y);
+                let start = index(region.left, y);
+                output[start..start + pixels.len()].copy_from_slice(pixels);
+            }
+            return;
+        }
+        for top in (region.top..region.bottom).step_by(PLACEMENT_BLOCK_ROWS) {
+            let bottom = (top + PLACEMENT_BLOCK_ROWS as u32).min(region.bottom);
+            for x in region.left..region.right {
+                let source = (x - region.left) as usize * 3;
+                for y in top..bottom {
+                    let start = index(x, y);
+                    output[start..start + 3].copy_from_slice(&row(y)[source..source + 3]);
+                }
             }
         }
     }

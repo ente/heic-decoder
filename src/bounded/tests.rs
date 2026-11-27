@@ -922,28 +922,43 @@ fn one_channel_pixi_is_accepted_without_relaxing_bit_depth_checks() {
 
 #[cfg(all(feature = "incremental-experiment", not(feature = "decoder-tracing")))]
 #[test]
-fn incremental_rejects_unimplemented_chroma_transform_orders() {
+fn incremental_converts_single_images_to_full_chroma_like_bounded() {
     let nals = nal_sets();
     let config = configuration(&nals[1]);
-    let crop = [13u32, 1, 11, 1, 0, 1, 0, 1]
-        .into_iter()
-        .flat_map(u32::to_be_bytes)
-        .collect::<Vec<_>>();
+    let payload = asymmetric_payload();
+    let crop = clean_aperture(13, 11, [0, 1], [0, 1]);
+    let quarter_turn = box_bytes(b"irot", &[1]);
+    for properties in [
+        vec![quarter_turn.clone(), crop.clone()],
+        vec![crop.clone(), quarter_turn.clone()],
+        vec![
+            clean_aperture(12, 12, [-1, 2], [1, 2]),
+            box_bytes(b"imir", &[1]),
+        ],
+        vec![box_bytes(b"imir", &[0])],
+        vec![
+            clean_aperture(14, 14, [-1, 2], [-1, 2]),
+            box_bytes(b"irot", &[2]),
+        ],
+    ] {
+        let bytes = fixture(std::slice::from_ref(&config), &payload, &properties);
+        assert_matches_normal_decode(&bytes);
+        for max_side in [5, 6000] {
+            let options = BoundedDecodeOptions {
+                max_side,
+                ..Default::default()
+            };
+            let bounded = decode_bounded(BoundedInput::Bytes(&bytes), options).unwrap();
+            let (incremental, _) =
+                incremental::decode(BoundedInput::Bytes(&bytes), options).unwrap();
+            assert_eq!(incremental.original_dimensions, bounded.original_dimensions);
+            assert_eq!(incremental.image.pixels, bounded.image.pixels);
+        }
+    }
     let bytes = fixture(
         std::slice::from_ref(&config),
         &nals[3],
-        &[box_bytes(b"irot", &[1]), box_bytes(b"clap", &crop)],
-    );
-    assert!(matches!(
-        incremental::decode(BoundedInput::Bytes(&bytes), Default::default()),
-        Err(BoundedDecodeError::Unsupported(
-            "repeated crop or crop after orientation"
-        ))
-    ));
-    let bytes = fixture(
-        std::slice::from_ref(&config),
-        &nals[3],
-        &[box_bytes(b"clap", &crop), box_bytes(b"clap", &crop)],
+        &[crop.clone(), crop.clone()],
     );
     assert!(matches!(
         incremental::decode(BoundedInput::Bytes(&bytes), Default::default()),
@@ -951,15 +966,11 @@ fn incremental_rejects_unimplemented_chroma_transform_orders() {
             "duplicate transform property"
         ))
     ));
-    let bytes = fixture(
-        &[config.clone(), config],
-        &nals[3],
-        &[box_bytes(b"clap", &crop)],
-    );
+    let bytes = fixture(&[config.clone(), config], &nals[3], &[crop]);
     assert!(matches!(
         incremental::decode(BoundedInput::Bytes(&bytes), Default::default()),
         Err(BoundedDecodeError::Unsupported(
-            "odd grid crop chroma interpolation"
+            "grid 4:4:4 chroma conversion"
         ))
     ));
 }
@@ -1147,12 +1158,7 @@ fn mirrored_asymmetric_pixels_match_normal_decode() {
                 box_bytes(b"imir", &[mirror]),
             ];
             let odd = fixture(&configs, &asymmetric_payload(), &transforms);
-            assert!(matches!(
-                decode_bounded(BoundedInput::Bytes(&odd), Default::default()),
-                Err(BoundedDecodeError::Unsupported(
-                    "transform that needs 4:4:4 chroma"
-                ))
-            ));
+            assert_matches_normal_decode(&odd);
             let bytes = fixture_with_canvas(
                 &configs,
                 &asymmetric_payload(),
@@ -1298,16 +1304,15 @@ fn render_rejects_workspace_and_geometry_changes_after_preflight() {
         &budget,
     )
     .unwrap();
+    let frame = decode_tile(tile, &payload).unwrap();
     assert_eq!(
-        render_tile(tile, &payload, &color, &transform)
-            .unwrap()
-            .len(),
+        render_tile(tile, frame, &color, &transform).unwrap().len(),
         16 * 16 * 3
     );
     let geometry = tile.geometry;
     tile.geometry.width += 1;
     assert!(matches!(
-        render_tile(tile, &payload, &color, &transform),
+        decode_tile(tile, &payload),
         Err(BoundedDecodeError::Malformed(
             "coded headers changed after preflight"
         ))
@@ -1315,7 +1320,7 @@ fn render_rejects_workspace_and_geometry_changes_after_preflight() {
     tile.geometry = geometry;
     tile.workspace_bytes = 0;
     assert!(matches!(
-        render_tile(tile, &payload, &color, &transform),
+        decode_tile(tile, &payload),
         Err(BoundedDecodeError::Malformed(
             "codec workspace changed after preflight"
         ))
@@ -1661,26 +1666,116 @@ fn single_image_payloads_are_bounded_by_the_budget_instead_of_the_tile_cap() {
 }
 
 #[cfg(not(feature = "decoder-tracing"))]
+fn area_average(image: &crate::DecodedRgbImage, width: u32, height: u32) -> Vec<u8> {
+    let mut output = Vec::with_capacity(width as usize * height as usize * 3);
+    for oy in 0..height {
+        let y0 = f64::from(oy) * f64::from(image.height) / f64::from(height);
+        let y1 = f64::from(oy + 1) * f64::from(image.height) / f64::from(height);
+        for ox in 0..width {
+            let x0 = f64::from(ox) * f64::from(image.width) / f64::from(width);
+            let x1 = f64::from(ox + 1) * f64::from(image.width) / f64::from(width);
+            let mut sums = [0.0; 3];
+            for sy in y0.floor() as u32..y1.ceil() as u32 {
+                for sx in x0.floor() as u32..x1.ceil() as u32 {
+                    let weight = (x1.min(f64::from(sx + 1)) - x0.max(f64::from(sx)))
+                        * (y1.min(f64::from(sy + 1)) - y0.max(f64::from(sy)));
+                    let index = ((sy * image.width + sx) * 3) as usize;
+                    for (sum, &value) in sums.iter_mut().zip(&image.pixels[index..index + 3]) {
+                        *sum += f64::from(value) * weight;
+                    }
+                }
+            }
+            output.extend(sums.map(|sum| (sum / ((x1 - x0) * (y1 - y0))).round() as u8));
+        }
+    }
+    output
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+fn assert_matches_normal_decode(bytes: &[u8]) {
+    let normal = crate::decode_bytes_to_rgb8(bytes).unwrap();
+    let bounded = decode_bounded(BoundedInput::Bytes(bytes), Default::default()).unwrap();
+    assert_eq!(
+        (bounded.image.width, bounded.image.height),
+        (normal.width, normal.height)
+    );
+    assert_eq!(bounded.image.pixels, normal.pixels);
+    for max_side in [5, 11] {
+        let scaled = decode_bounded(
+            BoundedInput::Bytes(bytes),
+            BoundedDecodeOptions {
+                max_side,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let expected = area_average(&normal, scaled.image.width, scaled.image.height);
+        assert!(
+            scaled
+                .image
+                .pixels
+                .iter()
+                .zip(&expected)
+                .all(|(&actual, &expected)| actual.abs_diff(expected) <= 1),
+            "max side {max_side}"
+        );
+    }
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+fn tiled_fixture(
+    config: &[u8],
+    payload: &[u8],
+    (columns, rows): (u8, u8),
+    transforms: &[Vec<u8>],
+    canvas: (u32, u32),
+) -> Vec<u8> {
+    let configs = vec![config.to_vec(); usize::from(columns) * usize::from(rows)];
+    let mut bytes = fixture_with_canvas(
+        &configs,
+        payload,
+        transforms,
+        &(0..transforms.len()).collect::<Vec<_>>(),
+        &[],
+        None,
+        b"Exif\0",
+        canvas,
+    );
+    let idat = bytes.windows(4).position(|kind| kind == b"idat").unwrap() + 4;
+    bytes[idat + 2] = rows - 1;
+    bytes[idat + 3] = columns - 1;
+    bytes
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+fn clean_aperture(
+    width: i32,
+    height: i32,
+    horizontal_offset: [i32; 2],
+    vertical_offset: [i32; 2],
+) -> Vec<u8> {
+    let crop: Vec<_> = [
+        width,
+        1,
+        height,
+        1,
+        horizontal_offset[0],
+        horizontal_offset[1],
+        vertical_offset[0],
+        vertical_offset[1],
+    ]
+    .into_iter()
+    .flat_map(i32::to_be_bytes)
+    .collect();
+    box_bytes(b"clap", &crop)
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
 #[test]
-fn transforms_that_need_full_chroma_are_refused() {
+fn transforms_that_need_full_chroma_match_normal_decode() {
     let config = configuration(&nal_sets()[1]);
     let payload = asymmetric_payload();
-    let clap = |width: i32, height: i32, horizontal_offset: [i32; 2], vertical_offset: [i32; 2]| {
-        let crop: Vec<_> = [
-            width,
-            1,
-            height,
-            1,
-            horizontal_offset[0],
-            horizontal_offset[1],
-            vertical_offset[0],
-            vertical_offset[1],
-        ]
-        .into_iter()
-        .flat_map(i32::to_be_bytes)
-        .collect();
-        box_bytes(b"clap", &crop)
-    };
+    let clap = clean_aperture;
     let centred = [0, 1];
     let back_half = [-1, 2];
     let mirror = |axis| box_bytes(b"imir", &[axis]);
@@ -1689,53 +1784,32 @@ fn transforms_that_need_full_chroma_are_refused() {
     let three_quarter_turn = box_bytes(b"irot", &[3]);
     let odd_width = clap(11, 12, back_half, centred);
     let odd_height = clap(12, 11, centred, back_half);
-    for (properties, refused) in [
-        (vec![clap(12, 12, centred, centred)], false),
-        (
-            vec![clap(12, 12, centred, centred), quarter_turn.clone()],
-            false,
-        ),
-        (
-            vec![half_turn.clone(), clap(12, 12, centred, centred)],
-            false,
-        ),
-        (vec![odd_width.clone()], false),
-        (vec![odd_width.clone(), three_quarter_turn.clone()], false),
-        (vec![odd_height.clone()], false),
-        (vec![odd_height.clone(), quarter_turn.clone()], false),
-        (vec![clap(12, 10, centred, centred)], true),
-        (vec![clap(10, 12, centred, centred)], true),
-        (
-            vec![quarter_turn.clone(), clap(12, 10, centred, centred)],
-            true,
-        ),
-        (vec![half_turn.clone(), clap(11, 12, [1, 2], centred)], true),
-        (vec![half_turn.clone(), odd_width.clone()], true),
-        (vec![odd_width.clone(), quarter_turn.clone()], true),
-        (vec![odd_width.clone(), half_turn.clone()], true),
-        (vec![odd_width.clone(), mirror(0)], true),
-        (vec![odd_width, mirror(1)], true),
-        (vec![odd_height.clone(), half_turn], true),
-        (vec![odd_height.clone(), three_quarter_turn], true),
-        (vec![odd_height.clone(), mirror(0)], true),
-        (vec![odd_height, mirror(1)], true),
+    for properties in [
+        vec![clap(12, 12, centred, centred)],
+        vec![clap(12, 12, centred, centred), quarter_turn.clone()],
+        vec![half_turn.clone(), clap(12, 12, centred, centred)],
+        vec![odd_width.clone()],
+        vec![odd_width.clone(), three_quarter_turn.clone()],
+        vec![odd_height.clone()],
+        vec![odd_height.clone(), quarter_turn.clone()],
+        vec![clap(12, 10, centred, centred)],
+        vec![clap(10, 12, centred, centred)],
+        vec![quarter_turn.clone(), clap(12, 10, centred, centred)],
+        vec![half_turn.clone(), clap(11, 12, [1, 2], centred)],
+        vec![half_turn.clone(), odd_width.clone()],
+        vec![odd_width.clone(), quarter_turn.clone()],
+        vec![odd_width.clone(), half_turn.clone()],
+        vec![odd_width.clone(), mirror(0)],
+        vec![odd_width.clone(), mirror(1)],
+        vec![odd_height.clone(), half_turn.clone()],
+        vec![odd_height.clone(), three_quarter_turn.clone()],
+        vec![odd_height.clone(), mirror(0)],
+        vec![odd_height.clone(), mirror(1)],
+        vec![clap(9, 7, [1, 1], [-1, 1]), quarter_turn.clone(), mirror(1)],
     ] {
         for primary in [Primary::Single, Primary::Grid] {
             let bytes = coded_fixture(primary, &config, (16, 16), &[&payload], &properties, None);
-            let result = decode_bounded(BoundedInput::Bytes(&bytes), Default::default());
-            if refused {
-                assert!(
-                    matches!(
-                        result,
-                        Err(BoundedDecodeError::Unsupported(
-                            "transform that needs 4:4:4 chroma"
-                        ))
-                    ),
-                    "{result:?}"
-                );
-            } else {
-                assert!(result.is_ok(), "{result:?}");
-            }
+            assert_matches_normal_decode(&bytes);
         }
     }
     let rotated_then_cropped = fixture_with_canvas(
@@ -1753,9 +1827,68 @@ fn transforms_that_need_full_chroma_are_refused() {
         Default::default(),
     )
     .unwrap();
-    let normal = crate::decode_bytes_to_rgb8(&rotated_then_cropped).unwrap();
     assert_eq!((bounded.image.width, bounded.image.height), (10, 12));
-    assert_eq!(bounded.image.pixels, normal.pixels);
+    assert_matches_normal_decode(&rotated_then_cropped);
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn grids_convert_to_full_chroma_across_tile_edges_like_normal_decode() {
+    let config = configuration(&nal_sets()[1]);
+    let payload = asymmetric_payload();
+    let mirror = |axis| box_bytes(b"imir", &[axis]);
+    let turn = |quarters| box_bytes(b"irot", &[quarters]);
+    for (layout, canvas, properties) in [
+        ((2, 2), (31, 29), vec![turn(1)]),
+        ((2, 2), (31, 32), vec![turn(2)]),
+        ((2, 2), (32, 31), vec![turn(3), mirror(1)]),
+        ((2, 2), (32, 31), vec![turn(1), mirror(0)]),
+        ((3, 2), (47, 30), vec![mirror(1)]),
+        ((2, 3), (30, 47), vec![mirror(0)]),
+        (
+            (2, 2),
+            (32, 32),
+            vec![clean_aperture(29, 30, [0, 1], [0, 1])],
+        ),
+        (
+            (3, 3),
+            (48, 48),
+            vec![clean_aperture(45, 45, [-1, 1], [0, 1])],
+        ),
+        (
+            (3, 3),
+            (48, 48),
+            vec![clean_aperture(3, 3, [-1, 1], [-1, 1])],
+        ),
+        (
+            (3, 3),
+            (48, 48),
+            vec![clean_aperture(4, 5, [-17, 2], [17, 2])],
+        ),
+        (
+            (3, 3),
+            (47, 46),
+            vec![clean_aperture(44, 43, [0, 1], [0, 1]), turn(2)],
+        ),
+        (
+            (3, 3),
+            (48, 48),
+            vec![turn(1), clean_aperture(45, 44, [1, 1], [-1, 1]), mirror(1)],
+        ),
+        (
+            (3, 1),
+            (47, 16),
+            vec![turn(1), clean_aperture(5, 45, [0, 1], [0, 1])],
+        ),
+        (
+            (1, 3),
+            (16, 47),
+            vec![mirror(0), clean_aperture(14, 3, [0, 1], [-19, 1])],
+        ),
+    ] {
+        let bytes = tiled_fixture(&config, &payload, layout, &properties, canvas);
+        assert_matches_normal_decode(&bytes);
+    }
 }
 
 #[cfg(not(feature = "decoder-tracing"))]
@@ -1821,6 +1954,26 @@ fn ten_bit_slices_may_use_negative_qp() {
         .unwrap()
         .image;
     assert_eq!((bounded.width, bounded.height), (32, 32));
+    assert_eq!(bounded.source_bit_depth, 10);
+    assert_eq!(bounded.pixels, normal.pixels);
+}
+
+#[cfg(not(feature = "decoder-tracing"))]
+#[test]
+fn ten_bit_odd_crops_convert_chroma_at_the_coded_depth() {
+    let bytes = include_bytes!("testdata/x265-10bit-odd-crop-61x60.heic");
+    let budget = memory::Budget::new(128 * 1024 * 1024);
+    let mut source = container::Source::new(BoundedInput::Bytes(bytes)).unwrap();
+    let metadata = source.metadata(&budget).unwrap();
+    let index = container::Index::parse(&metadata, source.len(), &budget).unwrap();
+    let grid = grid::Grid::preflight(&index, &mut source, &budget).unwrap();
+    let color = grid.tiles[0].color.overridden_by(&grid.properties.color);
+    assert!(chroma::Yuv444::new(&grid, &color).unwrap().is_some());
+    let normal = crate::decode_bytes_to_rgb8(bytes).unwrap();
+    let bounded = decode_bounded(BoundedInput::Bytes(bytes), Default::default())
+        .unwrap()
+        .image;
+    assert_eq!((bounded.width, bounded.height), (61, 60));
     assert_eq!(bounded.source_bit_depth, 10);
     assert_eq!(bounded.pixels, normal.pixels);
 }
@@ -2089,5 +2242,72 @@ fn tiles_with_different_light_levels_form_one_grid() {
                 .pixels,
             plain
         );
+    }
+}
+
+#[cfg(feature = "parallel-grid")]
+#[test]
+fn ordered_tile_decoding_refills_a_freed_slot_before_finishing_the_next_tile() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let events = std::cell::RefCell::new(Vec::new());
+    decode_in_order(
+        &pool,
+        5,
+        |tile| {
+            events.borrow_mut().push(("start", tile));
+            Ok(tile)
+        },
+        |tile| {
+            if tile == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(tile)
+        },
+        |tile| events.borrow_mut().push(("finish", tile)),
+    )
+    .unwrap();
+    assert_eq!(
+        events.into_inner(),
+        [
+            ("start", 0),
+            ("start", 1),
+            ("finish", 0),
+            ("start", 2),
+            ("finish", 1),
+            ("start", 3),
+            ("finish", 2),
+            ("start", 4),
+            ("finish", 3),
+            ("finish", 4),
+        ]
+    );
+}
+
+#[cfg(feature = "parallel-grid")]
+#[test]
+fn ordered_tile_decoding_propagates_tile_panics_alongside_tile_errors() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    for panicking in [0, 1] {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decode_in_order(
+                &pool,
+                2,
+                Ok,
+                |tile| {
+                    if tile == panicking {
+                        panic!("tile {tile}");
+                    }
+                    Err::<(), _>(BoundedDecodeError::Malformed("tile"))
+                },
+                |()| {},
+            )
+        }));
+        assert!(outcome.is_err(), "tile {panicking}");
     }
 }

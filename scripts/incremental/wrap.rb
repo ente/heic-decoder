@@ -1,32 +1,10 @@
 input, output, width, height, columns, rows = ARGV
-abort 'Usage: wrap.rb ANNEX_B OUTPUT WIDTH HEIGHT [COLUMNS] [ROWS]' unless input && output && width && height
+abort 'Usage: wrap.rb ANNEX_B_OR_AVIF OUTPUT WIDTH HEIGHT [COLUMNS] [ROWS]' unless input && output && width && height
 width = Integer(width)
 height = Integer(height)
 columns = Integer(columns || '1')
 rows = Integer(rows || '1')
 raise 'Invalid fixture dimensions' unless width.positive? && height.positive? && (1..256).cover?(columns) && (1..256).cover?(rows)
-nals = File.binread(input).split(/\x00\x00\x00?\x01/n).reject(&:empty?)
-parameters = (32..34).map do |kind|
-  nals.find { |nal| (nal.getbyte(0) >> 1 & 63) == kind } || raise('Missing parameter set')
-end
-pictures = nals.select { |nal| [19, 20].include?(nal.getbyte(0) >> 1 & 63) }
-raise 'One IDR required' unless pictures.size == 1
-payload = pictures.map { |nal| [nal.bytesize].pack('N') + nal }.join
-sps = parameters[1].byteslice(2..).gsub(/\x00\x00\x03/n, "\x00\x00".b)
-raise 'SPS sub-layers are unsupported' unless (sps.getbyte(0) >> 1 & 7).zero?
-bits = sps.byteslice(13..).unpack1('B*')
-position = 0
-exp_golomb = lambda do
-  zeros = bits.index('1', position) - position
-  value = (1 << zeros) - 1 + bits[position + zeros + 1, zeros].to_i(2)
-  position += 2 * zeros + 1
-  value
-end
-exp_golomb.call
-chroma_format = exp_golomb.call
-raise 'Only 4:2:0 and 4:2:2 streams are supported' unless [1, 2].include?(chroma_format)
-hvcc = [1].pack('C') + sps.byteslice(1, 12) + [0xf0, 0, 0xfc, 0xfc | chroma_format, 0xf8, 0xf8, 0, 0, 0x0f, 3].pack('C*')
-parameters.each_with_index { |nal, i| hvcc += [0x80 + 32 + i, 1, nal.bytesize].pack('Cnn') + nal }
 def box(kind, data)
   [data.bytesize + 8].pack('N') + kind + data
 end
@@ -35,14 +13,64 @@ def full(kind, version, data, flags = 0)
   box(kind, [(version << 24) | flags].pack('N') + data)
 end
 
+def child_boxes(data, offset)
+  boxes = {}
+  while offset < data.bytesize
+    size, kind = data.unpack('Na4', offset: offset)
+    boxes[kind] ||= data.byteslice(offset, size)
+    offset += size
+  end
+  boxes
+end
+
+stream = File.binread(input)
+if stream.byteslice(4, 4) == 'ftyp'
+  top = child_boxes(stream, 0)
+  ipco = child_boxes(child_boxes(top.fetch('meta'), 12).fetch('iprp'), 8).fetch('ipco')
+  config = child_boxes(ipco, 8).fetch('av1C')
+  payload = top.fetch('mdat').byteslice(8..)
+  flags = config.getbyte(10)
+  bit_depth = flags[6].zero? ? 8 : 10 + 2 * flags[5]
+  coded_type = 'av01'
+  brands = "avif\0\0\0\0mif1avifmiaf".b
+else
+  nals = stream.split(/\x00\x00\x00?\x01/n).reject(&:empty?)
+  parameters = (32..34).map do |kind|
+    nals.find { |nal| (nal.getbyte(0) >> 1 & 63) == kind } || raise('Missing parameter set')
+  end
+  pictures = nals.select { |nal| [19, 20].include?(nal.getbyte(0) >> 1 & 63) }
+  raise 'One IDR required' unless pictures.size == 1
+  payload = pictures.map { |nal| [nal.bytesize].pack('N') + nal }.join
+  sps = parameters[1].byteslice(2..).gsub(/\x00\x00\x03/n, "\x00\x00".b)
+  raise 'SPS sub-layers are unsupported' unless (sps.getbyte(0) >> 1 & 7).zero?
+  bits = sps.byteslice(13..).unpack1('B*')
+  position = 0
+  exp_golomb = lambda do
+    zeros = bits.index('1', position) - position
+    value = (1 << zeros) - 1 + bits[position + zeros + 1, zeros].to_i(2)
+    position += 2 * zeros + 1
+    value
+  end
+  exp_golomb.call
+  chroma_format = exp_golomb.call
+  raise 'Only 4:2:0 and 4:2:2 streams are supported' unless [1, 2].include?(chroma_format)
+  hvcc = [1].pack('C') + sps.byteslice(1, 12) + [0xf0, 0, 0xfc, 0xfc | chroma_format, 0xf8, 0xf8, 0, 0, 0x0f, 3].pack('C*')
+  parameters.each_with_index { |nal, i| hvcc += [0x80 + 32 + i, 1, nal.bytesize].pack('Cnn') + nal }
+  config = box('hvcC', hvcc)
+  bit_depth = 8
+  coded_type = 'hvc1'
+  brands = "heic\0\0\0\0mif1heic".b
+end
+
 count = columns * rows
 grid = count > 1 || ENV['GRID'] == '1'
+raise 'AV1 grids are unsupported' if grid && coded_type == 'av01'
 total = count + (grid ? 1 : 0)
 primary = grid ? total : 1
 canvas_width, canvas_height = ENV.fetch('CANVAS', "#{width * columns}x#{height * rows}").split('x').map { |n| Integer(n) }
 raise 'Invalid canvas' unless canvas_width.positive? && canvas_height.positive? && canvas_width <= width * columns && canvas_height <= height * rows
 ispe = ->(w, h) { full('ispe', 0, [w, h].pack('NN')) }
-properties = [box('hvcC', hvcc), ispe.call(width, height), full('pixi', 0, [3, 8, 8, 8].pack('C*'))]
+properties = [config, ispe.call(width, height), full('pixi', 0, [3, bit_depth, bit_depth, bit_depth].pack('C*'))]
 properties << ispe.call(canvas_width, canvas_height) if grid
 tile_color = nil
 primary_color = nil
@@ -74,7 +102,7 @@ ENV.fetch('TRANSFORM_ORDER', 'CROP,ROTATION,MIRROR').split(',').each do |key|
   extra << properties.length
 end
 items = (1..total).map do |id|
-  kind = id == primary && grid ? 'grid' : 'hvc1'
+  kind = id == primary && grid ? 'grid' : coded_type
   full('infe', 2, [id, 0].pack('nn') + kind + "\0", grid && id != primary ? 1 : 0)
 end.join
 ipma = [total].pack('N') + (1..total).map do |id|
@@ -89,7 +117,7 @@ targets = ENV['REFERENCE_COUNT'] ? Array.new(Integer(ENV.fetch('REFERENCE_COUNT'
 raise 'Invalid reference count' unless (1..65_535).cover?(targets.length)
 references = grid ? full('iref', 0, box('dimg', [primary, targets.length, *targets].pack('n*'))) : ''.b
 griddata = grid ? [0, 1, rows - 1, columns - 1, canvas_width, canvas_height].pack('CCCCNN') : ''.b
-ftyp = box('ftyp', "heic\0\0\0\0mif1heic".b)
+ftyp = box('ftyp', brands)
 make_meta = lambda do |offset|
   locations = [0x44, 0, total].pack('CCn')
   (1..total).each do |id|
